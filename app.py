@@ -1,15 +1,12 @@
-"""Quickzi Munich rider alerts — webhook receiver, checks every minute, and a dashboard.
+"""Quickzi ops platform — server.
 
-Run:  uvicorn app:app --host 0.0.0.0 --port 8000
-Env:  MT_API_TOKEN          MotionTools API token (Rider-Alerts)
-      DASHBOARD_PASSWORD    password for the dashboard (any username)
-      WEBHOOK_PATH_SECRET   random word that goes at the end of the webhook URL
-      DATA_DIR              where the database is kept (Railway volume, e.g. /data)
-      MUNICH_SERVICE_AREA_ID  optional; empty = track all riders
+Truth comes from MotionTools' API every SYNC_SECONDS (all active orders + all riders), 24/7.
+Everything is written to SQLite on the Railway volume, so nothing is lost while nobody is watching.
+The MotionTools webhook only wakes the sync early.
 
-NOTE: MotionTools' exact webhook payload fields could not be fully confirmed from the
-public docs. The `dig(...)` calls accept the common shapes; every raw event is saved
-to events.jsonl so the field paths can be checked against real data.
+Env:  MT_API_TOKEN, DASHBOARD_PASSWORD, WEBHOOK_PATH_SECRET, DATA_DIR (/data),
+      MUNICH_SERVICE_AREA_ID (comma-separated area ids to keep; empty = all), SYNC_SECONDS (30), CITY_NAME
+Run:  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
 from __future__ import annotations
 
@@ -18,24 +15,23 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import mean
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from detector import UTC, Config, Detector, Stop
-from store import Store
+from mt import ACTIVE_STATUSES, MotionTools
+from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_minutes
+from store import Store, day_key, day_start
 
-log = logging.getLogger("rider-alerts")
+log = logging.getLogger("quickzi")
 logging.basicConfig(level=logging.INFO)
 
-MT_API = "https://api.motiontools.io"
+
 def env(name, default=""):
-    """Read a setting, forgiving stray spaces/quotes/backticks pasted into Railway,
-    and variable names that were saved with extra characters around them."""
     val = os.environ.get(name)
     if val is None:
         for k, v in os.environ.items():
@@ -50,17 +46,27 @@ PATH_SECRET = env("WEBHOOK_PATH_SECRET", "change-me")
 DASH_PASSWORD = env("DASHBOARD_PASSWORD")
 DATA_DIR = Path(env("DATA_DIR", ".") or ".")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
+SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
+CITY = env("CITY_NAME", "Munich") or "Munich"
+STARTED = datetime.now(UTC)
 
-store = Store(str(DATA_DIR / "rider_alerts.db"))
-# Optional: comma-separated service area IDs to keep (e.g. only Munich); empty = keep all
-AREAS = {a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()}
-cfg = Config(munich_service_area_id=",".join(sorted(AREAS)) or None)
-det = Detector(cfg, store)
+mt = MotionTools(MT_TOKEN)
+store = Store(str(DATA_DIR / "quickzi.db"))
+rules = Rules()
+rules.apply(store.get_settings())
+tracker = RiderTracker()
 app = FastAPI()
 basic = HTTPBasic()
-# lightweight counters so setup can be checked from /health without exposing data
-STATS = {"events_received": 0, "events_without_driver": 0, "last_event_at": None, "event_types": {}}
-RECENT: list = []          # last 30 raw events, visible on /api/events (password protected)
+
+STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "raw_samples": {},
+         "sync": {"last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
+                  "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None}}
+WAKE = asyncio.Event()
+
+PHASE_LABEL = {"unassigned": "Waiting for rider", "accepted": "Accepted, not started", "to_restaurant": "Riding to restaurant",
+               "at_restaurant": "At restaurant", "to_customer": "Delivering", "at_customer": "At customer",
+               "delivered": "Delivered", "cancelled": "Cancelled"}
 
 
 def require_login(creds: HTTPBasicCredentials = Depends(basic)):
@@ -69,335 +75,410 @@ def require_login(creds: HTTPBasicCredentials = Depends(basic)):
         raise HTTPException(401, "Wrong password", headers={"WWW-Authenticate": "Basic"})
 
 
-# ---------- helpers to read payloads defensively ----------
-def dig(d, *paths):
-    for p in paths:
-        cur = d
-        for k in p.split("."):
-            cur = cur.get(k) if isinstance(cur, dict) else None
-            if cur is None:
-                break
-        if cur is not None:
-            return cur
-    return None
+# ====================================================================== sync
+def rider_name(u: dict) -> str:
+    p = u.get("profile") or {}
+    return " ".join(x for x in [p.get("first_name"), p.get("last_name")] if x).strip() or u.get("email") or "Rider"
 
 
-def ts(v):
-    if not v:
-        return None
-    try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(UTC)
-    except ValueError:
-        return None
-
-
-def driver_id_of(p):
-    return dig(p, "data.driver.id", "data.driver_id", "data.tour.driver.id",
-               "data.booking.driver.id", "data.user.id", "driver.id", "driver_id")
-
-
-def stops_of(p):
-    return dig(p, "data.stops", "data.tour.stops", "data.booking.stops", "stops") or []
-
-
-AUTH = {"Authorization": f"Bearer {MT_TOKEN}", "Accept": "application/json", "Accept-Language": "en"}
-PHONE_LOOKED_UP: set = set()
-BOOKINGS: dict = {}        # booking_id -> {driver_id, ref, area, first_seen, stops: {stop_id: Stop}, fetched}
-SAMPLES: list = []         # first few raw booking API responses, for checking field names
-LOOKUP = {"status": {}, "keys": [], "drivers_found": 0}
-
-
-async def enrich_rider(driver_id: str, name: str = ""):
-    """Use the name MotionTools sends; look the phone number up once per rider."""
-    r = det.rider(driver_id)
-    if name:
-        r.name = name
-    if driver_id in PHONE_LOOKED_UP or not MT_TOKEN:
+async def sync_riders(now: datetime):
+    rows = await mt.list_drivers(AREAS)
+    if rows is None:
         return
-    PHONE_LOOKED_UP.add(driver_id)
-    async with httpx.AsyncClient(timeout=10) as c:
-        try:
-            res = await c.get(f"{MT_API}/api/users/{driver_id}", headers=AUTH)
-            u = res.json().get("user", {}) if res.status_code == 200 else {}
-            prof = u.get("profile") or u
-            full = " ".join(x for x in [prof.get("first_name"), prof.get("last_name")] if x)
-            if full and r.name == "Unknown rider":
-                r.name = full
-            r.phone = prof.get("phone_number") or u.get("phone_number") or r.phone
-        except Exception as e:
-            log.warning("rider lookup failed for %s: %s", driver_id, e)
-
-
-async def fetch_booking(bid: str, b: dict):
-    """Once per booking: ask MotionTools for driver, creation time and stop addresses/coordinates."""
-    if not MT_TOKEN or b.get("driver_id") and b.get("fetched"):
-        return
-    last = b.get("fetched_at")
-    if last and (datetime.now(UTC) - last).total_seconds() < 90:   # re-ask at most every 90 s
-        return
-    b["fetched"], b["fetched_at"] = True, datetime.now(UTC)
-    raw = None
-    async with httpx.AsyncClient(timeout=10) as c:
-        for path in (f"/api/bookings/{bid}", f"/api/admin/bookings/{bid}"):
-            try:
-                res = await c.get(MT_API + path, headers=AUTH)
-            except Exception as e:
-                log.warning("booking lookup failed for %s: %s", bid, e)
-                continue
-            key = f"{path.split('/')[2]}:{res.status_code}"
-            LOOKUP["status"][key] = LOOKUP["status"].get(key, 0) + 1
-            if res.status_code == 200:
-                raw = res.json()
-                break
-    if raw is None:
-        return
-    if len(SAMPLES) < 3:
-        SAMPLES.append(raw)
-    bk = raw.get("booking", raw) if isinstance(raw, dict) else {}
-    if not LOOKUP["keys"]:
-        LOOKUP["keys"] = sorted(bk.keys())[:60] if isinstance(bk, dict) else []
-    did = dig(bk, "driver.id", "driver_id", "tour.driver.id", "assigned_driver.id", "tour.driver_id",
-              "current_tour.driver.id", "dispatched_tour.driver.id")
-    if not did:
-        for st in dig(bk, "stops") or []:
-            did = dig(st, "driver.id", "driver_id", "tour.driver.id", "tour.driver_id")
-            if did:
-                break
-    if did and not b.get("driver_id"):
-        b["driver_id"] = str(did)
-        LOOKUP["drivers_found"] += 1
-        name = dig(bk, "driver.name", "driver.first_name", "tour.driver.name") or ""
-        await enrich_rider(str(did), str(name))
-    created = ts(dig(bk, "created_at", "requested_at", "placed_at"))
-    if created:
-        b["first_seen"] = min(b["first_seen"], created)
-    for st in dig(bk, "stops") or []:
-        sid = str(st.get("id"))
-        stop = b["stops"].setdefault(sid, Stop(sid))
-        kind = str(dig(st, "type", "stop_type") or "").lower()
-        if kind:
-            stop.kind = "pickup" if "pick" in kind else "dropoff"
-        lat = dig(st, "location.lat", "location.latitude", "lat", "place.location.lat")
-        lng = dig(st, "location.lng", "location.longitude", "lng", "place.location.lng")
-        if lat is not None and lng is not None:
-            stop.lat, stop.lng = float(lat), float(lng)
-        addr = dig(st, "location.address", "address", "location.formatted_address", "place.name", "location.name")
-        if addr:
-            stop.address = str(addr)
-        stop.deadline = stop.deadline or ts(st.get("latest_arrival_at"))
-
-
-def push_booking(bid: str, now):
-    """Hand a booking's stops to the rider's tracker once we know who the rider is."""
-    b = BOOKINGS.get(bid)
-    if not b or not b.get("driver_id"):
-        return None
-    did = b["driver_id"]
-    for stop in b["stops"].values():
-        if stop.done:
+    if rows and "rider" not in STATE["raw_samples"]:
+        STATE["raw_samples"]["rider"] = rows[0]
+    busy_order = {o["rider_id"]: o["id"] for o in STATE["orders"].values() if o["rider_id"]}
+    for u in rows:
+        rid = u.get("id")
+        if not rid:
             continue
-        stop.booking_ref = b["ref"]
-        stop.assigned_at = b["first_seen"]
-        det.on_stop_eta(did, stop, now)
-    r = det.rider(did)
-    if b.get("area"):
-        r.service_area_id = b["area"]
-    return did
+        loc = u.get("location") or {}
+        online = u.get("status") == "online"
+        info = {"id": rid, "name": rider_name(u), "phone": (u.get("profile") or {}).get("phone_number") or "",
+                "online": online, "lat": loc.get("lat"), "lng": loc.get("lng"),
+                "active_ids": u.get("active_hailing_booking_ids") or []}
+        STATE["riders"][rid] = info
+        store.upsert_rider(rid, info["name"], info["phone"], online, info["lat"], info["lng"], info["active_ids"], now)
+        if online:
+            tracker.push(rid, info["lat"], info["lng"], now)
+            if rid in busy_order or info["active_ids"]:
+                store.record_position(rid, info["lat"], info["lng"], busy_order.get(rid), now)
+    STATE["sync"]["riders_seen"] = len(rows)
 
 
-# ---------- webhook ----------
+async def sync_orders(now: datetime):
+    rows = await mt.list_bookings(AREAS, ACTIVE_STATUSES)
+    if rows is None:
+        STATE["sync"]["last_error"] = mt.stats["last_error"]
+        return False
+    if rows and "booking" not in STATE["raw_samples"]:
+        STATE["raw_samples"]["booking"] = rows[0]
+    parsed = [parse_booking(b) for b in rows]
+    per_rider = {}
+    for o in parsed:
+        if o["rider_id"]:
+            per_rider[o["rider_id"]] = per_rider.get(o["rider_id"], 0) + 1
+    seen = set()
+    for o in parsed:
+        if not o["id"]:
+            continue
+        seen.add(o["id"])
+        STATE["orders"][o["id"]] = o
+        store.upsert_order(o, now, stacked=per_rider.get(o["rider_id"], 0) >= 2)
+        if o["rider_id"] and o["rider_lat"] is not None:
+            tracker.push(o["rider_id"], o["rider_lat"], o["rider_lng"], now)
+            store.record_position(o["rider_id"], o["rider_lat"], o["rider_lng"], o["id"], now)
+    for oid in [k for k in STATE["orders"] if k not in seen]:
+        b = await mt.get_booking(oid)
+        o = parse_booking(b) if b else None
+        if o and o["id"]:
+            if o["phase"] not in ("delivered", "cancelled"):
+                o["phase"] = "delivered" if o["delivered_at"] else "cancelled"
+            store.upsert_order(o, now, stacked=False)
+            why = "delivered" if o["phase"] == "delivered" else "cancelled"
+        else:
+            why = "order closed"
+        for key in [k for k in STATE["open_alerts"] if k[0] == oid]:
+            store.resolve_alert(STATE["open_alerts"].pop(key), why, now)
+            STATE["sev"].pop(key, None)
+        STATE["orders"].pop(oid, None)
+    store.close_missing(seen, now)
+    STATE["sync"]["orders_seen"] = len(seen)
+    STATE["sync"]["last_ok"] = iso(now)
+    STATE["sync"]["last_error"] = None
+    return True
+
+
+async def backfill_done(day: datetime) -> int:
+    """Pull every finished order of one (Berlin) day, so reports are complete even after downtime."""
+    date = day.astimezone(BERLIN).strftime("%Y-%m-%d")
+    n = 0
+    for statuses in (["done", "paid", "processing_payment"], ["cancelled"]):
+        rows = await mt.list_bookings(AREAS, statuses, extra={"local_done_at": date})
+        if rows is None:
+            rows = await mt.list_bookings(AREAS, statuses, extra={"date": date})
+        for b in rows or []:
+            o = parse_booking(b)
+            if o["id"] and (o["delivered_at"] or o["phase"] == "cancelled"):
+                store.upsert_order(o, datetime.now(UTC), stacked=False)
+                n += 1
+    STATE["sync"]["backfilled"] += n
+    return n
+
+
+def alert_payload(o: dict, c: dict) -> dict:
+    r = STATE["riders"].get(o["rider_id"] or "", {})
+    lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o["rider_lat"], o["rider_lng"])
+    return {"order_id": o["id"], "order_ref": o["ref"], "rider_id": o["rider_id"], "rider": o["rider"] or r.get("name", ""),
+            "kind": c["kind"], "severity": c["severity"], "headline": c["headline"], "action": c["action"],
+            "restaurant": o["restaurant"], "phone": r.get("phone") or "", "restaurant_phone": o["restaurant_phone"],
+            "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None else ""}
+
+
+def evaluate_all(now: datetime):
+    for o in STATE["orders"].values():
+        r = STATE["riders"].get(o["rider_id"] or "")
+        conds = {c["kind"]: c for c in evaluate(o, now, rules, tracker, r["online"] if r else None)}
+        for kind, c in conds.items():
+            key = (o["id"], kind)
+            payload = alert_payload(o, c)
+            STATE["sev"][key] = c["severity"]
+            if key in STATE["open_alerts"]:
+                store.update_alert(STATE["open_alerts"][key], payload, now)
+            else:
+                STATE["open_alerts"][key] = store.open_alert(payload, now)
+        for key in [k for k in STATE["open_alerts"] if k[0] == o["id"] and k[1] not in conds]:
+            store.resolve_alert(STATE["open_alerts"].pop(key), PHASE_LABEL.get(o["phase"], o["phase"]).lower(), now)
+            STATE["sev"].pop(key, None)
+
+
+def snapshot_yesterday(now: datetime):
+    """Freeze yesterday's report once per day (after 04:05 Berlin)."""
+    local = now.astimezone(BERLIN)
+    yday = day_key(now - timedelta(days=1))
+    if STATE["sync"]["last_snapshot"] == yday or (local.hour == 4 and local.minute < 5):
+        return
+    if store.daily(yday) is None or STATE["sync"]["last_snapshot"] is None:
+        data = store.insights(yday, now, rules)
+        data["day"] = yday
+        store.save_daily(yday, data)
+        store.log("info", f"daily report frozen for {yday}: {data['delivered']} delivered, {data['within_pct']}% within target")
+    STATE["sync"]["last_snapshot"] = yday
+
+
+async def sync_loop():
+    first = True
+    last_backfill = None
+    while True:
+        now = datetime.now(UTC)
+        STATE["sync"]["runs"] += 1
+        try:
+            if mt.enabled:
+                await sync_riders(now)
+                ok = await sync_orders(now)
+                if first and ok:
+                    # first run on an empty database: pull the last 7 days so week/month views are populated
+                    days = 7 if not store.orders_in("week", now) else 2
+                    total = 0
+                    for i in range(days):
+                        total += await backfill_done(now - timedelta(days=i))
+                    store.log("info", f"backfilled {total} finished orders from the last {days} days")
+                    last_backfill = now
+                elif last_backfill is None or (now - last_backfill) > timedelta(minutes=10):
+                    await backfill_done(now)
+                    last_backfill = now
+                if not ok:
+                    store.log("error", f"MotionTools sync failed: {mt.stats['last_error']}")
+            evaluate_all(datetime.now(UTC))
+            snapshot_yesterday(now)
+            if now.minute == 30 and now.second < SYNC_SECONDS:
+                store.cleanup(now)
+            first = False
+        except Exception as e:
+            log.exception("sync failed: %s", e)
+            STATE["sync"]["last_error"] = str(e)[:300]
+            store.log("error", f"sync exception: {e}"[:300])
+        try:
+            await asyncio.wait_for(WAKE.wait(), timeout=SYNC_SECONDS)
+            await asyncio.sleep(2)
+        except asyncio.TimeoutError:
+            pass
+        WAKE.clear()
+
+
+@app.on_event("startup")
+async def startup():
+    now = datetime.now(UTC)
+    store.close_stale_sessions(now)
+    for o in store.open_orders():
+        STATE["orders"][o["id"]] = o
+    for a in store.open_alerts():
+        STATE["open_alerts"][(a["order_id"], a["kind"])] = a["id"]
+        STATE["sev"][(a["order_id"], a["kind"])] = a["severity"]
+    for r in store.riders():
+        STATE["riders"][r["id"]] = {"id": r["id"], "name": r["name"], "phone": r["phone"], "online": bool(r["online"]),
+                                    "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"]}
+    store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
+    if not DASH_PASSWORD:
+        store.log("error", "DASHBOARD_PASSWORD not set — dashboard refuses all logins")
+    if not mt.enabled:
+        store.log("error", "MT_API_TOKEN not set — no data will be pulled from MotionTools")
+    asyncio.create_task(sync_loop())
+
+
+# ====================================================================== webhook (wakes the sync)
 @app.post("/mt/{secret}")
 async def webhook(secret: str, request: Request):
     if not secrets.compare_digest(secret, PATH_SECRET):
         raise HTTPException(404)
-    p = await request.json()
-    with open(DATA_DIR / "events.jsonl", "a") as f:     # raw log
+    try:
+        p = await request.json()
+    except Exception:
+        p = {}
+    STATE["sync"]["webhook_events"] += 1
+    STATE["sync"]["last_webhook"] = iso(datetime.now(UTC))
+    with open(DATA_DIR / "events.jsonl", "a") as f:
         f.write(json.dumps(p) + "\n")
-
-    # MotionTools sends {"resource_type": "booking", "event": "stop_arrived", "data": {...}}
-    rtype, ev = str(p.get("resource_type") or ""), str(p.get("event") or p.get("type") or "")
-    event = ev if "." in ev or not rtype else f"{rtype}.{ev}"
-    d = p.get("data") or {}
-    now = ts(p.get("timestamp") or d.get("timestamp")) or datetime.now(UTC)
-
-    STATS["events_received"] += 1
-    STATS["last_event_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-    STATS["event_types"][event or "?"] = STATS["event_types"].get(event or "?", 0) + 1
-    area = d.get("service_area_id")
-    if area:
-        STATS.setdefault("service_areas", {})
-        STATS["service_areas"][area] = STATS["service_areas"].get(area, 0) + 1
-    RECENT.append({"received_at": STATS["last_event_at"], "body": p})
-    del RECENT[:-30]
-    if AREAS and area and area not in AREAS:          # e.g. a Hamburg order -> ignore completely
-        STATS["events_other_areas"] = STATS.get("events_other_areas", 0) + 1
-        return {"ok": True, "ignored": "other service area"}
-
-    # ---- booking events: tie everything to the booking, then to its rider ----
-    bid = d.get("booking_id") or dig(d, "booking.id")
-    if bid:
-        b = BOOKINGS.setdefault(bid, {"driver_id": None, "ref": "", "area": None, "first_seen": now,
-                                      "stops": {}, "fetched": False})
-        b["ref"] = d.get("external_id") or b["ref"] or bid[:8]
-        b["area"] = area or b["area"]
-        if d.get("driver_id"):
-            b["driver_id"] = d["driver_id"]
-            await enrich_rider(d["driver_id"], d.get("driver_name") or "")
-        await fetch_booking(bid, b)
-
-        if event.endswith("etas_recalculated"):
-            for s in d.get("unfinished_stops_info") or []:
-                sid = str(s.get("id"))
-                stop = b["stops"].setdefault(sid, Stop(sid))
-                stop.kind = "pickup" if "pick" in str(s.get("type", "")).lower() else "dropoff"
-                stop.eta = ts(s.get("eta")) or stop.eta
-        elif d.get("stop_id"):
-            sid = str(d["stop_id"])
-            stop = b["stops"].setdefault(sid, Stop(sid))
-            if d.get("stop_type"):
-                stop.kind = "pickup" if "pick" in str(d["stop_type"]).lower() else "dropoff"
-
-        did = push_booking(bid, now)
-        if not did:
-            STATS["events_without_driver"] += 1
-            return {"ok": True, "waiting_for_driver": True}
-
-        sid = str(d.get("stop_id") or "")
-        if event.endswith("stop_arrived") and sid:
-            det.on_stop_arrived(did, sid, now)
-        elif event.endswith("stop_completed") and sid:
-            det.on_stop_completed(did, sid, now)
-            if all(st.done for st in b["stops"].values()):
-                BOOKINGS.pop(bid, None)
-        elif event.endswith("stop_failed") and sid:
-            det.on_stop_completed(did, sid, now, failed=True)
-        return {"ok": True}
-
-    # ---- driver / tour events ----
-    did = dig(d, "driver_id", "driver.id", "tour.driver.id", "user_id", "id" if rtype == "driver" else "_")
-    if not did:
-        STATS["events_without_driver"] += 1
-        return {"ok": True, "ignored": "no driver"}
-    did = str(did)
-    await enrich_rider(did, d.get("driver_name") or dig(d, "driver.name") or "")
-    if area:
-        det.rider(did).service_area_id = area
-
-    if event.endswith("driver_location_updated"):
-        lat = dig(d, "driver_location.lat", "location.lat", "driver_location.latitude", "location.latitude", "lat")
-        lng = dig(d, "driver_location.lng", "location.lng", "driver_location.longitude", "location.longitude", "lng")
-        if lat is not None and lng is not None:
-            det.on_location(did, float(lat), float(lng), now)
-    elif event.endswith(".online"):
-        det.on_online(did, True, now)
-    elif event.endswith(".offline"):
-        det.on_online(did, False, now)
+    WAKE.set()
     return {"ok": True}
 
 
-# ---------- dashboard ----------
+# ====================================================================== API
+def hm(dt):
+    return dt.astimezone(BERLIN).strftime("%H:%M") if dt else None
+
+
+def order_view(o: dict, now: datetime) -> dict:
+    r = STATE["riders"].get(o["rider_id"] or "", {})
+    live = o["phase"] not in ("delivered", "cancelled")
+    end = o["delivered_at"] or o.get("cancelled_at") or now
+    elapsed = mins(o["dispatched_at"], end if not live else now)
+    kinds = [k[1] for k in STATE["open_alerts"] if k[0] == o["id"]] if live else []
+    sevs = [STATE["sev"].get((o["id"], k)) for k in kinds]
+    lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o.get("rider_lat"), o.get("rider_lng"))
+    return {"id": o["id"], "ref": o["ref"], "rider": o["rider"] or r.get("name") or "", "rider_id": o["rider_id"],
+            "phone": r.get("phone") or "", "restaurant": o["restaurant"], "restaurant_phone": o.get("restaurant_phone", ""),
+            "customer_addr": o["customer_addr"], "customer_zip": o.get("customer_zip", ""), "phase": o["phase"],
+            "phase_label": PHASE_LABEL.get(o["phase"], o["phase"]), "elapsed": int(elapsed) if elapsed is not None else None,
+            "target": rules.ptod_target_min, "eta_customer": hm(o.get("eta_customer")), "eta_restaurant": hm(o.get("eta_restaurant")),
+            "timeline": {k: hm(o.get(k + "_at")) for k in ("dispatched", "accepted", "started", "at_restaurant", "picked_up", "at_customer", "delivered", "cancelled")},
+            "phases": phase_minutes(o), "alerts": kinds, "severity": "red" if "red" in sevs else ("amber" if kinds else ""),
+            "stacked": bool(o.get("stacked")), "cancel_reason": o.get("cancel_reason", ""),
+            "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
+            "rider_online": r.get("online")}
+
+
+@app.get("/api/state", dependencies=[Depends(require_login)])
+def api_state():
+    now = datetime.now(UTC)
+    alerts = store.alerts_for_ui(now)
+    orders = sorted((order_view(o, now) for o in STATE["orders"].values()), key=lambda v: -(v["elapsed"] or 0))
+    busy = {}
+    for o in STATE["orders"].values():
+        if o["rider_id"]:
+            busy[o["rider_id"]] = busy.get(o["rider_id"], 0) + 1
+    riders = []
+    for r in STATE["riders"].values():
+        n = busy.get(r["id"], 0) or len(r.get("active_ids") or [])
+        fix = tracker.last_fix(r["id"])
+        riders.append({"id": r["id"], "name": r["name"], "phone": r["phone"], "online": r["online"], "orders": n,
+                       "status": "offline" if not r["online"] else ("busy" if n else "idle"),
+                       "map_url": f"https://maps.google.com/?q={r['lat']:.5f},{r['lng']:.5f}" if r.get("lat") is not None else "",
+                       "still_min": tracker.stationary_minutes(r["id"], now, rules.stationary_radius_m) if r["online"] else None,
+                       "last_fix_min": int((now - fix[0]).total_seconds() // 60) if fix else None})
+    riders.sort(key=lambda x: ({"busy": 0, "idle": 1, "offline": 2}[x["status"]], -x["orders"], x["name"]))
+    today = store.delivered("today", now)
+    ptods = [o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None]
+    open_alerts = [a for a in alerts if a["resolved_at"] is None]
+    last_ok = STATE["sync"]["last_ok"]
+    stale = (not last_ok) or (now - datetime.fromisoformat(last_ok)).total_seconds() > max(180, SYNC_SECONDS * 4)
+    pulse = {"delivered": len(today),
+             "within_pct": round(100 * sum(1 for p in ptods if p <= rules.ptod_target_min) / len(ptods)) if ptods else None,
+             "target_within_pct": rules.target_within_pct, "target": rules.ptod_target_min,
+             "avg_ptod": round(mean(ptods)) if ptods else None,
+             "live_orders": len(orders), "unassigned": sum(1 for o in orders if o["phase"] == "unassigned"),
+             "riders_online": sum(1 for r in riders if r["online"]), "riders_idle": sum(1 for r in riders if r["status"] == "idle"),
+             "riders_busy": sum(1 for r in riders if r["status"] == "busy"),
+             "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
+    return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders,
+            "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS}}
+
+
+@app.get("/api/insights", dependencies=[Depends(require_login)])
+def api_insights(period: str = "today"):
+    _check_period(period)
+    return store.insights(period, datetime.now(UTC), rules)
+
+
+def _check_period(period):
+    if period not in ("today", "yesterday", "week", "month") and not (len(period) == 10 and period[4] == "-"):
+        raise HTTPException(400, "period must be today, yesterday, week, month or YYYY-MM-DD")
+
+
+@app.get("/api/orders", dependencies=[Depends(require_login)])
+def api_orders(period: str = "today", q: str = ""):
+    _check_period(period)
+    now = datetime.now(UTC)
+    rows = store.orders_in(period, now, q)
+    return {"orders": [order_view(o, now) for o in rows]}
+
+
+@app.get("/api/orders/{oid}", dependencies=[Depends(require_login)])
+def api_order(oid: str):
+    o = store.order(oid)
+    if not o:
+        raise HTTPException(404)
+    now = datetime.now(UTC)
+    pts = store.positions_for_order(o)
+    step = max(1, len(pts) // 9)
+    way = [f"{p['lat']:.5f},{p['lng']:.5f}" for p in pts[::step]][:10]
+    view = order_view(o, now)
+    view.update({"alerts_log": store.alerts_for_order(oid), "positions": len(pts), "trail_km": store.trail_km(o),
+                 "route_url": "https://www.google.com/maps/dir/" + "/".join(way) if len(way) >= 2 else "",
+                 "times": {k: iso(o.get(k + "_at")) for k in ("dispatched", "accepted", "started", "at_restaurant", "picked_up", "at_customer", "delivered", "cancelled")}})
+    return view
+
+
+@app.get("/api/riders/{rid}", dependencies=[Depends(require_login)])
+def api_rider(rid: str, period: str = "today"):
+    _check_period(period)
+    now = datetime.now(UTC)
+    ins = store.insights(period, now, rules)
+    stats = next((r for r in ins["riders"] if r["rider_id"] == rid), None)
+    orders = [order_view(o, now) for o in store.orders_in(period, now) if o["rider_id"] == rid]
+    r = STATE["riders"].get(rid, {})
+    return {"rider": stats or {"rider_id": rid, "rider": r.get("name", "")}, "phone": r.get("phone", ""),
+            "online": r.get("online"), "orders": orders, "period_phases": ins["phases"]}
+
+
+@app.get("/api/daily", dependencies=[Depends(require_login)])
+def api_daily(day: str = ""):
+    now = datetime.now(UTC)
+    day = day or day_key(now - timedelta(days=1))
+    data = store.daily(day)
+    frozen = data is not None
+    if data is None:
+        data = store.insights(day, now, rules)
+        data["day"] = day
+    data["frozen"] = frozen
+    data["trend"] = store.daily_trend(14)
+    data["brief"] = daily_brief(data)
+    return data
+
+
+def daily_brief(d: dict) -> str:
+    """Short text for the team chat."""
+    lines = [f"Quickzi {CITY} — {d.get('day', '')}",
+             f"Orders: {d['delivered']} delivered, {d['cancelled']} cancelled",
+             f"Within {rules.ptod_target_min} min: {d['within_pct'] if d['within_pct'] is not None else '–'}% (target {rules.target_within_pct}%) · avg PTOD {d['avg_ptod'] or '–'} min · late: {d['late']}"]
+    ph = d["phases"]
+    if ph.get("to_accept") is not None:
+        lines.append(f"Avg minutes: accept {ph['to_accept']} · to restaurant {ph['to_restaurant']} · at restaurant {ph['at_restaurant']} · to customer {ph['to_customer']} · handover {ph['handover']}")
+    if d["riders"]:
+        best = d["riders"][0]
+        lines.append(f"Best rider: {best['rider']} ({best['within_pct']}% within target, {best['delivered']} orders)")
+    for f in d["focus"][:3]:
+        lines.append(f"• {f['title']}")
+    return "\n".join(lines)
+
+
+@app.get("/api/settings", dependencies=[Depends(require_login)])
+def api_settings_get():
+    return {"rules": rules.as_dict(), "labels": {
+        "ptod_target_min": "PTOD target (minutes from dispatch to delivered)", "ptod_warn_min": "PTOD warning at (minutes)",
+        "target_within_pct": "Goal: % of orders within target", "accept_limit_min": "Alert if nobody accepted after (min)",
+        "start_limit_min": "Alert if accepted but not started after (min)", "stationary_min": "Alert if not moving for (min)",
+        "wrong_way_m": "Alert if further from next stop by (metres)", "late_grace_min": "Alert if behind ETA by (min)",
+        "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)"}}
+
+
+@app.post("/api/settings", dependencies=[Depends(require_login)])
+async def api_settings_set(request: Request):
+    values = await request.json()
+    rules.apply(values)
+    store.set_settings({k: v for k, v in values.items() if k in Rules.EDITABLE})
+    store.log("info", "thresholds changed: " + ", ".join(f"{k}={v}" for k, v in values.items() if k in Rules.EDITABLE))
+    return {"ok": True, "rules": rules.as_dict()}
+
+
+@app.get("/api/system", dependencies=[Depends(require_login)])
+def api_system():
+    s = STATE["sync"]
+    return {"started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
+            "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
+            "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
+
+
+@app.post("/api/alerts/{aid}/dismiss", dependencies=[Depends(require_login)])
+def api_dismiss(aid: int):
+    return {"ok": store.dismiss_alert(aid, datetime.now(UTC))}
+
+
+@app.post("/api/alerts/{aid}/snooze", dependencies=[Depends(require_login)])
+def api_snooze(aid: int, minutes: int = 10):
+    return {"ok": store.snooze_alert(aid, datetime.now(UTC) + timedelta(minutes=max(1, min(minutes, 120))))}
+
+
+@app.get("/export.csv", dependencies=[Depends(require_login)])
+def export_csv(period: str = "today"):
+    _check_period(period)
+    body = store.export_csv(period, datetime.now(UTC))
+    return PlainTextResponse(body, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="quickzi-{CITY.lower()}-{period}.csv"'})
+
+
 @app.get("/health")
 def health():
-    # setup check without revealing any secret values
-    return {"ok": True, "riders_tracked": len(det.riders), "open_issues": len(det.open_issues),
-            "setup": {"dashboard_password_set": bool(DASH_PASSWORD),
-                      "dashboard_password_length": len(DASH_PASSWORD),
-                      "motiontools_token_set": bool(MT_TOKEN),
-                      "webhook_secret_set": PATH_SECRET != "change-me",
-                      "data_dir": str(DATA_DIR)},
-            "events": STATS, "booking_lookup": LOOKUP,
-            "orders_waiting_for_rider": sum(1 for b in BOOKINGS.values() if not b.get("driver_id"))}
-
-
-@app.get("/api/events", dependencies=[Depends(require_login)])
-def api_events():
-    """Last 30 raw webhook events + first booking lookups — used to check MotionTools' field names."""
-    return {"booking_lookups": SAMPLES, "events": RECENT[::-1]}
+    s = STATE["sync"]
+    return {"ok": True, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
+            "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
+            "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
+                      "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
+            "sync": {k: s[k] for k in ("last_ok", "last_error", "runs", "orders_seen", "riders_seen", "backfilled", "webhook_events", "last_snapshot")},
+            "api": mt.stats}
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def dashboard():
     return (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
-
-
-@app.get("/api/live", dependencies=[Depends(require_login)])
-def api_live():
-    return {"incidents": store.live(datetime.now(UTC))}
-
-
-@app.get("/api/active", dependencies=[Depends(require_login)])
-def api_active():
-    """Every order currently in progress, with its rider and PTOD clock."""
-    now = datetime.now(UTC)
-    rows = []
-    for r in det.riders.values():
-        if not (r.on_tour and det.tracked(r)):
-            continue
-        by_order: dict = {}
-        for s in r.stops.values():
-            by_order.setdefault(s.booking_ref or s.stop_id, []).append(s)
-        for ref, stops in by_order.items():
-            pending = [s for s in stops if not s.done]
-            if not pending:
-                continue
-            pick = next((s for s in stops if s.kind == "pickup"), None)
-            drop = next((s for s in stops if s.kind == "dropoff"), None)
-            nxt = sorted(pending, key=lambda s: 0 if s.kind == "pickup" else 1)[0]
-            if nxt.kind == "pickup":
-                status = "At restaurant" if nxt.arrived else "Going to restaurant"
-            else:
-                status = "At customer" if nxt.arrived else "Delivering"
-            start = min((s.assigned_at for s in stops if s.assigned_at), default=None)
-            rows.append({
-                "driver_id": r.driver_id, "rider": r.name, "phone": r.phone, "order_ref": ref,
-                "status": status,
-                "minutes": int((now - start).total_seconds() // 60) if start else None,
-                "eta": drop.eta.isoformat() if drop and drop.eta else None,
-                "address": nxt.address,
-                "has_issue": any(k[0] == r.driver_id for k in det.open_issues),
-            })
-    for bid, b in BOOKINGS.items():
-        if b.get("driver_id"):
-            continue
-        pending = [s for s in b["stops"].values() if not s.done]
-        if not pending:
-            continue
-        drop = next((s for s in b["stops"].values() if s.kind == "dropoff"), None)
-        picked = any(s.kind == "pickup" and s.done for s in b["stops"].values())
-        rows.append({"driver_id": "", "rider": "Rider not known yet", "phone": "", "order_ref": b["ref"],
-                     "status": "Delivering" if picked else "Going to restaurant",
-                     "minutes": int((now - b["first_seen"]).total_seconds() // 60),
-                     "eta": drop.eta.isoformat() if drop and drop.eta else None,
-                     "address": "", "has_issue": False})
-    rows.sort(key=lambda x: -(x["minutes"] or 0))
-    return {"orders": rows, "unassigned": 0}
-
-
-@app.get("/api/performance", dependencies=[Depends(require_login)])
-def api_performance(period: str = "today"):
-    if period not in ("today", "week", "month"):
-        raise HTTPException(400, "period must be today, week or month")
-    return {"period": period, "riders": store.performance(period, datetime.now(UTC))}
-
-
-@app.get("/api/rider/{driver_id}", dependencies=[Depends(require_login)])
-def api_rider(driver_id: str):
-    return {"incidents": store.rider_history(driver_id, datetime.now(UTC))}
-
-
-# ---------- background check every minute ----------
-async def checker():
-    while True:
-        try:
-            det.check(datetime.now(UTC))
-        except Exception as e:
-            log.exception("check failed: %s", e)
-        await asyncio.sleep(60)
-
-
-@app.on_event("startup")
-async def start():
-    if not DASH_PASSWORD:
-        log.warning("DASHBOARD_PASSWORD is not set — the dashboard will refuse all logins")
-    asyncio.create_task(checker())
