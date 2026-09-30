@@ -1,8 +1,11 @@
 """Quickzi ops platform — server.
 
-Truth comes from MotionTools' API every SYNC_SECONDS (all active orders + all riders), 24/7.
+API mode:     truth comes from MotionTools' API every SYNC_SECONDS (all active orders + all riders), 24/7;
+              the MotionTools webhook only wakes the sync early.
+Webhook mode: the account is in "restricted API mode" — orders are rebuilt from the events MotionTools pushes,
+              and every endpoint that is still open (booking detail, rider detail, restaurant detail) is used
+              to fill in what the events do not carry.  The server probes the endpoints itself, every hour.
 Everything is written to SQLite on the Railway volume, so nothing is lost while nobody is watching.
-The MotionTools webhook only wakes the sync early.
 
 Env:  MT_API_TOKEN, DASHBOARD_PASSWORD, WEBHOOK_PATH_SECRET, DATA_DIR (/data),
       MUNICH_SERVICE_AREA_ID (comma-separated area ids to keep; empty = all), SYNC_SECONDS (30), CITY_NAME
@@ -24,7 +27,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from events import Projector
-from mt import ACTIVE_STATUSES, MotionTools
+from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_minutes
 from store import Store, day_key, day_start
 
@@ -63,9 +66,11 @@ basic = HTTPBasic()
 STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "raw_samples": {},
          "sync": {"mode": "api", "last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
                   "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None,
-                  "api_retry_at": None, "events": {}}}
+                  "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None}}
 WAKE = asyncio.Event()
 projector = Projector(STATE, store, tracker, AREAS)
+ENRICHED_RIDERS: dict = {}          # rider_id -> when we last read it through the API
+ENRICH_LOCK = asyncio.Lock()
 
 
 def api_restricted() -> bool:
@@ -101,9 +106,10 @@ async def sync_riders(now: datetime):
             continue
         loc = u.get("location") or {}
         online = u.get("status") == "online"
-        info = {"id": rid, "name": rider_name(u), "phone": (u.get("profile") or {}).get("phone_number") or "",
+        mt_phone = (u.get("profile") or {}).get("phone_number") or ""
+        info = {"id": rid, "name": rider_name(u), "phone": projector.phone_for(rid, mt_phone), "mt_phone": mt_phone,
                 "online": online, "lat": loc.get("lat"), "lng": loc.get("lng"),
-                "active_ids": u.get("active_hailing_booking_ids") or []}
+                "active_ids": u.get("active_hailing_booking_ids") or u.get("active_booking_ids") or []}
         STATE["riders"][rid] = info
         store.upsert_rider(rid, info["name"], info["phone"], online, info["lat"], info["lng"], info["active_ids"], now)
         if online:
@@ -161,9 +167,9 @@ async def backfill_done(day: datetime) -> int:
     date = day.astimezone(BERLIN).strftime("%Y-%m-%d")
     n = 0
     for statuses in (["done", "paid", "processing_payment"], ["cancelled"]):
-        rows = await mt.list_bookings(AREAS, statuses, extra={"local_done_at": date})
+        rows = await mt.list_bookings(AREAS, statuses, extra={"local_done_at": date}, history=True)
         if rows is None:
-            rows = await mt.list_bookings(AREAS, statuses, extra={"date": date})
+            rows = await mt.list_bookings(AREAS, statuses, extra={"date": date}, history=True)
         for b in rows or []:
             o = parse_booking(b)
             if o["id"] and (o["delivered_at"] or o["phase"] == "cancelled"):
@@ -171,6 +177,130 @@ async def backfill_done(day: datetime) -> int:
                 n += 1
     STATE["sync"]["backfilled"] += n
     return n
+
+
+# ====================================================================== webhook mode: use whatever the API still allows
+async def probe_endpoints(now: datetime, quiet: bool = False):
+    """Test every MotionTools endpoint once (startup + hourly). Restricted ones are skipped until the next probe."""
+    if not mt.enabled:
+        return
+    sample_order = next(iter(STATE["orders"].values()), None) or next(iter(store.orders_in("week", now)), None)
+    sample_place = next((o.get("place_id") for o in [sample_order] if o and o.get("place_id")), None) \
+        or next(iter(projector.places), None)
+    sample_rider = (sample_order or {}).get("rider_id") or next(iter(STATE["riders"]), None)
+    await mt.probe(booking_id=(sample_order or {}).get("id"), place_id=sample_place, user_id=sample_rider)
+    STATE["sync"]["probe_at"] = iso(now)
+    if not quiet:
+        store.log("info", "MotionTools endpoint check: " + mt.endpoint_summary())
+
+
+async def enrich_order(bid: str, now: datetime = None) -> bool:
+    """Webhook mode: read one booking through the API (if the detail endpoint is open) and fill the gaps."""
+    if not mt.enabled or not mt.detail_available():
+        return False
+    b = await mt.get_booking(bid)
+    if not b:
+        return False
+    now = now or datetime.now(UTC)
+    if "booking" not in STATE["raw_samples"]:
+        STATE["raw_samples"]["booking"] = b
+    async with ENRICH_LOCK:
+        o = STATE["orders"].get(bid) or store.order(bid)
+        if o is None:
+            return False
+        o.setdefault("stop_types", {})
+        p = parse_booking(b)
+        if AREAS and p.get("area") and p["area"] not in AREAS:
+            return False
+        projector.merge_api(o, p, now)
+        STATE["sync"]["enriched"] += 1
+        if p.get("rider_id"):
+            r = STATE["riders"].get(p["rider_id"])
+            if r is not None and p.get("rider") and not r.get("name"):
+                r["name"] = p["rider"]
+    return True
+
+
+async def enrich_rider(rid: str, now: datetime = None) -> bool:
+    """Webhook mode: name + phone of a rider through /api/users/{id} (once a day per rider, if open)."""
+    if not rid or not mt.enabled or mt.blocked(USER_PATH):
+        return False
+    now = now or datetime.now(UTC)
+    last = ENRICHED_RIDERS.get(rid)
+    if last and now - last < timedelta(hours=24):
+        return False
+    ENRICHED_RIDERS[rid] = now
+    u = await mt.get_user(rid)
+    if not u:
+        return False
+    r = projector.rider(rid)
+    name = rider_name(u)
+    if name and name != "Rider":
+        r["name"] = name
+    mt_phone = (u.get("profile") or {}).get("phone_number") or u.get("phone_number") or ""
+    if mt_phone:
+        r["mt_phone"] = mt_phone
+        r["phone"] = projector.phone_for(rid, mt_phone)
+    if "rider" not in STATE["raw_samples"]:
+        STATE["raw_samples"]["rider"] = u
+    store.upsert_rider(rid, r["name"] or "Rider", r["phone"], r["online"], r.get("lat"), r.get("lng"),
+                       [o["id"] for o in STATE["orders"].values() if o["rider_id"] == rid], now)
+    for o in STATE["orders"].values():
+        if o["rider_id"] == rid and not o["rider"]:
+            o["rider"] = r["name"]
+    return True
+
+
+async def enrich_place(pid: str) -> bool:
+    """Webhook mode: restaurant name through /api/places/{id} (if open) — otherwise typed in Settings."""
+    if not pid or projector.places.get(pid) or not mt.enabled or mt.blocked(PLACE_PATH):
+        return False
+    p = await mt.get_place(pid)
+    if not p:
+        return False
+    name = p.get("name") or p.get("title") or ""
+    addr = p.get("formatted_address") or p.get("address") or ""
+    if isinstance(addr, dict):
+        addr = " ".join(str(x) for x in [addr.get("street"), addr.get("house_number"), addr.get("zip_code"), addr.get("city")] if x)
+    if name:
+        projector.set_place(pid, name)
+        store.log("info", f"restaurant named from MotionTools: {name}" + (f" ({addr})" if addr else ""))
+        return True
+    return False
+
+
+async def enrich_after_event(p: dict):
+    """Runs in the background after each webhook event so the webhook answers MotionTools immediately."""
+    d = p.get("data") or {}
+    rtype, ev = str(p.get("resource_type") or ""), str(p.get("event") or "")
+    try:
+        if rtype == "booking" and ev == "created":
+            pids = d.get("place_ids") or []
+            await enrich_place(pids[0] if isinstance(pids, list) and pids else (pids if isinstance(pids, str) else ""))
+            if await enrich_order(d.get("booking_id")):
+                evaluate_all(datetime.now(UTC))
+        elif rtype == "booking" and d.get("driver_id"):
+            await enrich_rider(d.get("driver_id"))
+        elif rtype == "driver" and d.get("driver_id"):
+            await enrich_rider(d.get("driver_id"))
+        elif rtype == "tour" and ev == "transition" and d.get("to") == "claimed":
+            users = d.get("affected_user_ids") or []
+            await enrich_rider(users[0] if isinstance(users, list) and users else users if isinstance(users, str) else "")
+    except Exception as e:
+        log.exception("enrichment failed: %s", e)
+
+
+async def refresh_live_orders(now: datetime):
+    """Webhook mode, once a minute: re-read every live order through the open detail endpoint —
+    gives rider GPS, ETAs and status even without the GPS webhook."""
+    if not mt.stats.get("detail_path"):
+        return
+    changed = False
+    for bid in list(STATE["orders"])[:40]:
+        if await enrich_order(bid, now):
+            changed = True
+    if changed:
+        evaluate_all(datetime.now(UTC))
 
 
 def alert_payload(o: dict, c: dict) -> dict:
@@ -216,30 +346,43 @@ def snapshot_yesterday(now: datetime):
 async def sync_loop():
     first = True
     last_backfill = None
+    last_refresh = None
     while True:
         now = datetime.now(UTC)
         STATE["sync"]["runs"] += 1
         try:
+            if mt.enabled and first:
+                await probe_endpoints(now)                 # learn what this token may read before doing anything
             mode = STATE["sync"]["mode"]
             if mt.enabled and mode == "webhook":
-                # retry the API every 30 min: the moment MotionTools lifts the restriction we switch back
+                # every 30 min: probe again and retry the list endpoints — the moment MotionTools opens them we switch back
                 retry_at = STATE["sync"]["api_retry_at"]
                 if retry_at is None or now >= datetime.fromisoformat(retry_at):
                     STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
+                    if not first:
+                        await probe_endpoints(now, quiet=True)
                     if await mt.list_bookings(AREAS, ACTIVE_STATUSES) is not None:
                         STATE["sync"]["mode"] = "api"
-                        store.log("info", "MotionTools API access works again — switching to API mode")
+                        store.log("info", f"MotionTools bookings endpoint works ({mt.stats['bookings_path']}) — switching to API mode")
                         first = True
+                    elif mt.stats.get("detail_path"):
+                        for o in list(STATE["orders"].values()):        # finished while we were down? close them now
+                            await enrich_order(o["id"], now)
+                if last_refresh is None or (now - last_refresh) >= timedelta(seconds=60):
+                    await refresh_live_orders(now)
+                    last_refresh = now
+                STATE["sync"]["orders_seen"] = len(STATE["orders"])
+                STATE["sync"]["riders_seen"] = sum(1 for r in STATE["riders"].values() if r.get("online"))
                 STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
             if mt.enabled and STATE["sync"]["mode"] == "api":
                 await sync_riders(now)
                 ok = await sync_orders(now)
-                if not ok and api_restricted():
+                if not ok and (api_restricted() or all(mt.blocked(p) for p in ("/api/bookings/active", "/api/bookings", "/api/hailing/bookings"))):
                     STATE["sync"]["mode"] = "webhook"
                     STATE["sync"]["last_error"] = None
                     STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
-                    store.log("error", "MotionTools account is in restricted API mode — running in WEBHOOK mode "
-                                       "(orders rebuilt from events). Ask MotionTools support to enable API access.")
+                    store.log("error", "MotionTools has this account in restricted API mode — running in WEBHOOK mode "
+                                       "(orders rebuilt from events; open endpoints: " + mt.endpoint_summary() + ")")
                     ok = False
                     first = False
                 if first and ok:
@@ -282,8 +425,9 @@ async def startup():
         STATE["open_alerts"][(a["order_id"], a["kind"])] = a["id"]
         STATE["sev"][(a["order_id"], a["kind"])] = a["severity"]
     for r in store.riders():
-        STATE["riders"][r["id"]] = {"id": r["id"], "name": r["name"], "phone": r["phone"], "online": bool(r["online"]),
-                                    "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"]}
+        STATE["riders"][r["id"]] = {"id": r["id"], "name": r["name"], "phone": projector.phone_for(r["id"], r["phone"]),
+                                    "mt_phone": r["phone"] if r["phone"] != projector.phones.get(r["id"]) else "",
+                                    "online": bool(r["online"]), "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"]}
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
     if not DASH_PASSWORD:
         store.log("error", "DASHBOARD_PASSWORD not set — dashboard refuses all logins")
@@ -312,6 +456,8 @@ async def webhook(secret: str, request: Request):
             name = projector.apply(p)
             STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
             evaluate_all(datetime.now(UTC))
+            if mt.enabled and name != "other area":
+                asyncio.create_task(enrich_after_event(p))      # fill names / phones / GPS through open endpoints
         except Exception as e:
             log.exception("event failed: %s", e)
             store.log("error", f"event {p.get('resource_type')}.{p.get('event')} failed: {e}"[:300])
@@ -402,7 +548,49 @@ async def api_places_set(request: Request):
     for pid, name in (body or {}).items():
         if pid and isinstance(name, str):
             projector.set_place(pid, name.strip())
+    evaluate_all(datetime.now(UTC))
     return {"ok": True}
+
+
+@app.get("/api/riders", dependencies=[Depends(require_login)])
+def api_riders():
+    """Known riders with their phone numbers — MotionTools' number if it sent one, otherwise the one typed in Settings."""
+    rows = {r["id"]: r for r in store.riders()}
+    for rid, r in STATE["riders"].items():
+        rows.setdefault(rid, r)
+    out = []
+    for rid, r in rows.items():
+        live = STATE["riders"].get(rid, {})
+        mt_phone = live.get("mt_phone") or ""
+        out.append({"id": rid, "name": live.get("name") or r.get("name") or "Rider", "mt_phone": mt_phone,
+                    "phone": projector.phones.get(rid, ""), "online": bool(live.get("online", r.get("online")))})
+    out.sort(key=lambda x: (not x["online"], x["name"]))
+    return {"riders": out}
+
+
+@app.post("/api/riders", dependencies=[Depends(require_login)])
+async def api_riders_set(request: Request):
+    body = await request.json()
+    for rid, phone in (body or {}).items():
+        if rid and isinstance(phone, str):
+            projector.set_phone(rid, phone.strip())
+            r = STATE["riders"].get(rid)
+            if r is not None:
+                store.upsert_rider(rid, r["name"] or "Rider", r["phone"], r["online"], r.get("lat"), r.get("lng"),
+                                   r.get("active_ids") or [], datetime.now(UTC))
+    evaluate_all(datetime.now(UTC))                     # open alerts pick up the new numbers immediately
+    return {"ok": True}
+
+
+@app.post("/api/probe", dependencies=[Depends(require_login)])
+async def api_probe():
+    """Button in Settings: re-check which MotionTools endpoints this token may read, right now."""
+    now = datetime.now(UTC)
+    await probe_endpoints(now)
+    if STATE["sync"]["mode"] == "webhook":
+        STATE["sync"]["api_retry_at"] = iso(now)         # let the next sync run try the list endpoints immediately
+        WAKE.set()
+    return {"ok": True, "endpoints": mt.stats["endpoints"], "summary": mt.endpoint_summary()}
 
 
 @app.get("/api/insights", dependencies=[Depends(require_login)])
@@ -506,7 +694,7 @@ async def api_settings_set(request: Request):
 def api_system():
     s = STATE["sync"]
     return {"started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
-            "mode": s["mode"], "event_counts": projector.counts,
+            "mode": s["mode"], "event_counts": projector.counts, "endpoint_summary": mt.endpoint_summary(),
             "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
             "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
 

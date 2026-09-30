@@ -111,12 +111,19 @@ for rid, (fn, ln, ph) in RIDERS.items():
                     "active_hailing_booking_ids": [b["id"] for b in ACTIVE if b["driver"] and b["driver"]["id"] == rid]})
 
 
-class FakeMT:
-    enabled = True
-    stats = {"calls": 0, "errors": 0, "last_status": 200, "last_error": None, "bookings_filter_mode": "fake",
-             "drivers_filter_mode": "fake"}
+from mt import MotionTools  # noqa: E402
 
-    async def list_bookings(self, area_ids, statuses, extra=None):
+
+class FakeMT(MotionTools):
+    def __init__(self):
+        super().__init__("fake")
+        self.stats.update(bookings_filter_mode="fake", drivers_filter_mode="fake", bookings_path="/api/bookings")
+
+    async def probe(self, **k):
+        self.stats["endpoints"] = {"/api/bookings": "ok", "/api/users": "ok"}
+        return self.stats["endpoints"]
+
+    async def list_bookings(self, area_ids, statuses, extra=None, history=False):
         self.stats["calls"] += 1
         return DONE if "done" in statuses else ACTIVE
 

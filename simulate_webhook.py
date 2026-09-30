@@ -1,6 +1,11 @@
-"""Test WEBHOOK mode: MotionTools API answers 403 (restricted), orders come only from webhook events.
+"""Test WEBHOOK mode against a FAKE MotionTools HTTP server in "restricted API mode".
 
-    DASHBOARD_PASSWORD=test python3 simulate_webhook.py     -> http://127.0.0.1:8021/dashboard
+    DASHBOARD_PASSWORD=test python3 simulate_webhook.py              -> http://127.0.0.1:8021/dashboard
+    SIM_OPEN=none  ...   every read endpoint answers 403 restricted_endpoint (worst case)
+    SIM_OPEN=detail ...  (default) list endpoints restricted, but /api/bookings/{id}, /api/users/{id}, /api/places/{id} open
+    SIM_OPEN=all   ...   nothing restricted -> the server must switch to API mode by itself
+
+The real mt.py client talks to the fake server, so probing, blocking and enrichment are exercised end to end.
 """
 from __future__ import annotations
 
@@ -18,28 +23,17 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="quickzi-wh-"))
 os.environ.setdefault("MT_API_TOKEN", "fake")
 os.environ.setdefault("WEBHOOK_PATH_SECRET", "abc")
 os.environ.setdefault("SYNC_SECONDS", "5")
+SIM_OPEN = os.environ.get("SIM_OPEN", "detail")
+
+import httpx  # noqa: E402
+from fastapi import FastAPI, Response  # noqa: E402
 
 import app as appmod  # noqa: E402
+import mt as mtmod  # noqa: E402
 
-
-class RestrictedMT:
-    enabled = True
-    stats = {"calls": 0, "errors": 0, "last_status": 403, "bookings_filter_mode": None, "drivers_filter_mode": None,
-             "last_error": '/api/hailing/bookings -> 403 {"error_code":"restricted_endpoint","description":"Your account is in restricted API mode"}'}
-
-    async def list_bookings(self, *a, **k):
-        self.stats["calls"] += 1; self.stats["errors"] += 1
-        return None
-
-    async def get_booking(self, *a):
-        return None
-
-    async def list_drivers(self, *a):
-        self.stats["calls"] += 1; self.stats["errors"] += 1
-        return None
-
-
-appmod.mt = RestrictedMT()
+FAKE_PORT = 8031
+RESTRICTED = Response(content='{"error_code":"restricted_endpoint","description":"Your account is in restricted API mode and cannot access this endpoint. Please contact support."}',
+                      status_code=403, media_type="application/json")
 NOW = datetime.now(UTC)
 m = lambda n: (NOW + timedelta(minutes=n)).isoformat(timespec="seconds")
 AREA = "0d0bc288-f92a-4c34-a2cd-725838be6619"
@@ -51,8 +45,16 @@ def ev(rtype, event_name, t, **data):
     return {"id": "e", "timestamp": t, "resource_type": rtype, "event": event_name, "data": {"service_area_id": AREA, **data}}
 
 
+BOOK: dict = {}          # booking id -> what the fake API knows about it
+PLACES = {PLACE_BK: ("Burger King Freiham", "Bodenseestr. 200", 48.147, 11.428, "+49 89 1111111"),
+          PLACE_CHO: ("Cho Que Harras", "Albert-Roßhaupter-Str. 4", 48.126, 11.539, "+49 89 2222222")}
+RIDERS = {"r-ahmad": ("Ahmad", "Sabe", "+49 151 1000001"), "r-murat": ("Murat", "K.", "+49 151 1000002"),
+          "r-obaida": ("Obaida", "H.", "+49 151 1000003"), "r-sven": ("Sven", "B.", "+49 151 1000007")}
+
+
 def order_events(ref, bid, place, rider_id, rider, t0, wait_min=4, deliver=True, gps=True):
     p1, d1 = f"{bid}-p", f"{bid}-d"
+    BOOK[bid] = {"ref": ref, "place": place, "rider_id": rider_id, "rider": rider, "delivered": bool(rider_id and wait_min is not None and deliver)}
     out = [ev("booking", "created", m(t0), booking_id=bid, external_id=ref, customer_id=CUST, place_ids=[place], status="to_be_dispatched"),
            ev("booking", "transition", m(t0 + 0.5), booking_id=bid, external_id=ref, **{"from": "to_be_dispatched", "to": "dispatched", "event": "dispatch"}),
            ev("booking", "etas_recalculated", m(t0 + 1), booking_id=bid, external_id=ref, customer_id=CUST,
@@ -90,11 +92,109 @@ EVENTS += [ev("booking", "created", m(-6), booking_id="b-live4", external_id="KM
            ev("tour", "created", m(-5.5), tour_id="t-9", dispatched_booking_ids=["b-live4"], status="pickable"),
            ev("tour", "transition", m(-4), tour_id="t-9", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-sven"])]
 EVENTS.sort(key=lambda e: e["timestamp"])
+BOOK["b-live4"] = {"ref": "KMW86T", "place": PLACE_CHO, "rider_id": "r-sven", "rider": "Sven B.", "delivered": False}
+
+
+# ---------------------------------------------------------------- fake MotionTools HTTP server
+fake = FastAPI()
+
+
+POSTED: dict = {}        # booking id -> {event name: timestamp} of events already delivered (the API never knows the future)
+
+
+def booking_json(bid: str) -> dict:
+    i = BOOK[bid]
+    name, street, plat, plng, pphone = PLACES[i["place"]]
+    seen = POSTED.get(bid, {})
+    rid = i["rider_id"] if ("in_progress" in seen or "claimed" in seen) else None
+    prof = RIDERS.get(rid)
+    done = "done" in seen
+    events = [{"name": "dispatched", "status": "dispatched", "timestamp": seen.get("created")}]
+    if "claimed" in seen:
+        events.append({"name": "claimed", "status": "claimed", "timestamp": seen["claimed"]})
+    if "in_progress" in seen:
+        events.append({"name": "en_route", "status": "en_route", "timestamp": seen["in_progress"]})
+    return {"id": bid, "external_id": i["ref"], "status": "done" if done else ("en_route" if rid else "pickable"),
+            "created_at": seen.get("created") or m(-30), "service_area": {"id": AREA, "name": "München"},
+            "driver": {"id": rid, "profile": {"first_name": prof[0], "last_name": prof[1]}} if rid and prof else None,
+            "driver_location": {"lat": 48.1501, "lng": 11.5702} if rid and not done else None,
+            "stops": [{"id": f"{bid}-p", "type": "pickup", "lat": plat, "lng": plng, "place_id": i["place"], "place": {"name": name},
+                       "phone_number": pphone, "street": street.rsplit(" ", 1)[0], "number": street.rsplit(" ", 1)[1], "city": "München",
+                       "zip_code": "81249", "status": "scheduled"},
+                      {"id": f"{bid}-d", "type": "dropoff", "lat": plat + 0.01, "lng": plng + 0.02, "street": "Leopoldstr.", "number": "12",
+                       "city": "München", "zip_code": "80802", "phone_number": "+49 170 0000000", "status": "scheduled"}],
+            "events": [e for e in events if e["timestamp"]], "total_estimated_distance_meters": 3400}
+
+
+def open_(kind: str) -> bool:
+    return SIM_OPEN == "all" or (SIM_OPEN == "detail" and kind == "detail")
+
+
+@fake.get("/api/user")
+def f_me():
+    return {"user": {"id": "admin-1", "role": "admin", "email": "ops@quickzi.de"}}
+
+
+@fake.get("/api/bookings/active")
+@fake.get("/api/bookings")
+@fake.get("/api/hailing/bookings")
+def f_list():
+    if not open_("list"):
+        return RESTRICTED
+    return {"results": [booking_json(b) for b in BOOK if not BOOK[b]["delivered"]], "meta": {"pagination": {"next": None}}}
+
+
+@fake.get("/api/bookings/{bid}")
+@fake.get("/api/hailing/bookings/{bid}")
+def f_detail(bid: str):
+    if not open_("detail"):
+        return RESTRICTED
+    if bid not in BOOK:
+        return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
+    return {"booking": booking_json(bid)}
+
+
+@fake.get("/api/users")
+def f_users():
+    if not open_("list"):
+        return RESTRICTED
+    return {"results": [{"id": rid, "role": "driver", "status": "online", "profile": {"first_name": p[0], "last_name": p[1], "phone_number": p[2]},
+                         "location": {"lat": 48.14, "lng": 11.56}, "active_hailing_booking_ids": []} for rid, p in RIDERS.items()],
+            "meta": {"pagination": {"next": None}}}
+
+
+@fake.get("/api/users/{rid}")
+def f_user(rid: str):
+    if not open_("detail"):
+        return RESTRICTED
+    p = RIDERS.get(rid)
+    if not p:
+        return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
+    return {"user": {"id": rid, "role": "driver", "profile": {"first_name": p[0], "last_name": p[1], "phone_number": p[2]}}}
+
+
+@fake.get("/api/places/{pid}")
+def f_place(pid: str):
+    if not open_("detail"):
+        return RESTRICTED
+    if pid not in PLACES:
+        return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
+    name, street, lat, lng, phone = PLACES[pid]
+    return {"place": {"id": pid, "name": name, "formatted_address": f"{street}, München", "lat": lat, "lng": lng}}
 
 
 def post_all():
-    time.sleep(3)
+    time.sleep(4)
     for e in EVENTS:
+        d = e["data"]
+        if e["resource_type"] == "booking" and d.get("booking_id"):
+            key = "done" if (e["event"] == "transition" and d.get("to") == "done") else e["event"]
+            POSTED.setdefault(d["booking_id"], {}).setdefault(key, e["timestamp"])
+        if e["resource_type"] == "driver" and e["event"] == "busy":          # the fake tour claim: next in_progress belongs to it
+            pass
+        if e["resource_type"] == "tour" and e["event"] == "transition" and d.get("to") == "claimed":
+            for b in ("b-live4",):
+                POSTED.setdefault(b, {}).setdefault("claimed", e["timestamp"])
         req = urllib.request.Request("http://127.0.0.1:8021/mt/abc", data=json.dumps(e).encode(), headers={"content-type": "application/json"})
         urllib.request.urlopen(req)
     print(f"posted {len(EVENTS)} events")
@@ -102,6 +202,9 @@ def post_all():
 
 if __name__ == "__main__":
     import uvicorn
+    # point the real client at the fake server
+    appmod.mt._client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{FAKE_PORT}", timeout=20)
+    threading.Thread(target=lambda: uvicorn.run(fake, host="127.0.0.1", port=FAKE_PORT, log_level="warning"), daemon=True).start()
     threading.Thread(target=post_all, daemon=True).start()
-    print("Dashboard: http://127.0.0.1:8021/dashboard  (password: test)")
+    print(f"Dashboard: http://127.0.0.1:8021/dashboard  (password: test)   fake MotionTools: SIM_OPEN={SIM_OPEN}")
     uvicorn.run(appmod.app, host="127.0.0.1", port=8021, log_level="warning")

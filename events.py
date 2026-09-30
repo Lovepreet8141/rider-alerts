@@ -28,7 +28,8 @@ class Projector:
         self.state, self.store, self.tracker, self.areas = state, store, tracker, areas
         self.tours: dict = {}          # tour_id -> [booking_id]
         self.busy_at: dict = {}        # driver_id -> time the driver last became busy (≈ accepted an order)
-        self.places: dict = {}         # place_id -> restaurant name (editable in Settings)
+        self.places: dict = {}         # place_id -> restaurant name (editable in Settings / filled from the API)
+        self.phones: dict = {}         # rider_id -> phone number typed in Settings (used when MotionTools sends none)
         self.counts: dict = {}
         self._load()
 
@@ -39,13 +40,26 @@ class Projector:
                 self.places[k[6:]] = v
             elif k.startswith("tour:"):
                 self.tours[k[5:]] = v.split(",")
+            elif k.startswith("phone:"):
+                self.phones[k[6:]] = v
 
     def set_place(self, pid: str, name: str):
         self.places[pid] = name
         self.store.set_settings({f"place:{pid}": name})
         for o in self.state["orders"].values():
             if o.get("place_id") == pid:
-                o["restaurant"] = name
+                o["restaurant"] = name or self.restaurant_name(pid)
+
+    def set_phone(self, rid: str, phone: str):
+        self.phones[rid] = phone
+        self.store.set_settings({f"phone:{rid}": phone})
+        r = self.state["riders"].get(rid)
+        if r is not None:
+            r["phone"] = phone or r.get("mt_phone") or ""
+
+    def phone_for(self, rid: str, mt_phone: str = "") -> str:
+        """A number typed in Settings wins; otherwise whatever MotionTools sent."""
+        return self.phones.get(rid) or mt_phone or ""
 
     def restaurant_name(self, pid: str) -> str:
         return self.places.get(pid) or (f"Restaurant {pid[:6]}" if pid else "Restaurant")
@@ -69,8 +83,10 @@ class Projector:
         return o
 
     def rider(self, rid: str, name: str = "", now: datetime = None):
-        r = self.state["riders"].setdefault(rid, {"id": rid, "name": "", "phone": "", "online": True, "lat": None,
-                                                  "lng": None, "active_ids": []})
+        r = self.state["riders"].get(rid)
+        if r is None:
+            r = self.state["riders"][rid] = {"id": rid, "name": "", "phone": self.phones.get(rid, ""), "mt_phone": "",
+                                             "online": True, "lat": None, "lng": None, "active_ids": []}
         if name and not r["name"]:
             r["name"] = name
         return r
@@ -90,6 +106,38 @@ class Projector:
             r["lat"], r["lng"] = lat, lng
             self.tracker.push(rid, lat, lng, now)
             self.store.record_position(rid, lat, lng, order_id, now)
+
+    TEXT_FIELDS = ("ref", "area", "area_name", "restaurant_phone", "customer_addr", "customer_phone", "customer_zip",
+                   "place_id", "cancel_reason")
+    TIME_FIELDS = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
+                   "at_customer_at", "delivered_at")
+
+    def merge_api(self, o: dict, p: dict, now: datetime):
+        """Fill what the events could not tell us from a full booking read through the API (if that endpoint is open)."""
+        for k in self.TEXT_FIELDS:
+            if p.get(k) and not o.get(k):
+                o[k] = p[k]
+        for k in ("pick_lat", "pick_lng", "drop_lat", "drop_lng", "est_distance_m", "eta_restaurant", "eta_customer"):
+            if p.get(k) is not None:
+                o[k] = p[k]
+        if p.get("restaurant") and p["restaurant"] != "Restaurant":
+            o["restaurant"] = p["restaurant"]
+            if o.get("place_id") and not self.places.get(o["place_id"]):
+                self.set_place(o["place_id"], p["restaurant"])
+        for k in self.TIME_FIELDS:
+            if p.get(k) and not o.get(k):
+                o[k] = p[k]
+        if p.get("status"):
+            o["status"] = p["status"]
+        if p.get("phase") == "cancelled":
+            o["cancelled"] = True
+        if p.get("rider_id"):
+            self.set_rider(o, p["rider_id"], p.get("rider") or "", now)
+        if p.get("rider_lat") is not None and o["rider_id"] and not (o.get("delivered_at") or o.get("cancelled")):
+            o["rider_lat"], o["rider_lng"] = p["rider_lat"], p["rider_lng"]
+            self.gps(o["rider_id"], p["rider_lat"], p["rider_lng"], now, o["id"])
+        o["partial"] = False
+        self.finish(o, now)
 
     def finish(self, o: dict, now: datetime):
         o["phase"] = phase_from(o)
@@ -193,7 +241,8 @@ class Projector:
             if pname:
                 r["name"] = pname
             if prof.get("phone_number"):
-                r["phone"] = prof["phone_number"]
+                r["mt_phone"] = prof["phone_number"]
+                r["phone"] = self.phone_for(rid, r["mt_phone"])
             if ev == "online":
                 r["online"] = True
                 loc = d.get("location") or {}
