@@ -110,8 +110,11 @@ class Detector:
         return self.riders[driver_id]
 
     def tracked(self, r: Rider) -> bool:
-        area = self.cfg.munich_service_area_id
-        return area is None or r.service_area_id == area
+        areas = self.cfg.munich_service_area_id
+        if not areas:
+            return True
+        allowed = {a.strip() for a in areas.split(",") if a.strip()}
+        return r.service_area_id is None or r.service_area_id in allowed
 
     @staticmethod
     def next_stop(r: Rider) -> Optional[Stop]:
