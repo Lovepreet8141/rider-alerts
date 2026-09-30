@@ -231,8 +231,9 @@ class Store:
 
     def update_alert(self, aid: int, a: dict, now: datetime):
         self._exec("UPDATE alerts SET severity=?, headline=?, action=?, phone=?, map_url=?, rider=?, rider_id=?, "
-                   "updated_at=? WHERE id=?", (a["severity"], a["headline"], a["action"], a["phone"], a["map_url"],
-                                               a["rider"], a["rider_id"], iso(now), aid))
+                   "restaurant=?, restaurant_phone=?, updated_at=? WHERE id=?",
+                   (a["severity"], a["headline"], a["action"], a["phone"], a["map_url"], a["rider"], a["rider_id"],
+                    a["restaurant"], a["restaurant_phone"], iso(now), aid))
 
     def resolve_alert(self, aid: int, why: str, now: datetime):
         self._exec("UPDATE alerts SET resolved_at=?, resolution=? WHERE id=? AND resolved_at IS NULL", (iso(now), why, aid))

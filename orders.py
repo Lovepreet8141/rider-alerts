@@ -165,6 +165,37 @@ def parse_booking(b: dict) -> dict:
     }
 
 
+def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime] = None) -> dict:
+    """Empty order in the same shape parse_booking() produces (used in webhook mode)."""
+    return {"id": oid, "ref": ref or oid[:8], "status": "", "phase": "unassigned", "area": area, "area_name": None,
+            "rider_id": None, "rider": "", "restaurant": "", "restaurant_phone": "", "customer_addr": "",
+            "customer_phone": "", "pick_lat": None, "pick_lng": None, "drop_lat": None, "drop_lng": None,
+            "rider_lat": None, "rider_lng": None, "eta_restaurant": None, "eta_customer": None,
+            "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "accepted_at": None,
+            "started_at": None, "at_restaurant_at": None, "picked_up_at": None, "at_customer_at": None,
+            "delivered_at": None, "stops": 0, "customer_zip": "", "place_id": "", "cancel_reason": "",
+            "est_distance_m": None, "stop_types": {}, "partial": False}
+
+
+def phase_from(o: dict) -> str:
+    """Derive the phase from whatever timestamps we have (webhook mode)."""
+    if o.get("cancelled"):
+        return "cancelled"
+    if o["delivered_at"]:
+        return "delivered"
+    if o["at_customer_at"]:
+        return "at_customer"
+    if o["picked_up_at"]:
+        return "to_customer"
+    if o["at_restaurant_at"]:
+        return "at_restaurant"
+    if o["started_at"]:
+        return "to_restaurant"
+    if o["accepted_at"] or o["rider_id"]:
+        return "accepted"
+    return "unassigned"
+
+
 def phase_minutes(o: dict) -> dict:
     """Minutes spent in each phase (None when the phase hasn't happened)."""
     return {
@@ -283,10 +314,17 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
                         "action": "Call the rider, check where they are"})
         if tracker and o["rider_id"]:
             still = tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m)
+            fix = tracker.last_fix(o["rider_id"])
+            age = (now - fix[0]).total_seconds() / 60 if fix else None
             if still is not None and still >= rules.stationary_min and (mins(o["started_at"] or o["accepted_at"] or o["dispatched_at"], now) or 0) >= rules.stationary_min:
-                out.append({"kind": "stationary", "severity": "amber" if still < rules.stationary_min * 2 else "red",
-                            "headline": f"Not moving for {int(still)} min (should be riding to the {target})",
-                            "action": "Call the rider"})
+                if age is not None and age >= rules.stale_gps_min:
+                    out.append({"kind": "stationary", "severity": "amber" if age < rules.stale_gps_min * 3 else "red",
+                                "headline": f"No GPS update for {int(age)} min while riding to the {target} (app closed / phone off?)",
+                                "action": "Call the rider: is the app running?"})
+                else:
+                    out.append({"kind": "stationary", "severity": "amber" if still < rules.stationary_min * 2 else "red",
+                                "headline": f"Not moving for {int(still)} min (should be riding to the {target})",
+                                "action": "Call the rider"})
             tl, tg = (o["pick_lat"], o["pick_lng"]) if ph == "to_restaurant" else (o["drop_lat"], o["drop_lng"])
             away = tracker.wrong_way(o["rider_id"], f"{o['id']}:{ph}", tl, tg, now, rules.wrong_way_m)
             if away:

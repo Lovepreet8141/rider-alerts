@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from events import Projector
 from mt import ACTIVE_STATUSES, MotionTools
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_minutes
 from store import Store, day_key, day_start
@@ -60,9 +61,15 @@ app = FastAPI()
 basic = HTTPBasic()
 
 STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "raw_samples": {},
-         "sync": {"last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
-                  "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None}}
+         "sync": {"mode": "api", "last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
+                  "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None,
+                  "api_retry_at": None, "events": {}}}
 WAKE = asyncio.Event()
+projector = Projector(STATE, store, tracker, AREAS)
+
+
+def api_restricted() -> bool:
+    return "restricted_endpoint" in (mt.stats.get("last_error") or "")
 
 PHASE_LABEL = {"unassigned": "Waiting for rider", "accepted": "Accepted, not started", "to_restaurant": "Riding to restaurant",
                "at_restaurant": "At restaurant", "to_customer": "Delivering", "at_customer": "At customer",
@@ -213,9 +220,28 @@ async def sync_loop():
         now = datetime.now(UTC)
         STATE["sync"]["runs"] += 1
         try:
-            if mt.enabled:
+            mode = STATE["sync"]["mode"]
+            if mt.enabled and mode == "webhook":
+                # retry the API every 30 min: the moment MotionTools lifts the restriction we switch back
+                retry_at = STATE["sync"]["api_retry_at"]
+                if retry_at is None or now >= datetime.fromisoformat(retry_at):
+                    STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
+                    if await mt.list_bookings(AREAS, ACTIVE_STATUSES) is not None:
+                        STATE["sync"]["mode"] = "api"
+                        store.log("info", "MotionTools API access works again — switching to API mode")
+                        first = True
+                STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
+            if mt.enabled and STATE["sync"]["mode"] == "api":
                 await sync_riders(now)
                 ok = await sync_orders(now)
+                if not ok and api_restricted():
+                    STATE["sync"]["mode"] = "webhook"
+                    STATE["sync"]["last_error"] = None
+                    STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
+                    store.log("error", "MotionTools account is in restricted API mode — running in WEBHOOK mode "
+                                       "(orders rebuilt from events). Ask MotionTools support to enable API access.")
+                    ok = False
+                    first = False
                 if first and ok:
                     # first run on an empty database: pull the last 7 days so week/month views are populated
                     days = 7 if not store.orders_in("week", now) else 2
@@ -227,7 +253,7 @@ async def sync_loop():
                 elif last_backfill is None or (now - last_backfill) > timedelta(minutes=10):
                     await backfill_done(now)
                     last_backfill = now
-                if not ok:
+                if not ok and STATE["sync"]["mode"] == "api":
                     store.log("error", f"MotionTools sync failed: {mt.stats['last_error']}")
             evaluate_all(datetime.now(UTC))
             snapshot_yesterday(now)
@@ -279,7 +305,18 @@ async def webhook(secret: str, request: Request):
     STATE["sync"]["last_webhook"] = iso(datetime.now(UTC))
     with open(DATA_DIR / "events.jsonl", "a") as f:
         f.write(json.dumps(p) + "\n")
-    WAKE.set()
+    if len(STATE["raw_samples"].get("events", [])) < 12:
+        STATE["raw_samples"].setdefault("events", []).append(p)
+    if STATE["sync"]["mode"] == "webhook":
+        try:
+            name = projector.apply(p)
+            STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
+            evaluate_all(datetime.now(UTC))
+        except Exception as e:
+            log.exception("event failed: %s", e)
+            store.log("error", f"event {p.get('resource_type')}.{p.get('event')} failed: {e}"[:300])
+    else:
+        WAKE.set()
     return {"ok": True}
 
 
@@ -342,6 +379,30 @@ def api_state():
              "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
     return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders,
             "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS}}
+
+
+@app.get("/api/places", dependencies=[Depends(require_login)])
+def api_places():
+    """Restaurants seen as MotionTools place ids (webhook mode) with the names given in Settings."""
+    seen = {}
+    for o in store.orders_in("month", datetime.now(UTC)):
+        pid = o.get("place_id")
+        if pid:
+            seen[pid] = seen.get(pid, 0) + 1
+    for o in STATE["orders"].values():
+        if o.get("place_id"):
+            seen.setdefault(o["place_id"], 0)
+    return {"places": [{"id": pid, "name": projector.places.get(pid, ""), "orders": n}
+                       for pid, n in sorted(seen.items(), key=lambda x: -x[1])]}
+
+
+@app.post("/api/places", dependencies=[Depends(require_login)])
+async def api_places_set(request: Request):
+    body = await request.json()
+    for pid, name in (body or {}).items():
+        if pid and isinstance(name, str):
+            projector.set_place(pid, name.strip())
+    return {"ok": True}
 
 
 @app.get("/api/insights", dependencies=[Depends(require_login)])
@@ -445,6 +506,7 @@ async def api_settings_set(request: Request):
 def api_system():
     s = STATE["sync"]
     return {"started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
+            "mode": s["mode"], "event_counts": projector.counts,
             "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
             "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
 
