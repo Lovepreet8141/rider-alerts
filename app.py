@@ -33,10 +33,22 @@ log = logging.getLogger("rider-alerts")
 logging.basicConfig(level=logging.INFO)
 
 MT_API = "https://api.motiontools.io"
-MT_TOKEN = os.environ.get("MT_API_TOKEN", "")
-PATH_SECRET = os.environ.get("WEBHOOK_PATH_SECRET", "change-me")
-DASH_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+def env(name, default=""):
+    """Read a setting, forgiving stray spaces/quotes/backticks pasted into Railway,
+    and variable names that were saved with extra characters around them."""
+    val = os.environ.get(name)
+    if val is None:
+        for k, v in os.environ.items():
+            if k.strip(" `'\"") == name:
+                val = v
+                break
+    return (val if val is not None else default).strip().strip("`'\"").strip()
+
+
+MT_TOKEN = env("MT_API_TOKEN")
+PATH_SECRET = env("WEBHOOK_PATH_SECRET", "change-me")
+DASH_PASSWORD = env("DASHBOARD_PASSWORD")
+DATA_DIR = Path(env("DATA_DIR", ".") or ".")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 store = Store(str(DATA_DIR / "rider_alerts.db"))
@@ -47,7 +59,8 @@ basic = HTTPBasic()
 
 
 def require_login(creds: HTTPBasicCredentials = Depends(basic)):
-    if not DASH_PASSWORD or not secrets.compare_digest(creds.password.encode(), DASH_PASSWORD.encode()):
+    typed = creds.password.strip()
+    if not DASH_PASSWORD or not secrets.compare_digest(typed.encode(), DASH_PASSWORD.encode()):
         raise HTTPException(401, "Wrong password", headers={"WWW-Authenticate": "Basic"})
 
 
@@ -158,7 +171,13 @@ async def webhook(secret: str, request: Request):
 # ---------- dashboard ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "riders_tracked": len(det.riders), "open_issues": len(det.open_issues)}
+    # setup check without revealing any secret values
+    return {"ok": True, "riders_tracked": len(det.riders), "open_issues": len(det.open_issues),
+            "setup": {"dashboard_password_set": bool(DASH_PASSWORD),
+                      "dashboard_password_length": len(DASH_PASSWORD),
+                      "motiontools_token_set": bool(MT_TOKEN),
+                      "webhook_secret_set": PATH_SECRET != "change-me",
+                      "data_dir": str(DATA_DIR)}}
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
