@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.2"
+VERSION = "4.3"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -244,9 +244,11 @@ async def enrich_rider(rid: str, now: datetime = None, force: bool = False) -> b
     if mt_phone:
         r["mt_phone"] = mt_phone
         r["phone"] = projector.phone_for(rid, mt_phone)
-    if u.get("status") in ("online", "offline", "busy"):
+    if u.get("status") in ("online", "offline", "busy", "available"):
         r["online"] = u["status"] != "offline"
         r["api_status_at"] = iso(now)
+        if r["online"]:
+            r["last_seen"] = iso(now)
     loc = u.get("location") or {}
     if loc.get("lat") is not None:
         r["lat"], r["lng"] = loc.get("lat"), loc.get("lng")
@@ -301,6 +303,29 @@ async def enrich_after_event(p: dict):
             await enrich_rider(users[0] if isinstance(users, list) and users else users if isinstance(users, str) else "")
     except Exception as e:
         log.exception("enrichment failed: %s", e)
+
+
+SWEEP_POS = {"i": 0}
+
+
+async def sweep_rider_status(now: datetime):
+    """Every 2 min, 2 riders: round-robin through every rider known today and ask MotionTools whether they are
+    online — the only way to count riders who are online but had no order and no online event. ~60 calls/hour;
+    if the hourly quota ends, the client stops by itself until the next hour."""
+    if mt.blocked(USER_PATH):
+        return
+    cutoff = iso(now - timedelta(minutes=30))
+    rids = sorted(rid for rid, r in STATE["riders"].items() if (r.get("last_seen") or "") < cutoff and (r.get("api_status_at") or "") < cutoff)
+    if not rids:
+        return
+    changed = False
+    for _ in range(2):
+        rid = rids[SWEEP_POS["i"] % len(rids)]
+        SWEEP_POS["i"] += 1
+        if await enrich_rider(rid, now, force=True):
+            changed = True
+    if changed:
+        evaluate_all(datetime.now(UTC))
 
 
 async def recheck_offline_riders(now: datetime):
@@ -495,6 +520,7 @@ async def sync_loop():
     first = True
     last_backfill = None
     last_refresh = None
+    last_sweep = None
     while True:
         now = datetime.now(UTC)
         STATE["sync"]["runs"] += 1
@@ -516,6 +542,9 @@ async def sync_loop():
                     elif mt.stats.get("detail_path"):
                         for o in list(STATE["orders"].values()):        # finished while we were down? close them now
                             await enrich_order(o["id"], now)
+                if last_sweep is None or (now - last_sweep) >= timedelta(minutes=2):
+                    await sweep_rider_status(now)
+                    last_sweep = now
                 if last_refresh is None or (now - last_refresh) >= timedelta(minutes=5):
                     await refresh_live_orders(now)
                     if int(now.timestamp() // 300) % 2 == 0:
@@ -689,7 +718,7 @@ def api_state():
             busy[o["rider_id"]] = busy.get(o["rider_id"], 0) + 1
     riders = []
     for r in STATE["riders"].values():
-        n = busy.get(r["id"], 0) or len(r.get("active_ids") or [])
+        n = busy.get(r["id"], 0) or (len(r.get("active_ids") or []) if STATE["sync"]["mode"] == "api" else 0)
         fix = tracker.last_fix(r["id"])
         riders.append({"id": r["id"], "name": r["name"], "phone": r["phone"], "online": r["online"], "orders": n,
                        "status": "offline" if not r["online"] else ("busy" if n else "idle"),

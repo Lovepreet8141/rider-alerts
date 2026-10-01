@@ -244,7 +244,8 @@ def f_user(rid: str):
     p = RIDERS.get(rid)
     if not p:
         return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
-    return {"user": {"id": rid, "role": "driver", "profile": {"first_name": p[0], "last_name": p[1], "phone_number": p[2]}}}
+    return {"user": {"id": rid, "role": "driver", "status": "offline" if rid == "r-sven" else "online",
+                     "profile": {"first_name": p[0], "last_name": p[1], "phone_number": p[2]}}}
 
 
 @fake.get("/api/places/{pid}")
