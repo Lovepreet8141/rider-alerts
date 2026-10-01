@@ -76,9 +76,9 @@ ENRICH_LOCK = asyncio.Lock()
 def api_restricted() -> bool:
     return "restricted_endpoint" in (mt.stats.get("last_error") or "")
 
-PHASE_LABEL = {"unassigned": "Waiting for rider", "accepted": "Accepted, not started", "to_restaurant": "Riding to restaurant",
-               "at_restaurant": "At restaurant", "to_customer": "Delivering", "at_customer": "At customer",
-               "delivered": "Delivered", "cancelled": "Cancelled"}
+PHASE_LABEL = {"on_hold": "On hold (not dispatched yet)", "unassigned": "Waiting for rider", "accepted": "Accepted, not started",
+               "to_restaurant": "Riding to restaurant", "at_restaurant": "At restaurant", "to_customer": "Delivering",
+               "at_customer": "At customer", "delivered": "Delivered", "cancelled": "Cancelled", "closed": "Closed (no events)"}
 
 
 def require_login(creds: HTTPBasicCredentials = Depends(basic)):
@@ -371,6 +371,9 @@ async def sync_loop():
                 if last_refresh is None or (now - last_refresh) >= timedelta(seconds=60):
                     await refresh_live_orders(now)
                     last_refresh = now
+                    n = projector.expire(now)
+                    if n:
+                        store.log("info", f"{n} order(s) closed automatically — no MotionTools events for hours")
                 STATE["sync"]["orders_seen"] = len(STATE["orders"])
                 STATE["sync"]["riders_seen"] = sum(1 for r in STATE["riders"].values() if r.get("online"))
                 STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
@@ -471,11 +474,17 @@ def hm(dt):
     return dt.astimezone(BERLIN).strftime("%H:%M") if dt else None
 
 
+PHASE_START = {"unassigned": "dispatched_at", "accepted": "accepted_at", "to_restaurant": "started_at", "at_restaurant": "at_restaurant_at",
+               "to_customer": "picked_up_at", "at_customer": "at_customer_at", "on_hold": "created_at"}
+
+
 def order_view(o: dict, now: datetime) -> dict:
     r = STATE["riders"].get(o["rider_id"] or "", {})
-    live = o["phase"] not in ("delivered", "cancelled")
+    live = o["phase"] not in ("delivered", "cancelled", "closed")
     end = o["delivered_at"] or o.get("cancelled_at") or now
-    elapsed = mins(o["dispatched_at"], end if not live else now)
+    elapsed = mins(o["dispatched_at"], end if not live else now) if o.get("dispatched_at") and o["phase"] != "closed" else None
+    stage_since = o.get(PHASE_START.get(o["phase"], "")) or (o.get("accepted_at") if o["phase"] == "to_restaurant" else None) or o.get("dispatched_at")
+    in_stage = mins(stage_since, now) if (live and stage_since) else None
     kinds = [k[1] for k in STATE["open_alerts"] if k[0] == o["id"]] if live else []
     sevs = [STATE["sev"].get((o["id"], k)) for k in kinds]
     lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o.get("rider_lat"), o.get("rider_lng"))
@@ -488,14 +497,17 @@ def order_view(o: dict, now: datetime) -> dict:
             "phases": phase_minutes(o), "alerts": kinds, "severity": "red" if "red" in sevs else ("amber" if kinds else ""),
             "stacked": bool(o.get("stacked")), "cancel_reason": o.get("cancel_reason", ""),
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
-            "rider_online": r.get("online")}
+            "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
+            "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
+            "waiting_min": int(mins(o.get("created_at"), now) or 0) if o["phase"] == "on_hold" else None}
 
 
 @app.get("/api/state", dependencies=[Depends(require_login)])
 def api_state():
     now = datetime.now(UTC)
     alerts = store.alerts_for_ui(now)
-    orders = sorted((order_view(o, now) for o in STATE["orders"].values()), key=lambda v: -(v["elapsed"] or 0))
+    orders = sorted((order_view(o, now) for o in STATE["orders"].values()),
+                    key=lambda v: (v["phase"] == "on_hold", -(v["elapsed"] or 0)))
     busy = {}
     for o in STATE["orders"].values():
         if o["rider_id"]:
@@ -519,7 +531,8 @@ def api_state():
              "within_pct": round(100 * sum(1 for p in ptods if p <= rules.ptod_target_min) / len(ptods)) if ptods else None,
              "target_within_pct": rules.target_within_pct, "target": rules.ptod_target_min,
              "avg_ptod": round(mean(ptods)) if ptods else None,
-             "live_orders": len(orders), "unassigned": sum(1 for o in orders if o["phase"] == "unassigned"),
+             "live_orders": sum(1 for o in orders if o["phase"] != "on_hold"), "on_hold": sum(1 for o in orders if o["phase"] == "on_hold"),
+             "unassigned": sum(1 for o in orders if o["phase"] == "unassigned"),
              "riders_online": sum(1 for r in riders if r["online"]), "riders_idle": sum(1 for r in riders if r["status"] == "idle"),
              "riders_busy": sum(1 for r in riders if r["status"] == "busy"),
              "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
@@ -715,6 +728,15 @@ def export_csv(period: str = "today"):
     body = store.export_csv(period, datetime.now(UTC))
     return PlainTextResponse(body, media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="quickzi-{CITY.lower()}-{period}.csv"'})
+
+
+@app.get("/export-events.jsonl", dependencies=[Depends(require_login)])
+def export_events(n: int = 300):
+    """The last raw webhook events, for checking field names and event flows."""
+    path = DATA_DIR / "events.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()[-max(1, min(n, 2000)):] if path.exists() else []
+    return PlainTextResponse("\n".join(lines), media_type="application/json",
+                             headers={"Content-Disposition": 'attachment; filename="motiontools-events.jsonl"'})
 
 
 @app.get("/health")

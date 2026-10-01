@@ -114,7 +114,13 @@ def parse_booking(b: dict) -> dict:
 
     status = b.get("status") or ""
     created = ts(b.get("created_at"))
-    dispatched = ev("dispatched", "pickable", "partially_dispatched") or created
+    # PTOD starts when MotionTools DISPATCHES the order (offers it to riders) — not when a pre-order is created
+    # hours earlier and sits "on hold" (status to_be_dispatched).
+    dispatched = ev("dispatched", "pickable", "partially_dispatched")
+    if dispatched is None and status != "to_be_dispatched":
+        dispatched = created
+    scheduled = ts(b.get("scheduled_at") or b.get("scheduled_for") or pick.get("scheduled_at")
+                   or pick.get("earliest_arrival_at") or pick.get("latest_arrival_at"))
     accepted = ev("claimed")
     started = ev("en_route")
     at_rest, picked = ts(pick.get("arrived_at")), ts(pick.get("completed_at"))
@@ -135,6 +141,8 @@ def parse_booking(b: dict) -> dict:
         phase = "cancelled"
     elif delivered or status in ("done", "paid", "processing_payment"):
         phase = "delivered"
+    elif dispatched is None:
+        phase = "on_hold"
     elif not driver.get("id") or status in UNASSIGNED:
         phase = "unassigned"
     elif status == "claimed" and not started:
@@ -158,7 +166,7 @@ def parse_booking(b: dict) -> dict:
         "rider_lat": loc.get("lat"), "rider_lng": loc.get("lng"),
         "eta_restaurant": ts(pick.get("expected_arrival_at")), "eta_customer": ts(drop.get("expected_arrival_at")),
         "pick_status": pick.get("status"), "drop_status": drop.get("status"),
-        "created_at": created, "dispatched_at": dispatched, "accepted_at": accepted, "started_at": started,
+        "created_at": created, "dispatched_at": dispatched, "scheduled_at": scheduled, "accepted_at": accepted, "started_at": started,
         "at_restaurant_at": at_rest, "picked_up_at": picked, "at_customer_at": at_cust, "delivered_at": delivered,
         "stops": len(stops), "customer_zip": str(drop.get("zip_code") or ""), "place_id": pick.get("place_id") or "",
         "cancel_reason": cancel_reason, "est_distance_m": b.get("total_estimated_distance_meters") if isinstance(b.get("total_estimated_distance_meters"), (int, float)) else None,
@@ -171,7 +179,7 @@ def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime]
             "rider_id": None, "rider": "", "restaurant": "", "restaurant_phone": "", "customer_addr": "",
             "customer_phone": "", "pick_lat": None, "pick_lng": None, "drop_lat": None, "drop_lng": None,
             "rider_lat": None, "rider_lng": None, "eta_restaurant": None, "eta_customer": None,
-            "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "accepted_at": None,
+            "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None, "accepted_at": None,
             "started_at": None, "at_restaurant_at": None, "picked_up_at": None, "at_customer_at": None,
             "delivered_at": None, "stops": 0, "customer_zip": "", "place_id": "", "cancel_reason": "",
             "est_distance_m": None, "stop_types": {}, "partial": False}
@@ -181,6 +189,8 @@ def phase_from(o: dict) -> str:
     """Derive the phase from whatever timestamps we have (webhook mode)."""
     if o.get("cancelled"):
         return "cancelled"
+    if o.get("closed_auto"):
+        return "closed"
     if o["delivered_at"]:
         return "delivered"
     if o["at_customer_at"]:
@@ -193,6 +203,8 @@ def phase_from(o: dict) -> str:
         return "to_restaurant"
     if o["accepted_at"] or o["rider_id"]:
         return "accepted"
+    if not o.get("dispatched_at"):
+        return "on_hold"
     return "unassigned"
 
 
@@ -215,10 +227,13 @@ class RiderTracker:
     def __init__(self):
         self.hist: dict[str, deque] = {}
         self.best: dict[tuple, tuple] = {}   # (rider, target_stop_key) -> (min_dist, at)
+        self.pushes: dict[str, deque] = {}   # rider -> times a position was reported (even if unchanged)
 
     def push(self, rider_id: str, lat, lng, now: datetime):
         if rider_id is None or lat is None or lng is None:
             return
+        p = self.pushes.setdefault(rider_id, deque(maxlen=200))
+        p.append(now)
         h = self.hist.setdefault(rider_id, deque(maxlen=60))
         if h and h[-1][1] == lat and h[-1][2] == lng:
             return                                    # identical fix = no new information
@@ -229,6 +244,15 @@ class RiderTracker:
     def last_fix(self, rider_id):
         h = self.hist.get(rider_id)
         return h[-1] if h else None
+
+    def has_feed(self, rider_id: str, now: datetime, minutes: int = 15, min_reports: int = 3) -> bool:
+        """True when we really receive positions for this rider (API polling or the GPS webhook).
+        Without a feed, "not moving" / "no GPS" / "wrong direction" would be guesses — so they stay silent."""
+        p = self.pushes.get(rider_id)
+        if not p:
+            return False
+        cutoff = now - timedelta(minutes=minutes)
+        return sum(1 for t in p if t >= cutoff) >= min_reports
 
     def stationary_minutes(self, rider_id: str, now: datetime, radius_m: int) -> Optional[float]:
         """How long the rider has stayed within radius_m of the latest position (None = unknown)."""
@@ -265,7 +289,7 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
     """Return the list of alert conditions currently true for this order.
     Each: {"kind", "severity" (red|amber), "headline", "action"}"""
     out = []
-    if o["phase"] in ("delivered", "cancelled"):
+    if o["phase"] in ("delivered", "cancelled", "on_hold", "closed") or not o.get("dispatched_at"):
         return out
     elapsed = mins(o["dispatched_at"], now) or 0
     tgt, warn = rules.ptod_target_min, rules.ptod_warn_min
@@ -312,7 +336,7 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
             out.append({"kind": f"late_{target}", "severity": "amber" if late < 10 else "red",
                         "headline": f"Late to {target} — {late} min behind ETA",
                         "action": "Call the rider, check where they are"})
-        if tracker and o["rider_id"]:
+        if tracker and o["rider_id"] and tracker.has_feed(o["rider_id"], now):
             still = tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m)
             fix = tracker.last_fix(o["rider_id"])
             age = (now - fix[0]).total_seconds() / 60 if fix else None

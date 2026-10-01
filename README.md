@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v3.2)
+# Quickzi — Munich ops platform (v3.3)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -31,6 +31,14 @@ daily report of the evening before.
 - **Settings** — alert thresholds; restaurant names (by MotionTools place id); rider phone numbers;
   system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples.
 
+## Order stages (Live tab board, always in this order)
+Waiting for rider · Accepted, not started · Riding to restaurant · At restaurant · Delivering · At customer · **On hold**.
+On hold = created by Lieferando but not yet dispatched by MotionTools (pre-orders, often hours ahead): no PTOD, no alerts.
+**PTOD starts at dispatch** (booking.transition → dispatched / tour.created), not at creation.
+Alerts resolve themselves when the condition ends or the order is delivered/cancelled; a live order without any
+MotionTools event for 3 h is closed automatically ("Closed (no events)") so nothing stays stuck on the board.
+GPS-based alerts (not moving / no GPS / wrong direction) only fire for riders we actually receive positions for.
+
 ## Alerts (PTOD clock starts at dispatch; thresholds editable in Settings)
 No rider (5 min) · accepted but not started (3 min) · not moving / no GPS (4 min) · wrong direction (400 m) ·
 late to restaurant / customer (5 min behind ETA) · waiting at restaurant (8 min) · waiting at customer (5 min) ·
@@ -55,7 +63,8 @@ Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
 
 ## Pages
 `/dashboard` (any username + DASHBOARD_PASSWORD) · `/export.csv?period=today|yesterday|week|month|YYYY-MM-DD` ·
-`/health` (no login) · `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe` (login).
+`/health` (no login) · `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`,
+`/export-events.jsonl` (last raw webhook events, for debugging) (login).
 
 ## Test locally
 ```

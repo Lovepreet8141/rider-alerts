@@ -17,7 +17,7 @@
   button,.btn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 10px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
   button.on{border-color:var(--accent);color:var(--accent)} .primary{background:var(--ink)!important;color:var(--bg)!important;border-color:var(--ink)!important}
   input,select{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 9px}
-  main{max-width:1200px;margin:0 auto;padding:14px 16px 60px} section{display:none} section.active{display:block}
+  main{max-width:1400px;margin:0 auto;padding:14px 16px 60px} section{display:none} section.active{display:block}
   h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:22px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .count{border-radius:10px;padding:0 7px;font-size:12px;color:#fff;background:var(--muted)} .count.red{background:var(--red)} .count.amber{background:var(--amber)} .count.green{background:var(--green)}
   .banner{background:var(--red-bg);color:var(--red);border:1px solid var(--red);border-radius:10px;padding:8px 12px;margin:10px 0;font-weight:600} .banner.amber{background:var(--amber-bg);color:var(--amber);border-color:var(--amber);font-weight:500}
@@ -47,6 +47,15 @@
   .form{display:grid;grid-template-columns:1fr 120px;gap:8px 12px;align-items:center;max-width:640px} .form label{font-size:13px} .form input{width:110px;text-align:right}
   pre{background:var(--soft);border-radius:8px;padding:10px;font-size:12px;white-space:pre-wrap;word-break:break-word} .log{font-family:ui-monospace,Menlo,monospace;font-size:12px} .log .err{color:var(--red)}
   .trend{display:flex;align-items:flex-end;gap:3px;height:70px} .trend div{flex:1;background:var(--blue);border-radius:3px 3px 0 0;position:relative;min-width:8px} .trend div.bad{background:var(--red)} .trend div.ok{background:var(--green)} .trend div span{position:absolute;bottom:100%;left:0;right:0;text-align:center;font-size:10px;color:var(--muted)}
+  .board{display:grid;gap:12px} .stage{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+  .stage .sh{display:flex;align-items:center;gap:8px;padding:8px 12px;border-left:5px solid var(--muted);font-weight:700;font-size:13px} .stage .sh .count{margin-left:2px} .stage .sh .muted{font-weight:400;margin-left:auto}
+  .stage.on_hold .sh{border-left-color:var(--muted)} .stage.unassigned .sh{border-left-color:var(--red)} .stage.accepted .sh{border-left-color:var(--amber)} .stage.to_restaurant .sh{border-left-color:var(--blue)} .stage.at_restaurant .sh{border-left-color:var(--amber)} .stage.to_customer .sh{border-left-color:var(--green)} .stage.at_customer .sh{border-left-color:var(--amber)}
+  .stage .sb{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding:0 10px 10px;border-top:1px solid var(--line);padding-top:10px} .stage.empty .sb{display:none} .stage.empty .sh{opacity:.6;font-weight:600}
+  .oc{border:1px solid var(--line);border-radius:10px;padding:8px 10px;cursor:pointer;background:var(--bg);display:grid;gap:3px;font-size:13px} .oc:hover{border-color:var(--accent)} .oc.red{border-color:var(--red);background:var(--red-bg)} .oc.amber{border-color:var(--amber)}
+  .oc .r1{display:flex;align-items:center;gap:8px} .oc .r1 b{font-size:14px} .oc .chip{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums;border-radius:6px;padding:1px 7px;background:var(--green-bg);color:var(--green);white-space:nowrap} .oc .chip.warn{background:var(--amber-bg);color:var(--amber)} .oc .chip.bad{background:var(--red-bg);color:var(--red)} .oc .chip.grey{background:var(--soft);color:var(--muted);font-weight:600}
+  .oc .r2,.oc .r3{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .oc .r2 b{color:var(--ink)} .oc .r4{display:flex;gap:4px;flex-wrap:wrap;align-items:center;font-size:11px;color:var(--muted)} .oc .r4 .tag{margin:0;padding:1px 5px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap} .chips button{padding:4px 10px;border-radius:14px} .chips button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  .pill.on_hold{background:var(--soft);color:var(--muted)} .pill.closed{background:var(--soft);color:var(--muted)}
   .hidden{display:none}
 </style>
 </head>
@@ -67,8 +76,8 @@
     <h2>Needs action now <span id="alertCount" class="count green">0</span></h2>
     <div class="cards" id="alerts"></div>
     <details id="resolvedBox" class="hidden"><summary>Recently resolved (<span id="resolvedCount">0</span>)</summary><div class="cards" id="resolved"></div></details>
-    <h2>Live orders <span id="orderCount" class="count">0</span><span class="sp"></span><span class="muted">tap an order for its full story</span></h2>
-    <div class="orders" id="liveOrders"></div>
+    <h2>Orders by stage <span id="orderCount" class="count">0</span><span class="sp"></span><span class="muted">PTOD counts from dispatch · tap an order for its story</span></h2>
+    <div class="board" id="board"></div>
     <h2>Riders now <span class="muted" id="riderNote"></span></h2>
     <div class="riders" id="riderChips"></div>
   </section>
@@ -79,6 +88,7 @@
       <input id="q" placeholder="search order, rider, restaurant, address" style="min-width:260px">
       <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button></span>
       <a class="btn" id="csvOrders" href="/export.csv?period=today">⬇ CSV</a></h2>
+    <div class="chips" id="orderChips" style="margin:0 0 10px"></div>
     <div class="panel" style="margin-top:0"><div id="ordersTable"></div></div>
   </section>
 
@@ -155,7 +165,7 @@ document.getElementById("dlgClose").onclick=()=>document.getElementById("dlg").c
 
 /* ---------------- LIVE ---------------- */
 function renderPulse(p){ TARGET=p.target; TARGET_PCT=p.target_within_pct; const w=p.within_pct;
-  document.getElementById("pulse").innerHTML=tile("Delivered today",p.delivered,"orders")+tile(`≤ ${p.target} min`,pc(w),`target ${p.target_within_pct}%`,wcls(w))+tile("Avg PTOD",p.avg_ptod==null?"–":p.avg_ptod+"′","dispatch → delivered",pcls(p.avg_ptod))+tile("Live orders",p.live_orders,p.unassigned?`<b style="color:var(--red)">${p.unassigned} without rider</b>`:"all assigned",p.unassigned?"red":"")+tile("Riders online",p.riders_online,`${p.riders_busy} busy · ${p.riders_idle} idle`,p.riders_online===0?"red":"")+tile("Needs action",p.red+p.amber,`${p.red} urgent · ${p.amber} watch`,p.red?"red":p.amber?"amber":"green"); }
+  document.getElementById("pulse").innerHTML=tile("Delivered today",p.delivered,"orders")+tile(`≤ ${p.target} min`,pc(w),`target ${p.target_within_pct}%`,wcls(w))+tile("Avg PTOD",p.avg_ptod==null?"–":p.avg_ptod+"′","dispatch → delivered",pcls(p.avg_ptod))+tile("Live orders",p.live_orders,(p.unassigned?`<b style="color:var(--red)">${p.unassigned} without rider</b>`:"all assigned")+(p.on_hold?` · ${p.on_hold} on hold`:""),p.unassigned?"red":"")+tile("Riders online",p.riders_online,`${p.riders_busy} busy · ${p.riders_idle} idle`,p.riders_online===0?"red":"")+tile("Needs action",p.red+p.amber,`${p.red} urgent · ${p.amber} watch`,p.red?"red":p.amber?"amber":"green"); }
 function alertCard(a){ const open=!a.resolved_at, sev=open?a.severity:"done";
   const tags=open?`<span class="tag ${a.severity}">${a.severity==="red"?"Urgent":"Watch"}</span><span class="tag grey">${KIND[a.kind]||a.kind}</span>`:`<span class="tag green">Resolved</span><span class="tag grey">${KIND[a.kind]||a.kind}</span>`;
   const head=open?esc(a.headline):`${esc(a.headline)} → ${esc(a.resolution)} after ${Math.max(0,Math.round((new Date(a.resolved_at)-new Date(a.opened_at))/60000))} min`;
@@ -171,7 +181,7 @@ function renderAlerts(alerts){ const open=alerts.filter(a=>!a.resolved_at), done
   document.getElementById("resolvedBox").classList.toggle("hidden",!done.length); document.getElementById("resolvedCount").textContent=done.length; document.getElementById("resolved").innerHTML=done.map(alertCard).join("");
   const ids=new Set(open.map(a=>a.id)); if(known&&[...ids].some(i=>!known.has(i))) beep(); known=ids; document.title=open.length?`(${open.length}) Quickzi Ops`:"Quickzi Ops"; }
 function timeline(o){ const steps=[["dispatched","Disp"],["accepted","Acc"],["at_restaurant","Rest"],["picked_up","Pick"],["at_customer","Cust"],["delivered","Done"]];
-  const cur={unassigned:"dispatched",accepted:"accepted",to_restaurant:"accepted",at_restaurant:"at_restaurant",to_customer:"picked_up",at_customer:"at_customer"}[o.phase];
+  const cur={unassigned:"dispatched",accepted:"accepted",to_restaurant:"accepted",at_restaurant:"at_restaurant",to_customer:"picked_up",at_customer:"at_customer",on_hold:""}[o.phase];
   return `<div class="tl">${steps.map(([k,l])=>{const t=o.timeline[k]; return `<span class="${t?"on":""} ${k===cur?"now":""}">${l}${t?" "+t:""}</span>`;}).join("")}</div>`; }
 function orderRow(o){ const e=o.elapsed??0, cls=e>=o.target?"bad":e>=o.target-5?"warn":"", pct=Math.min(100,100*e/o.target); const ph=o.phases||{};
   const parts=[ph.to_accept!=null?`accept ${f1(ph.to_accept)}′`:"",ph.at_restaurant!=null?`wait ${f1(ph.at_restaurant)}′`:""].filter(Boolean).join(" · ");
@@ -179,8 +189,18 @@ function orderRow(o){ const e=o.elapsed??0, cls=e>=o.target?"bad":e>=o.target-5?
     <div class="links">${o.phone?`<a href="${tel(o.phone)}">📞 call</a>`:""}${o.restaurant_phone?`<a href="${tel(o.restaurant_phone)}">🏪 restaurant</a>`:""}${o.map_url?`<a href="${esc(o.map_url)}" target="_blank" rel="noopener">🗺 map</a>`:""}</div></div>
     <div><span class="pill ${o.phase}">${esc(o.phase_label)}</span>${o.alerts.length?` <span class="tag ${o.severity}" style="margin-left:4px">${o.alerts.map(k=>KIND[k]||k).join(" · ")}</span>`:""}${timeline(o)}${parts?`<div class="sub">${parts}</div>`:""}</div>
     <div class="ptod"><div class="n ${cls}">${e}′</div><div class="bar"><i class="${cls}" style="width:${pct}%"></i></div><div class="eta">${e>=o.target?`<b style="color:var(--red)">+${e-o.target} over</b>`:`${o.target-e} min left`}${o.eta_customer?`<br>ETA ${o.eta_customer}`:""}</div></div></div>`; }
+const STAGES=[["unassigned","🔔","Waiting for rider","nobody accepted yet"],["accepted","✅","Accepted, not started","rider has it but hasn't moved"],["to_restaurant","🏍","Riding to restaurant",""],["at_restaurant","🏪","At restaurant","waiting for the food"],["to_customer","🚚","Delivering",""],["at_customer","🏠","At customer","handover"],["on_hold","🕒","On hold — not dispatched yet","pre-orders; PTOD starts at dispatch"]];
+function ptodChip(o){ if(o.phase==="on_hold") return `<span class="chip grey">${o.scheduled?"for "+o.scheduled:"waiting "+o.waiting_min+"′"}</span>`; const e=o.elapsed??0; const c=e>=o.target?"bad":e>=o.target-5?"warn":""; return `<span class="chip ${c}" title="PTOD: minutes since dispatch">${e}′ / ${o.target}</span>`; }
+function orderCard(o){ const sev=o.severity||""; const stage=o.in_stage!=null?`${o.in_stage}′ in this stage`:""; const alerts=o.alerts.map(k=>`<span class="tag ${sev||"grey"}">${KIND[k]||k}</span>`).join("");
+  return `<div class="oc ${sev}" data-order="${o.id}"><div class="r1"><b>${esc(o.ref)}</b>${o.stackedN>1?`<span class="badge">${o.stackedN} orders</span>`:""}${o.rider_online===false?`<span class="badge" style="background:var(--red-bg);color:var(--red)">offline</span>`:""}${ptodChip(o)}</div>
+    <div class="r2">👤 <b>${esc(o.rider||"no rider yet")}</b>${o.phone?` <a href="${tel(o.phone)}" onclick="event.stopPropagation()" style="color:var(--accent);text-decoration:none">📞</a>`:""}${o.phase==="on_hold"?` · created ${o.created||"–"}`:o.timeline.dispatched?` · dispatched ${o.timeline.dispatched}`:""}</div>
+    <div class="r3">🏪 ${esc(o.restaurant)}${o.customer_addr?` → ${esc(o.customer_addr)}`:""}</div>
+    <div class="r4">${stage?`<span>⏱ ${stage}</span>`:""}${o.eta_customer?`<span>· ETA ${o.eta_customer}</span>`:""}${alerts}</div></div>`; }
 function renderLiveOrders(orders){ const per={}; orders.forEach(o=>{if(o.rider_id) per[o.rider_id]=(per[o.rider_id]||0)+1;}); orders.forEach(o=>o.stackedN=per[o.rider_id]||0);
-  document.getElementById("orderCount").textContent=orders.length; document.getElementById("liveOrders").innerHTML=orders.length?orders.map(orderRow).join(""):`<div class="empty">No orders in progress. New orders appear the moment MotionTools dispatches them.</div>`; }
+  const live=orders.filter(o=>o.phase!=="on_hold"); document.getElementById("orderCount").textContent=live.length;
+  document.getElementById("board").innerHTML=STAGES.map(([k,icon,label,hint])=>{ const rows=orders.filter(o=>o.phase===k).sort((a,b)=>(b.in_stage??0)-(a.in_stage??0));
+    const avg=rows.length&&k!=="on_hold"?Math.round(rows.reduce((t,o)=>t+(o.in_stage||0),0)/rows.length):null;
+    return `<div class="stage ${k} ${rows.length?"":"empty"}"><div class="sh"><span>${icon}</span><span>${label}</span><span class="count ${k==="unassigned"&&rows.length?"red":rows.length?"":""}">${rows.length}</span><span class="muted">${rows.length?[avg!=null?`avg ${avg}′ in stage`:"",hint].filter(Boolean).join(" · "):"none"}</span></div><div class="sb">${rows.map(orderCard).join("")}</div></div>`; }).join(""); }
 function renderRiderChips(riders){ const on=riders.filter(r=>r.online), off=riders.filter(r=>!r.online); document.getElementById("riderNote").textContent=`${on.length} online · ${off.length} offline`;
   const chip=r=>`<div class="rider ${r.status}" data-rider="${r.id}"><span class="st"></span><div><b>${esc(r.name)}</b> <span class="muted">${r.status==="busy"?`${r.orders} order${r.orders>1?"s":""}`:r.status==="idle"?"idle · can take an order":"offline"}</span>${r.status==="busy"&&r.still_min>=4?`<div class="warn">⚠ not moving ${Math.round(r.still_min)} min</div>`:""}</div>${r.phone?`<a class="btn" style="padding:3px 7px" href="${tel(r.phone)}" onclick="event.stopPropagation()">📞</a>`:""}${r.map_url&&r.online?`<a class="btn" style="padding:3px 7px" href="${esc(r.map_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">🗺</a>`:""}</div>`;
   document.getElementById("riderChips").innerHTML=riders.length?[...on,...off.slice(0,12)].map(chip).join("")+(off.length>12?`<div class="rider offline"><span class="muted">+${off.length-12} more offline</span></div>`:""):`<div class="empty">No riders found yet.</div>`; }
@@ -199,15 +219,21 @@ async function showOrder(id){ openDlg("Loading…",""); try{ const o=await api(`
       const d=prev?Math.round((new Date(v)-new Date(prev))/60000):null; const lim={accepted:5,started:3,at_restaurant:12,picked_up:8,at_customer:12,delivered:5}[k]; const dc=d==null?"":lim&&d>lim*1.5?"bad":lim&&d>lim?"warn":"";
       rows+=`<div class="step done"><span class="t">${hm(v)}</span><span class="d ${dc}">${d==null?"":"+"+d+"′"}</span><span class="l">${l}</span></div>`; prev=v; }
     const total=o.elapsed; const al=o.alerts_log.length?`<h4 style="margin:12px 0 6px">Alerts on this order</h4>`+o.alerts_log.map(a=>`<div class="muted" style="margin:3px 0"><span class="tag ${a.severity}">${KIND[a.kind]||a.kind}</span>${hm(a.opened_at)} ${esc(a.headline)} ${a.dismissed_at?"— handled ✓":a.resolved_at?`— ${esc(a.resolution)} after ${Math.max(0,Math.round((new Date(a.resolved_at)-new Date(a.opened_at))/60000))} min`:"— open"}</div>`).join(""):`<p class="muted">No alerts on this order.</p>`;
-    openDlg(`Order ${o.ref} · ${o.phase_label}`,`<div class="meta"><span>👤 <b>${esc(o.rider||"no rider")}</b></span><span>🏪 ${esc(o.restaurant)}</span><span>→ ${esc(o.customer_addr)} ${o.customer_zip?"("+esc(o.customer_zip)+")":""}</span>${o.stacked?"<span class='tag blue'>double order</span>":""}</div>
+    openDlg(`Order ${o.ref} · ${o.phase_label}`,`<div class="meta"><span>👤 <b>${esc(o.rider||"no rider")}</b></span><span>🏪 ${esc(o.restaurant)}</span>${o.created?`<span>created ${o.created}</span>`:""}${o.scheduled?`<span>scheduled ${o.scheduled}</span>`:""}<span>→ ${esc(o.customer_addr)} ${o.customer_zip?"("+esc(o.customer_zip)+")":""}</span>${o.stacked?"<span class='tag blue'>double order</span>":""}</div>
       <div class="ptod" style="margin:10px 0"><div class="n ${total>=o.target?"bad":total>=o.target-5?"warn":""}">${total??"–"}′</div><div class="bar"><i class="${total>=o.target?"bad":total>=o.target-5?"warn":""}" style="width:${Math.min(100,100*(total||0)/o.target)}%"></i></div><div class="eta">${o.phase==="delivered"?"PTOD total":o.phase==="cancelled"?"cancelled":"so far"}</div></div>
       <div class="steps">${rows}</div>${o.cancel_reason?`<p class="muted">Cancel reason: ${esc(o.cancel_reason)}</p>`:""}
       <div class="btns">${o.phone?`<a class="btn" href="${tel(o.phone)}">📞 Call rider</a>`:""}${o.restaurant_phone?`<a class="btn" href="${tel(o.restaurant_phone)}">🏪 Call restaurant</a>`:""}${o.map_url?`<a class="btn" href="${esc(o.map_url)}" target="_blank" rel="noopener">🗺 Rider now</a>`:""}${o.route_url?`<a class="btn" href="${esc(o.route_url)}" target="_blank" rel="noopener">🧭 Route driven${o.trail_km?` (${o.trail_km} km)`:""}</a>`:""}</div>${al}`); }catch(e){ openDlg("Order","<p class='muted'>Could not load this order.</p>"); } }
 
 /* ---------------- ORDERS TAB ---------------- */
-async function loadOrders(){ const q=document.getElementById("q").value.trim(); const {orders}=await api(`/api/orders?period=${P.orders}&q=${encodeURIComponent(q)}`);
+let ORDER_CAT="all";
+const CATS=[["all","All"],["live","Live"],["on_hold","On hold"],["delivered","Delivered"],["late","Late (> target)"],["cancelled","Cancelled"],["closed","Closed (no events)"]];
+const inCat=(o,c)=>c==="all"||(c==="live"&&o.live&&o.phase!=="on_hold")||(c==="late"&&o.phase==="delivered"&&(o.phases?.ptod??0)>o.target)||o.phase===c;
+async function loadOrders(){ const q=document.getElementById("q").value.trim(); const res=await api(`/api/orders?period=${P.orders}&q=${encodeURIComponent(q)}`); const all=res.orders;
   document.getElementById("csvOrders").href=`/export.csv?period=${P.orders}`;
-  document.getElementById("ordersTable").innerHTML=orders.length?`<table><tr><th>Dispatched</th><th>Order</th><th>Rider</th><th>Restaurant</th><th>Customer</th><th>Status</th><th class="n">PTOD</th><th class="n">Accept</th><th class="n">Wait</th><th class="n">To cust.</th><th class="n">Alerts</th></tr>${orders.map(o=>{const p=o.phases||{}; const e=o.elapsed; return `<tr class="click" data-order="${o.id}"><td>${o.timeline.dispatched||"–"}</td><td><b>${esc(o.ref)}</b>${o.stacked?' <span class="tag blue">2×</span>':""}</td><td>${esc(o.rider||"–")}</td><td>${esc(o.restaurant)}</td><td class="muted">${esc(o.customer_addr)}</td><td><span class="pill ${o.phase}">${esc(o.phase_label)}</span></td><td class="n ${e>=o.target?"bad":e>=o.target-5?"warn":""}"><b>${e==null?"–":e+"′"}</b></td><td class="n">${f1(p.to_accept)}</td><td class="n">${f1(p.at_restaurant)}</td><td class="n">${f1(p.to_customer)}</td><td class="n">${o.alerts.length||"·"}</td></tr>`;}).join("")}</table>`:`<div class="muted">No orders for this period.</div>`; }
+  document.getElementById("orderChips").innerHTML=CATS.map(([c,l])=>{const n=all.filter(o=>inCat(o,c)).length; return `<button data-cat="${c}" class="${ORDER_CAT===c?"on":""}">${l} <span class="muted" style="color:inherit;opacity:.7">${n}</span></button>`;}).join("");
+  document.querySelectorAll("#orderChips button").forEach(b=>b.onclick=()=>{ORDER_CAT=b.dataset.cat; loadOrders();});
+  const orders=all.filter(o=>inCat(o,ORDER_CAT));
+  document.getElementById("ordersTable").innerHTML=orders.length?`<table><tr><th>Dispatched</th><th>Order</th><th>Rider</th><th>Restaurant</th><th>Customer</th><th>Status</th><th class="n">PTOD</th><th class="n">Accept</th><th class="n">Wait</th><th class="n">To cust.</th><th class="n">Alerts</th></tr>${orders.map(o=>{const p=o.phases||{}; const e=o.elapsed; return `<tr class="click" data-order="${o.id}"><td>${o.timeline.dispatched||(o.phase==="on_hold"?`<span class="muted">on hold since ${o.created||"–"}</span>`:"–")}</td><td><b>${esc(o.ref)}</b>${o.stacked?' <span class="tag blue">2×</span>':""}</td><td>${esc(o.rider||"–")}</td><td>${esc(o.restaurant)}</td><td class="muted">${esc(o.customer_addr)}</td><td><span class="pill ${o.phase}">${esc(o.phase_label)}</span></td><td class="n ${e>=o.target?"bad":e>=o.target-5?"warn":""}"><b>${e==null?"–":e+"′"}</b></td><td class="n">${f1(p.to_accept)}</td><td class="n">${f1(p.at_restaurant)}</td><td class="n">${f1(p.to_customer)}</td><td class="n">${o.alerts.length||"·"}</td></tr>`;}).join("")}</table>`:`<div class="muted">No orders for this period.</div>`; }
 
 /* ---------------- RIDERS TAB ---------------- */
 function ridersTable(rs, period){ if(!rs.length) return `<div class="muted">No deliveries in this period yet.</div>`;

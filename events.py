@@ -5,7 +5,9 @@ Every event keeps the same order shape as parse_booking(), so alerts, storage an
 dashboard work unchanged. Payload formats: docs.motiontools.io → Event notifications.
 
 Phase sources
-  dispatched_at   booking.created (order enters our system = PTOD start)
+  created_at      booking.created (pre-orders sit "on hold" here, sometimes for hours — no PTOD yet)
+  dispatched_at   booking.transition to dispatched/pickable | tour.created | booking.created already dispatched
+                  (= the order is offered to riders = PTOD start)
   accepted_at     tour.transition to=claimed  |  driver.busy shortly before booking.in_progress
   started_at      booking.in_progress (rider started the tour; brings driver_id, driver_name, GPS)
   at_restaurant   booking.stop_arrived   stop_type=pickup
@@ -21,6 +23,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from orders import UTC, new_order, phase_from, ts
+
+DISPATCHED = {"dispatched", "partially_dispatched", "pickable", "claimed", "en_route"}
+DONE = {"done", "completed", "finished", "paid", "processing_payment"}
+STALE_HOURS = 3           # a live order without any MotionTools event for this long is closed automatically
 
 
 class Projector:
@@ -127,8 +133,12 @@ class Projector:
         for k in self.TIME_FIELDS:
             if p.get(k) and not o.get(k):
                 o[k] = p[k]
+        if p.get("scheduled_at"):
+            o["scheduled_at"] = p["scheduled_at"]
         if p.get("status"):
             o["status"] = p["status"]
+            if p["status"] in DISPATCHED or p["status"] in DONE:
+                self.dispatched(o, now)
         if p.get("phase") == "cancelled":
             o["cancelled"] = True
         if p.get("rider_id"):
@@ -139,13 +149,30 @@ class Projector:
         o["partial"] = False
         self.finish(o, now)
 
+    def dispatched(self, o: dict, now: datetime):
+        """The order is (or must have been) offered to riders — start the PTOD clock if it isn't running."""
+        if not o.get("dispatched_at"):
+            o["dispatched_at"] = now
+
+    def expire(self, now: datetime) -> int:
+        """Close live orders that MotionTools stopped talking about (no event for STALE_HOURS)."""
+        n = 0
+        for o in list(self.state["orders"].values()):
+            last = o.get("last_event_at") or o.get("created_at")
+            if last and now - last > timedelta(hours=STALE_HOURS):
+                o["closed_auto"] = True
+                o["cancel_reason"] = f"closed automatically — no MotionTools events for {STALE_HOURS} h"
+                self.finish(o, now)
+                n += 1
+        return n
+
     def finish(self, o: dict, now: datetime):
         o["phase"] = phase_from(o)
         stacked = o["rider_id"] and sum(1 for x in self.state["orders"].values()
                                         if x["rider_id"] == o["rider_id"] and x["phase"] not in ("delivered", "cancelled")) >= 2
         self.store.upsert_order(o, now, stacked=bool(stacked))
-        if o["phase"] in ("delivered", "cancelled"):
-            why = o["phase"]
+        if o["phase"] in ("delivered", "cancelled", "closed"):
+            why = {"closed": "order closed (no events)"}.get(o["phase"], o["phase"])
             for key in [k for k in self.state["open_alerts"] if k[0] == o["id"]]:
                 self.store.resolve_alert(self.state["open_alerts"].pop(key), why, now)
                 self.state["sev"].pop(key, None)
@@ -168,8 +195,11 @@ class Projector:
                 return "no booking id"
             if ev == "created":
                 o = self.state["orders"].get(bid) or new_order(bid, d.get("external_id") or "", area, now)
-                o["created_at"] = o["dispatched_at"] = now
+                o["created_at"] = o["last_event_at"] = now
                 o["status"] = d.get("status") or ""
+                o["dispatched_at"] = now if o["status"] in DISPATCHED else None      # pre-orders wait "on hold"
+                o["scheduled_at"] = ts(d.get("scheduled_at") or d.get("scheduled_for") or d.get("pickup_at")
+                                       or d.get("earliest_pickup_at") or d.get("delivery_at")) or o.get("scheduled_at")
                 o["partial"] = False
                 pids = d.get("place_ids") or []
                 if isinstance(pids, str):
@@ -182,17 +212,23 @@ class Projector:
                 self.finish(o, now)
                 return name
             o = self.order(bid, d, now)
+            o["last_event_at"] = now                      # only real MotionTools events count as "still alive"
             if ev == "transition":
-                to = d.get("to")
-                if to == "done" and not o["delivered_at"]:
-                    o["delivered_at"] = now
+                to = str(d.get("to") or "")
+                if to in DONE:
+                    self.dispatched(o, now)
+                    if not o["delivered_at"]:
+                        o["delivered_at"] = now
                 elif to == "cancelled":
                     o["cancelled"] = True
                     o["cancel_reason"] = o.get("cancel_reason") or "cancelled in MotionTools"
-                elif to in ("dispatched", "partially_dispatched"):
-                    o["assigned_at"] = now
+                elif to in DISPATCHED:
+                    self.dispatched(o, now)                                      # PTOD clock starts here
+                    if to in ("dispatched", "partially_dispatched"):
+                        o["assigned_at"] = now
                 o["status"] = to or o["status"]
             elif ev == "in_progress":
+                self.dispatched(o, now)
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now)
                 o["started_at"] = o["started_at"] or now
                 loc = d.get("driver_location") or {}
@@ -206,6 +242,7 @@ class Projector:
                     if eta:
                         o["eta_restaurant" if kind == "pickup" else "eta_customer"] = eta
             elif ev in ("stop_arrived", "stop_completed", "stop_failed"):
+                self.dispatched(o, now)
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now)
                 kind = str(d.get("stop_type") or o["stop_types"].get(str(d.get("stop_id")), "")).lower()
                 if kind in ("task", "return"):
@@ -263,26 +300,39 @@ class Projector:
                 self.store.set_settings({f"tour:{tid}": ",".join(self.tours[tid])})
                 for bid in self.tours[tid]:
                     if bid in self.state["orders"]:
-                        self.state["orders"][bid]["assigned_at"] = now
+                        o = self.state["orders"][bid]
+                        o["assigned_at"] = now
+                        self.dispatched(o, now)                                  # a tour exists = offered to riders
+                        self.finish(o, now)
                 return name
             bookings = [self.state["orders"][b] for b in self.tours.get(tid, []) if b in self.state["orders"]]
+            for o in bookings:
+                o["last_event_at"] = now
             if ev == "transition":
                 to = d.get("to")
                 users = d.get("affected_user_ids") or []
                 users = [users] if isinstance(users, str) else users
                 for o in bookings:
                     if to == "claimed":
+                        self.dispatched(o, now)
                         o["accepted_at"] = o["accepted_at"] or now
                         if users and not o["rider_id"]:
                             o["rider_id"] = users[0]
                             o["rider"] = self.rider(users[0])["name"]
                     elif to == "en_route":
+                        self.dispatched(o, now)
                         o["started_at"] = o["started_at"] or now
+                    elif to in DISPATCHED:
+                        self.dispatched(o, now)
+                    elif to in DONE:
+                        if not o.get("cancelled"):
+                            o["delivered_at"] = o["delivered_at"] or now
                     elif to == "cancelled":
                         o["cancelled"] = True
                     self.finish(o, now)
             elif ev == "force_assigned":
                 for o in bookings:
+                    self.dispatched(o, now)
                     self.set_rider(o, d.get("driver_id"), "", now)
                     self.finish(o, now)
             elif ev == "driver_location_updated":

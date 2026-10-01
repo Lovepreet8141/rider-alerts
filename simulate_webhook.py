@@ -91,8 +91,18 @@ EVENTS += order_events("Q4VJ9M", "b-live3", PLACE_BK, None, "", -7)
 EVENTS += [ev("booking", "created", m(-6), booking_id="b-live4", external_id="KMW86T", customer_id=CUST, place_ids=[PLACE_CHO], status="to_be_dispatched"),
            ev("tour", "created", m(-5.5), tour_id="t-9", dispatched_booking_ids=["b-live4"], status="pickable"),
            ev("tour", "transition", m(-4), tour_id="t-9", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-sven"])]
+# pre-orders (Lieferando customers ordering hours ahead): created long ago, still ON HOLD -> no PTOD, no alerts
+EVENTS += [ev("booking", "created", m(-120), booking_id="b-pre1", external_id="PRE001", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched", scheduled_at=m(60)),
+           ev("booking", "created", m(-95), booking_id="b-pre2", external_id="PRE002", customer_id=CUST, place_ids=[PLACE_CHO], status="to_be_dispatched", scheduled_at=m(45)),
+           # created 130 min ago, dispatched 6 min ago, nobody accepted yet -> PTOD 6, "no rider" alert
+           ev("booking", "created", m(-130), booking_id="b-pre3", external_id="PRE003", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched", scheduled_at=m(10)),
+           ev("booking", "transition", m(-6), booking_id="b-pre3", external_id="PRE003", **{"from": "to_be_dispatched", "to": "dispatched", "event": "dispatch"})]
+# an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
+EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])
 BOOK["b-live4"] = {"ref": "KMW86T", "place": PLACE_CHO, "rider_id": "r-sven", "rider": "Sven B.", "delivered": False}
+for b, ref, pl in (("b-pre1", "PRE001", PLACE_BK), ("b-pre2", "PRE002", PLACE_CHO), ("b-pre3", "PRE003", PLACE_BK)):
+    BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
 
 
 # ---------------------------------------------------------------- fake MotionTools HTTP server
@@ -109,12 +119,13 @@ def booking_json(bid: str) -> dict:
     rid = i["rider_id"] if ("in_progress" in seen or "claimed" in seen) else None
     prof = RIDERS.get(rid)
     done = "done" in seen
-    events = [{"name": "dispatched", "status": "dispatched", "timestamp": seen.get("created")}]
+    disp = seen.get("transition")                    # the fake only "dispatches" once that transition was delivered
+    events = [{"name": "dispatched", "status": "dispatched", "timestamp": disp}] if disp else []
     if "claimed" in seen:
         events.append({"name": "claimed", "status": "claimed", "timestamp": seen["claimed"]})
     if "in_progress" in seen:
         events.append({"name": "en_route", "status": "en_route", "timestamp": seen["in_progress"]})
-    return {"id": bid, "external_id": i["ref"], "status": "done" if done else ("en_route" if rid else "pickable"),
+    return {"id": bid, "external_id": i["ref"], "status": "done" if done else ("en_route" if rid else ("pickable" if disp else "to_be_dispatched")),
             "created_at": seen.get("created") or m(-30), "service_area": {"id": AREA, "name": "München"},
             "driver": {"id": rid, "profile": {"first_name": prof[0], "last_name": prof[1]}} if rid and prof else None,
             "driver_location": {"lat": 48.1501, "lng": 11.5702} if rid and not done else None,

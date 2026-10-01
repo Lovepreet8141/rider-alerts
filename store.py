@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS syslog (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT
 """
 
 DT_FIELDS = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
-             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer")
+             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer", "scheduled_at", "last_event_at")
 
 
 def day_start(now: datetime) -> datetime:
@@ -143,7 +143,7 @@ class Store:
     # ================================================================ orders
     def upsert_order(self, o: dict, now: datetime, stacked: bool):
         pm = phase_minutes(o)
-        closed = 1 if o["phase"] in ("delivered", "cancelled") else 0
+        closed = 1 if o["phase"] in ("delivered", "cancelled", "closed") else 0
         existing = self._rows("SELECT first_seen, stacked, cancelled_at FROM orders WHERE id=?", (o["id"],))
         first_seen = existing[0]["first_seen"] if existing else iso(now)
         stacked_flag = 1 if (stacked or (existing and existing[0]["stacked"])) else 0
@@ -202,7 +202,8 @@ class Store:
     def orders_in(self, period: str, now: datetime, q: str = "") -> list:
         start, end = period_range(period, now)
         rows = self._rows("SELECT * FROM orders WHERE (dispatched_at >= ? AND dispatched_at < ?) OR closed=0 "
-                          "ORDER BY dispatched_at DESC", (iso(start), iso(end)))
+                          "OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?) "
+                          "ORDER BY COALESCE(dispatched_at, first_seen) DESC", (iso(start), iso(end), iso(start), iso(end)))
         out = [self._hydrate(r) for r in rows]
         if q:
             ql = q.lower()
