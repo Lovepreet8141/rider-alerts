@@ -17,13 +17,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from statistics import mean, median
 
-from orders import BERLIN, UTC, haversine_m, iso, mins, phase_minutes, ts
+from orders import BERLIN, UTC, haversine_m, iso, mins, on_time, phase_minutes, ts
 
 DAY_STARTS_AT = 4
 
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS syslog (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT
 """
 
 DT_FIELDS = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
-             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer", "scheduled_at", "last_event_at", "eta_at")
+             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer", "scheduled_at", "last_event_at", "eta_at",
+             "promised_at")
 
 
 def day_start(now: datetime) -> datetime:
@@ -113,6 +115,13 @@ def _within(rows, tgt):
     """% of orders delivered within the target — only over orders whose PTOD is known."""
     known = [o for o in rows if o["phases"]["ptod"] is not None]
     return _pct(sum(1 for o in known if o["phases"]["ptod"] <= tgt), len(known))
+
+
+def _on_time(rows, grace):
+    """% of orders delivered by their planned time (+ grace) — only over orders whose plan is known."""
+    flags = [on_time(o, grace) for o in rows]
+    known = [f for f in flags if f is not None]
+    return _pct(sum(1 for f in known if f), len(known))
 
 
 def _count(values) -> dict:
@@ -449,7 +458,9 @@ class Store:
         done = [o for o in orders if o["phase"] == "delivered" and o["delivered_at"]]
         cancelled = [o for o in orders if o["phase"] == "cancelled"]
         tgt = rules.ptod_target_min
+        grace = rules.plan_grace_min
         ptods = [o["phases"]["ptod"] for o in done if o["phases"]["ptod"] is not None]
+        vs_plan = [o["phases"]["vs_plan"] for o in done if o["phases"]["vs_plan"] is not None]
         alerts = self.alerts_in(period, now, 2000)
         by_rider_alerts, by_kind = {}, {}
         for a in alerts:
@@ -488,7 +499,7 @@ class Store:
             hours.append({"hour": h, "orders": len(rs), "delivered": len(d), "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                           "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
                           "avg_accept": _avg([o["phases"]["to_accept"] for o in rs if o["accepted_at"]]),
-                          "within_pct": _within(d, tgt),
+                          "within_pct": _within(d, tgt), "on_time_pct": _on_time(d, grace),
                           "rider_hours": (round(rh / days, 1) if days > 1 else rh) if sessions_ok else None,
                           "orders_per_rider_hour": round(len(rs) / rh, 1) if rh else None,
                           "riders_active": round(active / days, 1) if days > 1 else active,
@@ -514,7 +525,8 @@ class Store:
             riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "orders": len(rs), "delivered": len(d),
                            "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                            "live": sum(1 for o in rs if o["phase"] not in ("delivered", "cancelled", "closed")),
-                           "within_pct": _within(d, tgt),
+                           "within_pct": _within(d, tgt), "on_time_pct": _on_time(d, grace),
+                           "avg_vs_plan": _avg([o["phases"]["vs_plan"] for o in d]),
                            "avg_ptod": ph("ptod"), "median_ptod": _median([o["phases"]["ptod"] for o in d]),
                            "avg_accept": ph("to_accept"), "avg_to_restaurant": ph("to_restaurant"),
                            "avg_wait": ph("at_restaurant"), "avg_to_customer": ph("to_customer"), "avg_handover": ph("handover"),
@@ -554,6 +566,8 @@ class Store:
         return {"period": period, "start": iso(start), "orders": len(orders), "delivered": len(done),
                 "cancelled": len(cancelled), "cancel_pct": _pct(len(cancelled), len(orders)),
                 "within_pct": _pct(sum(1 for p in ptods if p <= tgt), len(ptods)), "target_within_pct": rules.target_within_pct,
+                "on_time_pct": _pct(sum(1 for v in vs_plan if v <= grace), len(vs_plan)), "plan_known": len(vs_plan),
+                "avg_vs_plan": _avg(vs_plan), "late_vs_plan": sum(1 for v in vs_plan if v > grace), "plan_grace": grace,
                 "avg_ptod": _avg(ptods), "median_ptod": round(median(ptods), 1) if ptods else None,
                 "p90_ptod": round(sorted(ptods)[int(len(ptods) * 0.9) - 1], 1) if len(ptods) >= 5 else None,
                 "late": len(late), "late_cause": cause,
@@ -562,7 +576,8 @@ class Store:
                 "alerts_by_kind": by_kind, "alerts_total": len(alerts),
                 "handled": sum(1 for a in alerts if a["dismissed_at"]), "focus": focus,
                 "late_orders": [{"id": o["id"], "ref": o["ref"], "rider": o["rider"], "restaurant": o["restaurant"], "ptod": o["phases"]["ptod"],
-                                 "phases": o["phases"], "hour": o["hour"], "reason": o.get("reason", ""), "note": o.get("note", "")} for o in late[:15]],
+                                 "phases": o["phases"], "hour": o["hour"], "reason": o.get("reason", ""), "note": o.get("note", ""),
+                                 "vs_plan": o["phases"]["vs_plan"]} for o in late[:15]],
                 "sessions_ok": sessions_ok,
                 "late_reasons": _count(o.get("reason") for o in late if o.get("reason")),
                 "late_without_reason": sum(1 for o in late if not o.get("reason")),
@@ -615,6 +630,49 @@ class Store:
             focus.append({"icon": "✅", "title": "No structural problem found in this period", "action": "Keep the current setup; watch peak-hour acceptance times."})
         return focus[:7]
 
+    # ================================================================ staffing plan
+    def staffing_plan(self, now: datetime, rules, days: int = 7) -> dict:
+        """How many riders each hour needs tomorrow, from the last `days` operating days:
+        orders per hour (average and busiest day) ÷ capacity (orders one rider delivers per hour, Settings),
+        and never fewer than the riders who actually handled that hour — plus one when acceptance was slow."""
+        start = day_start(now) - timedelta(days=days - 1)
+        rows = self._rows("SELECT * FROM orders WHERE dispatched_at >= ? AND dispatched_at < ?", (iso(start), iso(now + timedelta(days=1))))
+        orders = [self._hydrate(r) for r in rows]
+        by_hour, days_seen = {}, set()
+        for o in orders:
+            d = o["dispatched_at"]
+            if not d or o["phase"] == "closed":
+                continue
+            dk = day_key(d)
+            days_seen.add(dk)
+            by_hour.setdefault(d.astimezone(BERLIN).hour, {}).setdefault(dk, []).append(o)
+        n_days = max(1, len(days_seen))
+        cap = max(1, int(rules.riders_capacity_per_hour or 2))
+        hours = []
+        for h in sorted(by_hour, key=lambda x: (x - DAY_STARTS_AT) % 24):
+            per_day = by_hour[h]
+            counts = [len(v) for v in per_day.values()]
+            allo = [o for v in per_day.values() for o in v]
+            done = [o for o in allo if o["phase"] == "delivered"]
+            active = [len({o["rider_id"] for o in v if o["rider_id"]}) for v in per_day.values()]
+            avg = sum(counts) / n_days                                   # days without orders in this hour count as 0
+            had = round(sum(active) / len(active), 1) if active else None
+            accept = _avg([o["phases"]["to_accept"] for o in allo if o["accepted_at"]])
+            no_rider = sum(1 for o in allo if (o["phases"]["to_accept"] or 0) >= rules.accept_limit_min
+                           or (not o["accepted_at"] and o["phase"] == "cancelled"))
+            slow = (accept or 0) >= 4 or no_rider >= max(2, len(allo) // 5)
+            need = math.ceil(avg / cap)
+            plan = max(need, math.ceil(had or 0) + (1 if slow else 0))
+            hours.append({"hour": h, "avg_orders": round(avg, 1), "max_orders": max(counts), "riders_needed": need,
+                          "riders_peak": math.ceil(max(counts) / cap), "riders_had": had, "avg_accept": accept,
+                          "within_pct": _within(done, rules.ptod_target_min), "on_time_pct": _on_time(done, rules.plan_grace_min),
+                          "no_rider": no_rider, "slow": slow, "plan": plan})
+        peak = [x["hour"] for x in sorted(hours, key=lambda x: -x["avg_orders"])[:3]]
+        local = now.astimezone(BERLIN)
+        return {"days": n_days, "from": day_key(start), "to": day_key(now), "capacity": cap,
+                "tomorrow": (local + timedelta(days=1)).strftime("%A"), "hours": hours, "peak_hours": sorted(peak),
+                "rider_hours": sum(x["plan"] for x in hours), "orders_per_day": round(len(orders) / n_days, 1)}
+
     # ================================================================ daily snapshot
     def save_daily(self, day: str, data: dict):
         self._exec("INSERT INTO daily_stats (day, computed_at, data) VALUES (?,?,?) ON CONFLICT(day) DO UPDATE SET "
@@ -630,23 +688,30 @@ class Store:
         for r in rows:
             d = json.loads(r["data"])
             out.append({"day": r["day"], "delivered": d.get("delivered"), "within_pct": d.get("within_pct"),
-                        "avg_ptod": d.get("avg_ptod"), "cancelled": d.get("cancelled")})
+                        "avg_ptod": d.get("avg_ptod"), "cancelled": d.get("cancelled"), "on_time_pct": d.get("on_time_pct")})
         return list(reversed(out))
 
     # ================================================================ export
-    def export_csv(self, period: str, now: datetime) -> str:
+    def export_csv(self, period: str, now: datetime, rules=None) -> str:
         rows = self.orders_in(period, now)
+        tgt = rules.ptod_target_min if rules else 30
+        grace = rules.plan_grace_min if rules else 5
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["order", "status", "rider", "restaurant", "customer", "postcode", "dispatched", "accepted", "at_restaurant",
+        w.writerow(["order", "status", "rider", "restaurant", "customer", "postcode", "created", "dispatched", "accepted", "at_restaurant",
                     "picked_up", "at_customer", "delivered", "min_to_accept", "min_to_restaurant", "min_at_restaurant",
-                    "min_to_customer", "min_handover", "ptod_min", "within_30", "double_order", "cancel_reason"])
+                    "min_to_customer", "min_handover", "ptod_min", f"within_{tgt}", "planned_delivery", "min_vs_plan", "on_time_plan",
+                    "double_order", "redispatched", "riders_history", "reason", "note", "cancel_reason"])
         f = lambda v: v.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M") if v else ""
         for o in rows:
             p = o["phases"]
+            hist = " > ".join(f"{h.get('what')} {h.get('rider') or ''}".strip() for h in (o.get("history") or []))
             w.writerow([o["ref"], o["phase"], o["rider"], o["restaurant"], o["customer_addr"], o.get("customer_zip", ""),
-                        f(o["dispatched_at"]), f(o["accepted_at"]), f(o["at_restaurant_at"]), f(o["picked_up_at"]),
+                        f(o.get("created_at")), f(o["dispatched_at"]), f(o["accepted_at"]), f(o["at_restaurant_at"]), f(o["picked_up_at"]),
                         f(o["at_customer_at"]), f(o["delivered_at"]), p["to_accept"], p["to_restaurant"], p["at_restaurant"],
-                        p["to_customer"], p["handover"], p["ptod"], "yes" if (p["ptod"] or 999) <= 30 else "no",
-                        "yes" if o["stacked"] else "no", o.get("cancel_reason", "")])
+                        p["to_customer"], p["handover"], p["ptod"], "" if p["ptod"] is None else ("yes" if p["ptod"] <= tgt else "no"),
+                        f(o.get("promised_at")), p["vs_plan"],
+                        "" if p["vs_plan"] is None else ("yes" if p["vs_plan"] <= grace else "no"),
+                        "yes" if o["stacked"] else "no", o.get("reassigned") or 0, hist,
+                        o.get("reason", ""), o.get("note", ""), o.get("cancel_reason", "")])
         return buf.getvalue()

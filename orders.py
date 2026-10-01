@@ -40,10 +40,12 @@ class Rules:
     target_within_pct: int = 90     # goal: this % of orders within ptod_target_min
     release_lead_min: int = 45      # MotionTools releases a pre-order to riders this long before its planned delivery
                                     # (MotionTools: automatic scheduling lead time) — used when no "pickable" event arrives
+    plan_grace_min: int = 5         # "on time vs plan": delivered no later than the planned delivery time + this
+    riders_capacity_per_hour: int = 2   # orders one rider can deliver per hour (staffing plan for tomorrow)
 
     EDITABLE = ("ptod_target_min", "ptod_warn_min", "accept_limit_min", "start_limit_min", "stationary_min",
                 "wrong_way_m", "late_grace_min", "wait_restaurant_min", "wait_customer_min", "target_within_pct",
-                "release_lead_min")
+                "release_lead_min", "plan_grace_min", "riders_capacity_per_hour")
 
     def apply(self, values: dict):
         for k, v in values.items():
@@ -75,6 +77,18 @@ def mins(a: Optional[datetime], b: Optional[datetime]) -> Optional[float]:
     if a is None or b is None:
         return None
     return round((b - a).total_seconds() / 60, 1)
+
+
+def hhmm(dt: Optional[datetime]) -> str:
+    return dt.astimezone(BERLIN).strftime("%H:%M") if dt else "–"
+
+
+def planned_at(o: dict) -> Optional[datetime]:
+    """The delivery time this order was planned for: the first ETA MotionTools calculated for the customer stop
+    (for a pre-order that is the scheduled delivery time). It never moves afterwards — later ETA recalculations
+    are the *current* ETA, not the plan — so "delivered vs plan" is the closest thing we have to the time the
+    customer was promised.  (The booking's own scheduled_at is NOT used: it can be the pickup time.)"""
+    return o.get("promised_at")
 
 
 def haversine_m(lat1, lng1, lat2, lng2) -> float:
@@ -124,6 +138,8 @@ def parse_booking(b: dict) -> dict:
         dispatched = created                                    # finished order without an event list
     scheduled = ts(b.get("scheduled_at") or b.get("scheduled_for") or pick.get("scheduled_at")
                    or pick.get("earliest_arrival_at") or pick.get("latest_arrival_at"))
+    promised = ts(drop.get("latest_arrival_at") or drop.get("scheduled_at") or drop.get("earliest_arrival_at")
+                  or b.get("delivery_at") or b.get("promised_at"))
     accepted = ev("claimed")
     started = ev("en_route")
     at_rest, picked = ts(pick.get("arrived_at")), ts(pick.get("completed_at"))
@@ -169,7 +185,8 @@ def parse_booking(b: dict) -> dict:
         "rider_lat": loc.get("lat"), "rider_lng": loc.get("lng"),
         "eta_restaurant": ts(pick.get("expected_arrival_at")), "eta_customer": ts(drop.get("expected_arrival_at")),
         "pick_status": pick.get("status"), "drop_status": drop.get("status"),
-        "created_at": created, "dispatched_at": dispatched, "scheduled_at": scheduled, "accepted_at": accepted, "started_at": started,
+        "created_at": created, "dispatched_at": dispatched, "scheduled_at": scheduled, "promised_at": promised,
+        "accepted_at": accepted, "started_at": started,
         "at_restaurant_at": at_rest, "picked_up_at": picked, "at_customer_at": at_cust, "delivered_at": delivered,
         "stops": len(stops), "customer_zip": str(drop.get("zip_code") or ""), "place_id": pick.get("place_id") or "",
         "cancel_reason": cancel_reason, "est_distance_m": b.get("total_estimated_distance_meters") if isinstance(b.get("total_estimated_distance_meters"), (int, float)) else None,
@@ -182,7 +199,8 @@ def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime]
             "rider_id": None, "rider": "", "restaurant": "", "restaurant_phone": "", "customer_addr": "",
             "customer_phone": "", "pick_lat": None, "pick_lng": None, "drop_lat": None, "drop_lng": None,
             "rider_lat": None, "rider_lng": None, "eta_restaurant": None, "eta_customer": None,
-            "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None, "accepted_at": None,
+            "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None,
+            "promised_at": None, "accepted_at": None,
             "started_at": None, "at_restaurant_at": None, "picked_up_at": None, "at_customer_at": None,
             "delivered_at": None, "stops": 0, "customer_zip": "", "place_id": "", "cancel_reason": "",
             "est_distance_m": None, "stop_types": {}, "partial": False, "history": [], "reassigned": 0, "tour_id": None, "in_tour": False}
@@ -220,7 +238,14 @@ def phase_minutes(o: dict) -> dict:
         "to_customer": mins(o["picked_up_at"], o["at_customer_at"]),
         "handover": mins(o["at_customer_at"], o["delivered_at"]),
         "ptod": mins(o["dispatched_at"], o["delivered_at"]),
+        "vs_plan": mins(planned_at(o), o["delivered_at"]),      # + = delivered after the planned time, − = before
     }
+
+
+def on_time(o: dict, grace_min: int) -> Optional[bool]:
+    """Delivered by the planned time (+ grace)?  None when the plan or the delivery time is unknown."""
+    v = (o.get("phases") or phase_minutes(o)).get("vs_plan")
+    return None if v is None else v <= grace_min
 
 
 # ---------------------------------------------------------------- rider GPS tracking
@@ -313,6 +338,19 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
             out.append({"kind": "ptod", "severity": "amber",
                         "headline": f"PTOD at risk — ETA projects {int(projected)} min total (target {tgt})",
                         "action": "Check route / restaurant wait"})
+
+    # --- the customer's planned delivery time (first ETA / scheduled time) ---
+    plan = planned_at(o)
+    if plan:
+        limit = plan + timedelta(minutes=rules.plan_grace_min)
+        if now > limit:
+            out.append({"kind": "plan", "severity": "red",
+                        "headline": f"Planned delivery {hhmm(plan)} missed — {int(mins(plan, now) or 0)} min late for the customer",
+                        "action": "Call the rider; tell the customer the new time; note the reason afterwards"})
+        elif o.get("eta_customer") and o["eta_customer"] > limit:
+            out.append({"kind": "plan", "severity": "amber",
+                        "headline": f"Running late vs plan — ETA {hhmm(o['eta_customer'])}, planned {hhmm(plan)} (+{int(mins(plan, o['eta_customer']) or 0)} min)",
+                        "action": "Check rider position and restaurant; reassign if a closer rider is idle"})
 
     ph = o["phase"]
     if queued:

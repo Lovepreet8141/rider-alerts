@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v4.9)
+# Quickzi — Munich ops platform (v5.1)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -22,19 +22,36 @@ daily report of the evening before.
   On startup, every order of the last 7 days (live and delivered) is rebuilt by replaying the stored raw events —
   dispatch moment, rider history, timestamps — so reports made before an upgrade are correct too.
 
+## Two clocks per order
+- **PTOD** (internal): dispatch → delivered, target 30 min (Settings). Starts when the order is released to riders.
+- **Plan** (the customer's time): the delivery time MotionTools calculated when the order came in — the first
+  ETA for the customer stop; for a pre-order that is the scheduled delivery time. It never moves afterwards (later
+  ETA recalculations are the *current* ETA, not the plan). **On time** = delivered no later than plan + grace
+  (5 min, Settings). This is the closest thing to what Lieferando scores: was the customer served when promised.
+  Shown as a pulse tile, per rider, per hour, per late order, in the daily brief and in the CSV
+  (`planned_delivery`, `min_vs_plan`, `on_time_plan`). Orders whose plan is unknown are simply left out of the %.
+  Alert **Behind plan**: amber when the current ETA is later than plan + grace, red when the planned time has passed.
+
 ## Tabs
 - **Live** — city pulse, **PTOD watch** (live orders at/over the warning time, longest first), the stage board
-  (alerts shown on the order cards; tap a card for the story with Call / Map / Snooze / Handled), riders.
-- **Orders** — every order of the day, searchable, with filters (Live · PTOD risk · Late · Late without reason ·
-  On hold · Delivered · Cancelled). Tap → the order's story: minutes per phase, every rider, alerts, route, and a
+  (alerts shown on the order cards; tap a card for the story with Call / Map / Snooze / Handled; a search box
+  filters the cards by order number / rider / restaurant; the *Waiting for rider* header names the riders who are
+  idle right now with their call button), riders.
+- **Orders** — every order of the day, searchable, with filters (Live · PTOD risk · Late · Late for the customer ·
+  Late without reason · On hold · Delivered · Cancelled) and a *Plan* column (+/− minutes vs the planned time). Tap → the order's story: minutes per phase, every rider, alerts, route, and a
   **reason box** ("Restaurant late", "No rider available", …) — reasons are counted in Insights and the daily brief.
-- **Riders** — deliveries, % within target, avg PTOD, delivery minutes per order, minutes per phase, km/order,
-  double orders, hand-backs, alerts — all from the orders themselves. Hours online / busy % / idle are shown only in
+- **Riders** — leaderboard (best 3 / coach next, riders with ≥3 deliveries), then deliveries, % within target,
+  % on time for the customer, avg PTOD, delivery minutes per order, minutes per phase, km/order, double orders,
+  hand-backs, alerts — all from the orders themselves. Hours online / busy % / idle are shown only in
   API mode (webhook mode cannot know online time reliably). Tap a rider → numbers vs the team.
-- **Insights** — where the minutes go, focus list, staffing hour by hour, restaurants by rider wait (each row shows
+- **Insights** — where the minutes go, focus list, **riders needed tomorrow** hour by hour (from the last 7 days:
+  orders per hour ÷ capacity per rider — Settings, default 2/h — never fewer than the riders who handled that hour,
+  +1 where acceptance was slow; the busiest hours are marked *peak*; the total is the rider-hours to plan),
+  staffing hour by hour, restaurants by rider wait (each row shows
   its order numbers; tap → every order of that restaurant with wait/PTOD/alerts, and a box to name an unnamed
   MotionTools place — the name is applied to all its past orders too), districts by postcode, late orders, alert log.
-- **Daily report** — 14-day trend, frozen report per operating day (04:00 → 04:00), team briefing text, CSV.
+- **Daily report** — 14-day trend, frozen report per operating day (04:00 → 04:00), team briefing text (includes the
+  on-time % and tomorrow's riders for the peak hours), CSV.
 - **Settings** — alert thresholds; restaurant names (by MotionTools place id); rider phone numbers;
   system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples.
 
@@ -59,7 +76,15 @@ actually delivered (a hand-back resets accepted/started/arrived for the next rid
 ## Alerts (PTOD clock starts at dispatch; thresholds editable in Settings)
 No rider (5 min) · accepted but not started (3 min) · not moving / no GPS (4 min) · wrong direction (400 m) ·
 late to restaurant / customer (5 min behind ETA) · waiting at restaurant (8 min) · waiting at customer (5 min) ·
-PTOD at risk (25 min or ETA projects > 30) / breached (30 min) · rider offline with an order.
+PTOD at risk (25 min or ETA projects > 30) / breached (30 min) · behind plan (ETA later than the planned time + 5) /
+plan missed · rider offline with an order.
+
+## Webhook watchdog
+MotionTools pauses a webhook when our server answered with errors for a while (it happened when the volume was full).
+In webhook mode the dashboard therefore shows an orange banner — and the status dot turns red — when **no event has
+arrived for 15 minutes while orders are live** (or riders are online between 11:00 and 23:00): "check in MotionTools →
+Settings → Webhooks that the webhook is still active". It is logged in Settings → System, and `/health` shows
+`silent_min` / `webhook_silent` so an external uptime check can read it too.
 
 ## Files
 `app.py` server · `mt.py` MotionTools client (multi-path, self-probing) · `events.py` webhook projector ·
@@ -85,7 +110,7 @@ Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
 
 ## Pages
 `/dashboard` (any username + DASHBOARD_PASSWORD) · `/export.csv?period=today|yesterday|week|month|YYYY-MM-DD` ·
-`/health` (no login) · `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`,
+`/health` (no login) · `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`, `/api/staffing`,
 `/export-events.jsonl` (last raw webhook events, for debugging) (login).
 
 ## Test locally

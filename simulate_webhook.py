@@ -126,6 +126,10 @@ EVENTS += [ev("booking", "created", m(-100), booking_id="b-plan1", external_id="
            ev("booking", "created", m(-85), booking_id="b-plan3", external_id="PLAN01", customer_id=CUST, place_ids=[PLACE_BK], status="dispatched"),
            ev("booking", "etas_recalculated", m(-84), booking_id="b-plan3", external_id="PLAN01", customer_id=CUST,
               unfinished_stops_info=[{"id": "b-plan3-p", "position": 1, "type": "pickup", "eta": m(36)}, {"id": "b-plan3-d", "position": 2, "type": "dropoff", "eta": m(46)}])]   # planned +46 -> releases in ~1 min (timer test)
+# accepted via booking.transition to "claimed" with affected_user_ids (no tour events, no in_progress yet)
+EVENTS += [ev("booking", "created", m(-9), booking_id="b-clm", external_id="CLAIM1", customer_id=CUST, place_ids=[PLACE_BK], status="dispatched"),
+           ev("booking", "transition", m(-8.5), booking_id="b-clm", external_id="CLAIM1", **{"from": "dispatched", "to": "pickable", "event": "ready_to_pick"}),
+           ev("booking", "transition", m(-6), booking_id="b-clm", external_id="CLAIM1", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-murat"])]
 # an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
 EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])
@@ -134,6 +138,7 @@ for b, ref, pl in (("b-pre1", "PRE001", PLACE_BK), ("b-pre2", "PRE002", PLACE_CH
     BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
 for b, ref, pl in (("b-plan1", "PLAN60", PLACE_BK), ("b-plan2", "PLAN20", PLACE_CHO), ("b-plan3", "PLAN01", PLACE_BK)):
     BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
+BOOK["b-clm"] = {"ref": "CLAIM1", "place": PLACE_BK, "rider_id": "r-murat", "rider": "Murat K.", "delivered": False}
 BOOK["b-dblB"] = {"ref": "DBL-B", "place": PLACE_CHO, "rider_id": "r-obaida", "rider": "Obaida H.", "delivered": False}
 BOOK["b-hb"] = {"ref": "HB1234", "place": PLACE_BK, "rider_id": "r-ahmad", "rider": "Ahmad Sabe", "delivered": False}
 

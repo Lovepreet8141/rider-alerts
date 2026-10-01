@@ -30,7 +30,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from events import DISPATCHED, Projector
 from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
-from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_from, phase_minutes, ts
+from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, ts
 from store import Store, day_key, day_start
 
 log = logging.getLogger("quickzi")
@@ -144,7 +144,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.9"
+VERSION = "5.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -158,7 +158,8 @@ basic = HTTPBasic()
 STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, "hidden": {}, "stack": {}, "raw_samples": {},
          "sync": {"mode": "api", "last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
                   "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None,
-                  "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None}}
+                  "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None,
+                  "silent_min": 0, "webhook_silent": False, "silent_logged": False}}
 WAKE = asyncio.Event()
 projector = Projector(STATE, store, tracker, AREAS)
 projector.lead_min = rules.release_lead_min
@@ -230,6 +231,8 @@ async def sync_orders(now: datetime):
         if not o["id"]:
             continue
         seen.add(o["id"])
+        prev = STATE["orders"].get(o["id"]) or {}
+        o["promised_at"] = prev.get("promised_at") or o.get("promised_at") or o.get("eta_customer")   # first ETA = the plan
         STATE["orders"][o["id"]] = o
         store.upsert_order(o, now, stacked=per_rider.get(o["rider_id"], 0) >= 2)
         if o["rider_id"] and o["rider_lat"] is not None:
@@ -239,6 +242,7 @@ async def sync_orders(now: datetime):
         b = await mt.get_booking(oid)
         o = parse_booking(b) if b else None
         if o and o["id"]:
+            o["promised_at"] = STATE["orders"][oid].get("promised_at") or o.get("promised_at")   # keep the plan it had
             if o["phase"] not in ("delivered", "cancelled"):
                 o["phase"] = "delivered" if o["delivered_at"] else "cancelled"
             store.upsert_order(o, now, stacked=False)
@@ -490,7 +494,7 @@ def replay_events(max_lines: int = 60000) -> dict:
 
 
 COPY_TIMES = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
-              "at_customer_at", "delivered_at", "scheduled_at", "last_event_at", "eta_at")
+              "at_customer_at", "delivered_at", "scheduled_at", "last_event_at", "eta_at", "promised_at")
 
 
 def repair_from_events(now: datetime) -> int:
@@ -590,6 +594,28 @@ def evaluate_all(now: datetime):
             STATE["heads"].pop(key, None)
 
 
+def webhook_watch(now: datetime):
+    """Webhook mode: MotionTools pauses a webhook when our server answered with errors for a while (it happened when the
+    volume was full). Nothing then arrives — the board would silently freeze. So: no event for 15 min while there are
+    live orders (or riders online during opening hours) = a warning banner + a log line."""
+    s = STATE["sync"]
+    last = ts(s["last_webhook"]) if s["last_webhook"] else None
+    ref = max(STARTED, last) if last else STARTED
+    s["silent_min"] = int((now - ref).total_seconds() // 60)
+    live = sum(1 for o in STATE["orders"].values() if o["phase"] not in ("on_hold", "delivered", "cancelled", "closed"))
+    online = sum(1 for r in STATE["riders"].values() if r.get("online"))
+    hour = now.astimezone(BERLIN).hour
+    matters = live > 0 or (online > 0 and 11 <= hour < 23)
+    s["webhook_silent"] = s["mode"] == "webhook" and s["silent_min"] >= 15 and matters
+    if s["webhook_silent"] and not s["silent_logged"]:
+        s["silent_logged"] = True
+        store.log("error", f"no MotionTools events for {s['silent_min']} min while {live} orders are live / {online} riders online — "
+                           "is the webhook still active in MotionTools (Settings → Webhooks)?")
+    elif not s["webhook_silent"] and s["silent_logged"] and s["silent_min"] < 15:
+        s["silent_logged"] = False
+        store.log("info", "MotionTools events are arriving again")
+
+
 def snapshot_yesterday(now: datetime):
     """Freeze yesterday's report once per day (after 04:05 Berlin)."""
     local = now.astimezone(BERLIN)
@@ -643,6 +669,7 @@ async def sync_loop():
                         store.log("info", f"{n} order(s) closed automatically — no MotionTools events for hours")
                 if projector.release_due(now):
                     evaluate_all(now)
+                webhook_watch(now)
                 STATE["sync"]["orders_seen"] = len(STATE["orders"])
                 STATE["sync"]["riders_seen"] = sum(1 for r in STATE["riders"].values() if r.get("online"))
                 STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
@@ -750,6 +777,7 @@ async def webhook(secret: str, request: Request):
         p = {}
     STATE["sync"]["webhook_events"] += 1
     STATE["sync"]["last_webhook"] = iso(datetime.now(UTC))
+    STATE["sync"]["silent_min"], STATE["sync"]["webhook_silent"] = 0, False
     if str(p.get("event") or "") not in GPS_EVENTS:
         with open(event_file(datetime.now(UTC)), "a") as f:
             f.write(json.dumps(p) + "\n")
@@ -808,6 +836,7 @@ def order_view(o: dict, now: datetime) -> dict:
             "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "planned": hm(o.get("eta_customer") or o.get("scheduled_at")),
+            "plan": hm(planned_at(o)), "plan_grace": rules.plan_grace_min, "on_time": on_time(o, rules.plan_grace_min),
             "release": hm((o.get("eta_customer") or o.get("scheduled_at")) - timedelta(minutes=rules.release_lead_min)) if (o.get("eta_customer") or o.get("scheduled_at")) and o["phase"] == "on_hold" else None,
             "waiting_min": int(mins(o.get("created_at"), now) or 0) if o["phase"] == "on_hold" else None}
 
@@ -834,6 +863,7 @@ def api_state():
     riders.sort(key=lambda x: ({"busy": 0, "idle": 1, "offline": 2}[x["status"]], -x["orders"], x["name"]))
     today = store.delivered("today", now)
     ptods = [o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None]
+    plan = [o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None]
     open_alerts = [a for a in alerts if a["resolved_at"] is None]
     last_ok = STATE["sync"]["last_ok"]
     stale = (not last_ok) or (now - datetime.fromisoformat(last_ok)).total_seconds() > max(180, SYNC_SECONDS * 4)
@@ -841,6 +871,8 @@ def api_state():
              "within_pct": round(100 * sum(1 for p in ptods if p <= rules.ptod_target_min) / len(ptods)) if ptods else None,
              "target_within_pct": rules.target_within_pct, "target": rules.ptod_target_min,
              "avg_ptod": round(mean(ptods)) if ptods else None,
+             "on_time_pct": round(100 * sum(1 for v in plan if v <= rules.plan_grace_min) / len(plan)) if plan else None,
+             "plan_known": len(plan), "late_vs_plan": sum(1 for v in plan if v > rules.plan_grace_min), "plan_grace": rules.plan_grace_min,
              "live_orders": sum(1 for o in orders if o["phase"] != "on_hold"), "on_hold": sum(1 for o in orders if o["phase"] == "on_hold"),
              "unassigned": sum(1 for o in orders if o["phase"] == "unassigned"),
              "riders_online": sum(1 for r in riders if r["online"]), "riders_idle": sum(1 for r in riders if r["status"] == "idle"),
@@ -852,7 +884,7 @@ def api_state():
         DISK_CACHE["at"] = now
     return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
             "disk": {"pct": disk["pct"], "free_mb": disk["free_mb"], "total_mb": disk["total_mb"]},
-            "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS}}
+            "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS, "started": iso(STARTED)}}
 
 
 @app.get("/api/places", dependencies=[Depends(require_login)])
@@ -930,6 +962,12 @@ def api_insights(period: str = "today"):
         log.exception("insights failed")
         store.log("error", f"insights failed: {e}"[:300])
         raise HTTPException(500, f"insights failed: {e}")
+
+
+@app.get("/api/staffing", dependencies=[Depends(require_login)])
+def api_staffing():
+    """Tomorrow's riders per hour, from the last 7 operating days."""
+    return store.staffing_plan(datetime.now(UTC), rules)
 
 
 def _check_period(period):
@@ -1031,15 +1069,22 @@ def api_daily(day: str = ""):
         data["day"] = day
     data["frozen"] = frozen
     data["trend"] = store.daily_trend(14)
-    data["brief"] = daily_brief(data)
+    try:
+        data["staffing"] = store.staffing_plan(now, rules)
+    except Exception as e:
+        log.exception("staffing plan failed")
+        data["staffing"] = None
+    data["brief"] = daily_brief(data, data.get("staffing"))
     return data
 
 
-def daily_brief(d: dict) -> str:
+def daily_brief(d: dict, staffing: dict = None) -> str:
     """Short text for the team chat."""
     lines = [f"Quickzi {CITY} — {d.get('day', '')}",
              f"Orders: {d['delivered']} delivered, {d['cancelled']} cancelled",
              f"Within {rules.ptod_target_min} min: {d['within_pct'] if d['within_pct'] is not None else '–'}% (target {rules.target_within_pct}%) · avg PTOD {d['avg_ptod'] or '–'} min · late: {d['late']}"]
+    if d.get("on_time_pct") is not None:
+        lines.append(f"On time for the customer (planned time +{d.get('plan_grace', rules.plan_grace_min)} min): {d['on_time_pct']}% of {d.get('plan_known', 0)} orders · {d.get('late_vs_plan', 0)} late vs plan")
     ph = d["phases"]
     if ph.get("to_accept") is not None:
         lines.append(f"Avg minutes: accept {ph['to_accept']} · to restaurant {ph['to_restaurant']} · at restaurant {ph['at_restaurant']} · to customer {ph['to_customer']} · handover {ph['handover']}")
@@ -1051,6 +1096,11 @@ def daily_brief(d: dict) -> str:
         lines.append(f"Best rider: {best['rider']} ({best['within_pct']}% within target, {best['delivered']} orders)")
     for f in d["focus"][:3]:
         lines.append(f"• {f['title']}")
+    if staffing and staffing.get("hours"):
+        peak = [h for h in staffing["hours"] if h["hour"] in staffing["peak_hours"]]
+        lines.append(f"Riders for {staffing['tomorrow']} (from the last {staffing['days']} days): "
+                     + " · ".join(f"{h['hour']:02d}–{(h['hour'] + 1) % 24:02d}h {h['plan']}" for h in peak)
+                     + " — full plan in Insights")
     return "\n".join(lines)
 
 
@@ -1062,7 +1112,9 @@ def api_settings_get():
         "start_limit_min": "Alert if accepted but not started after (min)", "stationary_min": "Alert if not moving for (min)",
         "wrong_way_m": "Alert if further from next stop by (metres)", "late_grace_min": "Alert if behind ETA by (min)",
         "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)",
-        "release_lead_min": "Pre-orders are released to riders this many min before the planned delivery (MotionTools auto-scheduling)"}}
+        "release_lead_min": "Pre-orders are released to riders this many min before the planned delivery (MotionTools auto-scheduling)",
+        "plan_grace_min": "On time for the customer = delivered no later than the planned time + (min)",
+        "riders_capacity_per_hour": "Staffing plan: orders one rider delivers per hour"}}
 
 
 @app.post("/api/settings", dependencies=[Depends(require_login)])
@@ -1100,7 +1152,7 @@ def api_snooze(aid: int, minutes: int = 10):
 @app.get("/export.csv", dependencies=[Depends(require_login)])
 def export_csv(period: str = "today"):
     _check_period(period)
-    body = store.export_csv(period, datetime.now(UTC))
+    body = store.export_csv(period, datetime.now(UTC), rules)
     return PlainTextResponse(body, media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="quickzi-{CITY.lower()}-{period}.csv"'})
 
@@ -1120,7 +1172,8 @@ def health():
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
-            "sync": {k: s[k] for k in ("last_ok", "last_error", "runs", "orders_seen", "riders_seen", "backfilled", "webhook_events", "last_snapshot")},
+            "sync": {k: s[k] for k in ("last_ok", "last_error", "runs", "orders_seen", "riders_seen", "backfilled", "webhook_events", "last_snapshot",
+                                       "last_webhook", "silent_min", "webhook_silent", "mode")},
             "api": mt.stats}
 
 

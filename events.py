@@ -188,6 +188,8 @@ class Projector:
                 o[k] = p[k]
         if p.get("scheduled_at"):
             o["scheduled_at"] = p["scheduled_at"]
+        if not o.get("promised_at"):
+            o["promised_at"] = p.get("promised_at") or (p.get("eta_customer") if not (o.get("delivered_at") or o.get("cancelled")) else None)
         if p.get("status"):
             o["status"] = p["status"]
             if p["status"] in DISPATCHED or p["status"] in DONE:
@@ -326,6 +328,12 @@ class Projector:
                     if to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)                                     # back to "pickable" = rider handed it back
                     self.dispatched(o, now, exact=(to == "pickable"))            # PTOD clock starts here
+                    users = d.get("affected_user_ids") or []
+                    users = [users] if isinstance(users, str) else list(users)
+                    if to in ("claimed", "en_route") and users:
+                        self.set_rider(o, users[0], "", now)                     # the rider who accepted (booking-level claim)
+                    if to == "en_route" and o.get("rider_id"):
+                        o["started_at"] = o["started_at"] or now
                 elif to in ASSIGNED or to == "to_be_dispatched":
                     if o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)
@@ -349,6 +357,8 @@ class Projector:
                     eta = ts(s.get("eta"))
                     if eta:
                         o["eta_restaurant" if kind == "pickup" else "eta_customer"] = eta
+                        if kind == "dropoff" and not o.get("promised_at"):
+                            o["promised_at"] = eta                  # the first ETA = the planned delivery time (never moves)
                 if o.get("status") != "to_be_dispatched":
                     self.weak_dispatch(o, now)
             elif ev in ("stop_arrived", "stop_completed", "stop_failed"):
