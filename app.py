@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "3.5"
+VERSION = "3.7"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -64,7 +64,7 @@ tracker = RiderTracker()
 app = FastAPI()
 basic = HTTPBasic()
 
-STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, "hidden": {}, "raw_samples": {},
+STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, "hidden": {}, "stack": {}, "raw_samples": {},
          "sync": {"mode": "api", "last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
                   "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None,
                   "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None}}
@@ -359,21 +359,26 @@ def repair_from_events(now: datetime) -> int:
             elif (ev == "transition" and str(d.get("to") or "") in DISPATCHED) or ev == "force_assigned":
                 for b in tours.get(tid, []):
                     disp.setdefault(b, t)
+    # every order of the last 7 days (delivered ones too — reports and the Orders tab use them), live objects first
+    targets = {o["id"]: o for o in store.orders_in("week", now)}
+    targets.update(STATE["orders"])
     n = 0
-    for o in STATE["orders"].values():
+    for o in targets.values():
         if o.get("repaired"):
             continue
         bid = o["id"]
+        finished = o["phase"] in ("delivered", "cancelled", "closed")
         if bid in disp:
             o["dispatched_at"] = disp[bid]
-        elif bid in created and not o.get("rider_id") and not o.get("accepted_at"):
+        elif bid in created and not finished and not o.get("rider_id") and not o.get("accepted_at"):
             o["dispatched_at"] = None                       # created, never offered to riders -> on hold
         else:
             continue
         if bid in created:
             o["created_at"] = created[bid][0]
         o["repaired"] = True
-        o["phase"] = phase_from(o)
+        if not finished:
+            o["phase"] = phase_from(o)
         store.upsert_order(o, now, stacked=bool(o.get("stacked")))
         n += 1
     return n
@@ -388,14 +393,41 @@ def alert_payload(o: dict, c: dict) -> dict:
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None else ""}
 
 
+PROGRESS = {"accepted": 0, "to_restaurant": 1, "at_restaurant": 2, "to_customer": 3, "at_customer": 4}
+
+
+def compute_stacks(now: datetime):
+    """Double orders: the rider works one order at a time. The order whose next stop has the earliest ETA is the
+    'current' one (fallback: the one further along, then the earlier dispatched); the others are queued behind it."""
+    by_rider = {}
+    for o in STATE["orders"].values():
+        if o["rider_id"] and o["phase"] in PROGRESS:
+            by_rider.setdefault(o["rider_id"], []).append(o)
+    stack = {}
+    for rid, rs in by_rider.items():
+        if len(rs) < 2:
+            continue
+
+        def rank(o):
+            eta = o.get("eta_customer") if o.get("picked_up_at") else o.get("eta_restaurant")
+            return (0 if eta else 1, eta or now, -PROGRESS.get(o["phase"], 0), o.get("dispatched_at") or now)
+        active = sorted(rs, key=rank)[0]
+        for o in rs:
+            stack[o["id"]] = {"with": [x["ref"] for x in rs if x is not o], "queued": o is not active,
+                              "behind": active["ref"] if o is not active else ""}
+    STATE["stack"] = stack
+
+
 def evaluate_all(now: datetime):
+    compute_stacks(now)
     for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:
         store.resolve_alert(STATE["open_alerts"].pop(key), "order completed", now)
         STATE["sev"].pop(key, None)
         STATE["heads"].pop(key, None)
     for o in STATE["orders"].values():
         r = STATE["riders"].get(o["rider_id"] or "")
-        conds = {c["kind"]: c for c in evaluate(o, now, rules, tracker, r["online"] if r else None)}
+        queued = STATE["stack"].get(o["id"], {}).get("queued", False)
+        conds = {c["kind"]: c for c in evaluate(o, now, rules, tracker, r["online"] if r else None, queued=queued)}
         for kind, c in conds.items():
             key = (o["id"], kind)
             payload = alert_payload(o, c)
@@ -523,7 +555,7 @@ async def startup():
         n = repair_from_events(now)
         if n:
             on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
-            store.log("info", f"repaired dispatch times of {n} open orders from the stored events ({on_hold} now on hold)")
+            store.log("info", f"repaired dispatch times of {n} orders of the last 7 days from the stored events ({on_hold} live orders now on hold)")
     except Exception as e:
         log.exception("repair failed: %s", e)
     if not DASH_PASSWORD:
@@ -596,7 +628,8 @@ def order_view(o: dict, now: datetime) -> dict:
             "stacked": bool(o.get("stacked")), "cancel_reason": o.get("cancel_reason", ""),
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
             "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
-            "alert_heads": [h for h in heads if h],
+            "alert_heads": [h for h in heads if h], "stack": STATE["stack"].get(o["id"]) if live else None,
+            "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "waiting_min": int(mins(o.get("created_at"), now) or 0) if o["phase"] == "on_hold" else None}
 

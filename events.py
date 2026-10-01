@@ -102,14 +102,35 @@ class Projector:
             r["name"] = name
         return r
 
+    @staticmethod
+    def note(o: dict, now: datetime, what: str, rid=None, name: str = ""):
+        """Order history shown in the story: who accepted, who handed it back, who took it next."""
+        h = o.setdefault("history", [])
+        h.append({"at": now.isoformat(timespec="seconds"), "what": what, "rider_id": rid, "rider": name or ""})
+        del h[:-30]
+
+    def release(self, o: dict, now: datetime, why: str = "released"):
+        """The rider who had this order no longer has it (handed back / unassigned by the dispatcher)."""
+        if not o.get("rider_id"):
+            return
+        self.note(o, now, why, o["rider_id"], o.get("rider") or "")
+        o["reassigned"] = (o.get("reassigned") or 0) + 1
+        o["rider_id"], o["rider"] = None, ""
+        o["accepted_at"], o["started_at"] = None, None          # the next rider's acceptance counts from here
+
     def set_rider(self, o: dict, rid, name, now):
         if rid:
+            if o.get("rider_id") and o["rider_id"] != rid:
+                self.release(o, now)                            # another rider takes over
+            new_rider = o.get("rider_id") != rid
             o["rider_id"] = rid
             r = self.rider(rid, name or "", now)
             o["rider"] = name or r["name"] or o["rider"]
             if not o["accepted_at"]:
                 busy = self.busy_at.get(rid)
                 o["accepted_at"] = busy if busy and now - busy < timedelta(minutes=20) else now
+            if new_rider:
+                self.note(o, now, "accepted", rid, o["rider"])
 
     def gps(self, rid, lat, lng, now, order_id=None):
         if rid and lat is not None and lng is not None:
@@ -229,9 +250,14 @@ class Projector:
                     o["cancelled"] = True
                     o["cancel_reason"] = o.get("cancel_reason") or "cancelled in MotionTools"
                 elif to in DISPATCHED:
+                    if to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
+                        self.release(o, now)                                     # back to "pickable" = rider handed it back
                     self.dispatched(o, now)                                      # PTOD clock starts here
-                elif to in ASSIGNED:
-                    o["assigned_at"] = now                                       # in a tour, still on hold
+                elif to in ASSIGNED or to == "to_be_dispatched":
+                    if o.get("rider_id") and not o.get("picked_up_at"):
+                        self.release(o, now)
+                    if to in ASSIGNED:
+                        o["assigned_at"] = now                                   # in a tour, still on hold
                 o["status"] = to or o["status"]
             elif ev == "in_progress":
                 self.dispatched(o, now)
@@ -241,6 +267,7 @@ class Projector:
                 o["rider_lat"], o["rider_lng"] = loc.get("lat"), loc.get("lng")
                 self.gps(o["rider_id"], loc.get("lat"), loc.get("lng"), now, bid)
             elif ev == "etas_recalculated":
+                o["eta_at"] = now
                 for s in d.get("unfinished_stops_info") or []:
                     kind = "pickup" if "pick" in str(s.get("type", "")).lower() else "dropoff"
                     o["stop_types"][str(s.get("id"))] = kind
@@ -309,6 +336,7 @@ class Projector:
                     if bid in self.state["orders"]:
                         o = self.state["orders"][bid]
                         o["assigned_at"] = now
+                        o["tour_id"] = tid
                         if st in DISPATCHED:                                     # tours are usually created on hold
                             self.dispatched(o, now)
                         self.finish(o, now)
@@ -321,12 +349,19 @@ class Projector:
                 users = d.get("affected_user_ids") or []
                 users = [users] if isinstance(users, str) else users
                 for o in bookings:
+                    o["tour_id"] = tid
                     if to == "claimed":
                         self.dispatched(o, now)
+                        if users and o.get("rider_id") and o["rider_id"] != users[0]:
+                            self.release(o, now)
                         o["accepted_at"] = o["accepted_at"] or now
                         if users and not o["rider_id"]:
                             o["rider_id"] = users[0]
                             o["rider"] = self.rider(users[0])["name"]
+                            self.note(o, now, "accepted", users[0], o["rider"])
+                    elif to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
+                        self.release(o, now)                                     # tour offered again = handed back
+                        self.dispatched(o, now)
                     elif to == "en_route":
                         self.dispatched(o, now)
                         o["started_at"] = o["started_at"] or now

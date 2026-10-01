@@ -182,7 +182,7 @@ def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime]
             "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None, "accepted_at": None,
             "started_at": None, "at_restaurant_at": None, "picked_up_at": None, "at_customer_at": None,
             "delivered_at": None, "stops": 0, "customer_zip": "", "place_id": "", "cancel_reason": "",
-            "est_distance_m": None, "stop_types": {}, "partial": False}
+            "est_distance_m": None, "stop_types": {}, "partial": False, "history": [], "reassigned": 0, "tour_id": None}
 
 
 def phase_from(o: dict) -> str:
@@ -285,9 +285,10 @@ class RiderTracker:
 
 # ---------------------------------------------------------------- alert rules
 def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracker] = None,
-             rider_online: Optional[bool] = None) -> list:
+             rider_online: Optional[bool] = None, queued: bool = False) -> list:
     """Return the list of alert conditions currently true for this order.
-    Each: {"kind", "severity" (red|amber), "headline", "action"}"""
+    Each: {"kind", "severity" (red|amber), "headline", "action"}
+    queued = the rider is busy with the other order of a double first: only the PTOD clock and offline matter."""
     out = []
     if o["phase"] in ("delivered", "cancelled", "on_hold", "closed") or not o.get("dispatched_at"):
         return out
@@ -311,6 +312,11 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
                         "action": "Check route / restaurant wait"})
 
     ph = o["phase"]
+    if queued:
+        if rider_online is False:
+            out.append({"kind": "offline", "severity": "red", "headline": "Rider is OFFLINE with an active order",
+                        "action": "Call the rider immediately / reassign"})
+        return out
     # --- nobody accepted ---
     if ph == "unassigned":
         if elapsed >= rules.accept_limit_min:
@@ -331,6 +337,9 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
     if ph in ("to_restaurant", "to_customer"):
         target = "restaurant" if ph == "to_restaurant" else "customer"
         eta = o["eta_restaurant"] if ph == "to_restaurant" else o["eta_customer"]
+        eta_at = o.get("eta_at")
+        if eta_at and o.get("started_at") and eta_at < o["started_at"]:
+            eta = None                                      # ETA from before the rider took it — wait for the recalculation
         if eta and now > eta + timedelta(minutes=rules.late_grace_min):
             late = int(mins(eta, now) or 0)
             out.append({"kind": f"late_{target}", "severity": "amber" if late < 10 else "red",

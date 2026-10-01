@@ -100,12 +100,27 @@ EVENTS += [ev("booking", "created", m(-120), booking_id="b-pre1", external_id="P
            # created 130 min ago, dispatched 6 min ago, nobody accepted yet -> PTOD 6, "no rider" alert
            ev("booking", "created", m(-130), booking_id="b-pre3", external_id="PRE003", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched", scheduled_at=m(10)),
            ev("booking", "transition", m(-6), booking_id="b-pre3", external_id="PRE003", **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"})]
+# DOUBLE order: Obaida has A (picked up, delivering) and B (accepted in the same tour, not started) -> B is queued, no alert
+EVENTS += order_events("DBL-A", "b-dblA", PLACE_BK, "r-obaida", "Obaida H.", -20, wait_min=3, deliver=False)
+EVENTS += [ev("booking", "created", m(-19), booking_id="b-dblB", external_id="DBL-B", customer_id=CUST, place_ids=[PLACE_CHO], status="to_be_dispatched"),
+           ev("booking", "transition", m(-18.5), booking_id="b-dblB", external_id="DBL-B", **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"}),
+           ev("tour", "created", m(-18), tour_id="t-dbl", dispatched_booking_ids=["b-dblA", "b-dblB"], status="pickable"),
+           ev("tour", "transition", m(-17), tour_id="t-dbl", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-obaida"])]
+# HAND-BACK: Sven accepted, asked to be released, tour offered again, Ahmad took it
+EVENTS += [ev("booking", "created", m(-15), booking_id="b-hb", external_id="HB1234", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched"),
+           ev("booking", "transition", m(-14), booking_id="b-hb", external_id="HB1234", **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"}),
+           ev("tour", "created", m(-14), tour_id="t-hb", dispatched_booking_ids=["b-hb"], status="pickable"),
+           ev("tour", "transition", m(-13), tour_id="t-hb", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-sven"]),
+           ev("tour", "transition", m(-7), tour_id="t-hb", **{"from": "claimed", "to": "pickable", "event": "unclaim"}, affected_user_ids=["r-sven"]),
+           ev("booking", "in_progress", m(-3), booking_id="b-hb", external_id="HB1234", driver_id="r-ahmad", driver_name="Ahmad Sabe", driver_location={"lat": 48.14, "lng": 11.56})]
 # an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
 EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])
 BOOK["b-live4"] = {"ref": "KMW86T", "place": PLACE_CHO, "rider_id": "r-sven", "rider": "Sven B.", "delivered": False}
 for b, ref, pl in (("b-pre1", "PRE001", PLACE_BK), ("b-pre2", "PRE002", PLACE_CHO), ("b-pre3", "PRE003", PLACE_BK)):
     BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
+BOOK["b-dblB"] = {"ref": "DBL-B", "place": PLACE_CHO, "rider_id": "r-obaida", "rider": "Obaida H.", "delivered": False}
+BOOK["b-hb"] = {"ref": "HB1234", "place": PLACE_BK, "rider_id": "r-ahmad", "rider": "Ahmad Sabe", "delivered": False}
 
 
 # ---------------------------------------------------------------- fake MotionTools HTTP server

@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS syslog (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT
 """
 
 DT_FIELDS = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
-             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer", "scheduled_at", "last_event_at")
+             "at_customer_at", "delivered_at", "eta_restaurant", "eta_customer", "scheduled_at", "last_event_at", "eta_at")
 
 
 def day_start(now: datetime) -> datetime:
@@ -398,6 +398,11 @@ class Store:
                           "orders_per_rider_hour": round(len(rs) / rh, 1) if rh else None})
 
         # --- riders ---
+        handbacks = {}
+        for o in orders:
+            for h in o.get("history") or []:
+                if h.get("what") == "released" and h.get("rider_id"):
+                    handbacks[h["rider_id"]] = handbacks.get(h["rider_id"], 0) + 1
         riders = []
         for rid, rs in group(orders, lambda o: o["rider_id"] or "").items():
             if not rid:
@@ -419,7 +424,7 @@ class Store:
                            "utilisation_pct": _pct(busy, online) if online else None,
                            "orders_per_hour": round(len(d) / (online / 60), 1) if online >= 30 else None,
                            "idle_minutes": round(max(0, online - busy)) if online else None,
-                           "avg_km": _avg(kms), "double": sum(1 for o in rs if o["stacked"]),
+                           "avg_km": _avg(kms), "double": sum(1 for o in rs if o["stacked"]), "handbacks": handbacks.get(rid, 0),
                            "alerts": sum(by_rider_alerts.get(rid, {}).values()), "alert_kinds": by_rider_alerts.get(rid, {})})
         riders.sort(key=lambda x: (-(x["within_pct"] if x["within_pct"] is not None else -1), x["avg_ptod"] or 0, -x["delivered"]))
 
