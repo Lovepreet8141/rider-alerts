@@ -144,7 +144,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.8"
+VERSION = "4.9"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)

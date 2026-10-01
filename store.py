@@ -104,6 +104,17 @@ def _pct(ok, n):
     return round(100 * ok / n) if n else None
 
 
+def _median(vals):
+    vals = [v for v in vals if v is not None]
+    return round(median(vals), 1) if vals else None
+
+
+def _within(rows, tgt):
+    """% of orders delivered within the target — only over orders whose PTOD is known."""
+    known = [o for o in rows if o["phases"]["ptod"] is not None]
+    return _pct(sum(1 for o in known if o["phases"]["ptod"] <= tgt), len(known))
+
+
 def _count(values) -> dict:
     out = {}
     for v in values:
@@ -432,7 +443,9 @@ class Store:
         'hours online' (busy %, orders/hour, idle, rider-hours per hour) is left out; staffing uses the riders
         who actually handled orders in that hour instead — which comes straight from the orders."""
         start, end = period_range(period, now)
-        orders = [o for o in self.orders_in(period, now) if o["dispatched_at"] and start <= o["dispatched_at"] < end]
+        def when(o):                       # an order belongs to the period of its dispatch; if that is unknown, of its delivery / creation
+            return o["dispatched_at"] or o["delivered_at"] or o.get("created_at")
+        orders = [o for o in self.orders_in(period, now) if when(o) and start <= when(o) < end]
         done = [o for o in orders if o["phase"] == "delivered" and o["delivered_at"]]
         cancelled = [o for o in orders if o["phase"] == "cancelled"]
         tgt = rules.ptod_target_min
@@ -461,7 +474,7 @@ class Store:
                                 "avg_wait": _avg([o["phases"]["at_restaurant"] for o in d]),
                                 "max_wait": max([o["phases"]["at_restaurant"] or 0 for o in d], default=None),
                                 "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
-                                "within_pct": _pct(sum(1 for o in d if (o["phases"]["ptod"] or 999) <= tgt), len(d))})
+                                "within_pct": _within(d, tgt)})
         restaurants.sort(key=lambda x: -(x["avg_wait"] or 0))
 
         # --- hours: demand vs supply ---
@@ -475,7 +488,7 @@ class Store:
             hours.append({"hour": h, "orders": len(rs), "delivered": len(d), "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                           "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
                           "avg_accept": _avg([o["phases"]["to_accept"] for o in rs if o["accepted_at"]]),
-                          "within_pct": _pct(sum(1 for o in d if (o["phases"]["ptod"] or 999) <= tgt), len(d)),
+                          "within_pct": _within(d, tgt),
                           "rider_hours": (round(rh / days, 1) if days > 1 else rh) if sessions_ok else None,
                           "orders_per_rider_hour": round(len(rs) / rh, 1) if rh else None,
                           "riders_active": round(active / days, 1) if days > 1 else active,
@@ -501,8 +514,8 @@ class Store:
             riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "orders": len(rs), "delivered": len(d),
                            "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                            "live": sum(1 for o in rs if o["phase"] not in ("delivered", "cancelled", "closed")),
-                           "within_pct": _pct(sum(1 for o in d if (o["phases"]["ptod"] or 999) <= tgt), len(d)),
-                           "avg_ptod": ph("ptod"), "median_ptod": round(median([o["phases"]["ptod"] for o in d if o["phases"]["ptod"] is not None]), 1) if d else None,
+                           "within_pct": _within(d, tgt),
+                           "avg_ptod": ph("ptod"), "median_ptod": _median([o["phases"]["ptod"] for o in d]),
                            "avg_accept": ph("to_accept"), "avg_to_restaurant": ph("to_restaurant"),
                            "avg_wait": ph("at_restaurant"), "avg_to_customer": ph("to_customer"), "avg_handover": ph("handover"),
                            "avg_delivery_min": round(busy / len(d), 1) if d else None,
@@ -519,7 +532,7 @@ class Store:
         for z, rs in group(done, lambda o: o.get("customer_zip") or "?").items():
             districts.append({"zip": z, "orders": len(rs), "avg_to_customer": _avg([o["phases"]["to_customer"] for o in rs]),
                               "avg_ptod": _avg([o["phases"]["ptod"] for o in rs]),
-                              "within_pct": _pct(sum(1 for o in rs if (o["phases"]["ptod"] or 999) <= tgt), len(rs))})
+                              "within_pct": _within(rs, tgt)})
         districts.sort(key=lambda x: -(x["avg_ptod"] or 0))
 
         single = [o["phases"]["ptod"] for o in done if not o["stacked"] and o["phases"]["ptod"] is not None]
@@ -559,8 +572,8 @@ class Store:
     def _focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts, sessions_ok=False):
         focus = []
         for x in restaurants:
-            if x["delivered"] >= 3 and (x["avg_wait"] or 0) >= rules.wait_restaurant_min:
-                focus.append({"icon": "🏪", "title": f"{x['restaurant']}: riders wait {x['avg_wait']:.0f} min on average ({x['delivered']} orders, max {x['max_wait']:.0f})",
+            if x["delivered"] >= 3 and x["avg_wait"] is not None and x["avg_wait"] >= rules.wait_restaurant_min:
+                focus.append({"icon": "🏪", "title": f"{x['restaurant']}: riders wait {x['avg_wait']:.0f} min on average ({x['delivered']} orders, max {x['max_wait'] or 0:.0f})",
                               "action": "Call the restaurant today: start cooking on dispatch and hand over at the counter. If it stays slow, dispatch riders 5 min later for this restaurant."})
         under = [h for h in hours if h["orders"] >= 3 and h["hour"] is not None and ((h["avg_accept"] or 0) >= 4 or (h["orders_per_rider_hour"] or 0) >= 2.5 or (h["orders_per_rider"] or 0) >= 3)]
         under.sort(key=lambda h: -(h["avg_accept"] or 0))
@@ -583,10 +596,10 @@ class Store:
             focus.append({"icon": "📦", "title": f"Double orders take {mean(double) - mean(single):.0f} min longer ({mean(double):.0f} vs {mean(single):.0f} min)",
                           "action": "Only stack a second order when both ETAs stay under 30 min."})
         if (phases["handover"] or 0) >= 4:
-            focus.append({"icon": "🚪", "title": f"Handover at the customer takes {phases['handover']:.0f} min on average",
+            focus.append({"icon": "🚪", "title": f"Handover at the customer takes {phases['handover'] or 0:.0f} min on average",
                           "action": "Riders should call the customer 2 min before arrival."})
         for x in riders:
-            if x["delivered"] >= 3 and ((x["within_pct"] or 100) < 70 or (x["avg_ptod"] or 0) > rules.ptod_target_min):
+            if x["delivered"] >= 3 and x["avg_ptod"] is not None and ((x["within_pct"] if x["within_pct"] is not None else 100) < 70 or x["avg_ptod"] > rules.ptod_target_min):
                 slow = max((k for k in ("avg_accept", "avg_to_restaurant", "avg_wait", "avg_to_customer", "avg_handover")), key=lambda k: (x[k] or 0) - (phases[{"avg_accept": "to_accept", "avg_to_restaurant": "to_restaurant", "avg_wait": "at_restaurant", "avg_to_customer": "to_customer", "avg_handover": "handover"}[k]] or 0))
                 focus.append({"icon": "🧑", "title": f"{x['rider']}: {x['within_pct']}% within target, avg PTOD {x['avg_ptod']:.0f} min — loses most time in {slow.replace('avg_', '').replace('_', ' ')}",
                               "action": "Coach with the numbers from the rider table (tap the name)."})
@@ -595,7 +608,7 @@ class Store:
                 focus.append({"icon": "💤", "title": f"{x['rider']}: online {x['online_minutes'] / 60:.1f} h but only {x['delivered']} deliveries ({x['utilisation_pct']}% busy)",
                               "action": "Check whether this rider accepts orders; otherwise shift them to a busier hour."})
         for d in districts[:1]:
-            if d["orders"] >= 4 and (d["avg_ptod"] or 0) > rules.ptod_target_min:
+            if d["orders"] >= 4 and d["avg_ptod"] is not None and d["avg_ptod"] > rules.ptod_target_min:
                 focus.append({"icon": "🗺", "title": f"Postcode {d['zip']}: avg PTOD {d['avg_ptod']:.0f} min over {d['orders']} orders",
                               "action": "Far district — position an idle rider nearby at peak, or dispatch earlier for these addresses."})
         if not focus and (single or double):

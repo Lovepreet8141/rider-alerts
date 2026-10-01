@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v4.8)
+# Quickzi — Munich ops platform (v4.9)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
