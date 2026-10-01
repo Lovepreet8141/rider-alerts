@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v5.2)
+# Quickzi — Munich ops platform (v5.4)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
@@ -33,10 +33,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   Alert **Behind plan**: amber when the current ETA is later than plan + grace, red when the planned time has passed.
 
 ## Tabs
-- **Live** — city pulse, **PTOD watch** (live orders at/over the warning time, longest first), the stage board
-  (alerts shown on the order cards; tap a card for the story with Call / Map / Snooze / Handled; a search box
-  filters the cards by order number / rider / restaurant; the *Waiting for rider* header names the riders who are
-  idle right now with their call button), riders.
+- **Live** — city pulse, **PTOD watch** (live orders at/over the warning time as one strip of chips), then the
+  live orders in three views: **Needs action** (default — only orders with an alert, one compact row each, red
+  first, then by PTOD; the on-track orders are a single line at the bottom with *Show them*), **All live** (every
+  order as a row, longest PTOD first), **By stage** (the card board). Above the list, one chip per stage with its
+  count and how many of them have an alert — tap a chip to see only that stage, in any view. The *Waiting for
+  rider* chip names the riders who are idle right now with their call button. Tap any row/card for the story
+  (Call / Map / Snooze / Handled / reason). The view you pick is remembered on that device. Riders: busy first,
+  idle and offline capped with *show all*.
 - **Orders** — every order of the day, searchable, with filters (Live · PTOD risk · Late · Late for the customer ·
   Late without reason · On hold · Delivered · Cancelled) and a *Plan* column (+/− minutes vs the planned time). Tap → the order's story: minutes per phase, every rider, alerts, route, and a
   **reason box** ("Restaurant late", "No rider available", …) — reasons are counted in Insights and the daily brief.

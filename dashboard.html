@@ -56,15 +56,21 @@
   .oc .r2,.oc .r3{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .oc .r5{font-size:12px;line-height:1.35} .oc .r2 b{color:var(--ink)} .oc .r4{display:flex;gap:4px;flex-wrap:wrap;align-items:center;font-size:11px;color:var(--muted)} .oc .r4 .tag{margin:0;padding:1px 5px}
   .chips{display:flex;gap:6px;flex-wrap:wrap} .chips button{padding:4px 10px;border-radius:14px} .chips button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
   .pill.on_hold{background:var(--soft);color:var(--muted)} .pill.closed{background:var(--soft);color:var(--muted)}
-  .hidden{display:none}
+  .hidden{display:none!important}
   .lead{display:grid;gap:6px} .lead .row{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;cursor:pointer} .lead .row:hover{border-color:var(--accent)} .lead .medal{font-size:18px;width:24px;text-align:center} .lead b{flex:1} .lead .muted{white-space:nowrap}
   .idle{font-size:12px;color:var(--green);font-weight:600} .idle a{color:var(--green);text-decoration:none;border:1px solid var(--green);border-radius:6px;padding:0 6px;margin-left:4px}
   td.plan b{font-variant-numeric:tabular-nums}
+  .rows{display:grid;gap:5px} .lr{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--line);border-radius:10px;padding:7px 10px;display:grid;grid-template-columns:78px minmax(0,1.1fr) minmax(0,1.3fr);gap:4px 12px;align-items:center;cursor:pointer;font-size:13px} .lr:hover{border-color:var(--accent)} .lr.red{border-left-color:var(--red);background:var(--red-bg)} .lr.amber{border-left-color:var(--amber)}
+  .lr .chip{font-weight:800;font-variant-numeric:tabular-nums;border-radius:6px;padding:2px 6px;background:var(--green-bg);color:var(--green);text-align:center;white-space:nowrap} .lr .chip.warn{background:var(--amber-bg);color:var(--amber)} .lr .chip.bad{background:var(--red-bg);color:var(--red)} .lr .chip.grey{background:var(--soft);color:var(--muted);font-weight:600}
+  .lr .who{display:flex;flex-wrap:wrap;gap:3px 8px;align-items:center;min-width:0} .lr .who b{font-size:14px} .lr .who .pill{font-size:11px;padding:1px 7px} .lr .who .muted{white-space:nowrap} .lr .what{color:var(--muted);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .lr .what .tag{margin:0 4px 0 0;padding:1px 5px} .lr .what.red{color:var(--red)} .lr .what.amber{color:var(--amber)}
+  @media(max-width:760px){.lr{grid-template-columns:70px 1fr} .lr .what{grid-column:1/-1;white-space:normal}}
+  .chips button .count{margin-left:4px;padding:0 6px} .chips button.on .count{background:var(--bg);color:var(--ink)}
+  .ontrack{background:var(--card);border:1px dashed var(--line);border-radius:10px;padding:10px 12px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 </style>
 </head>
 <body>
 <header>
-  <h1 id="title" title="dashboard v5.2">Quickzi · Ops</h1>
+  <h1 id="title" title="dashboard v5.4">Quickzi · Ops</h1>
   <nav id="nav"><a href="#live" class="active">Live</a><a href="#orders">Orders</a><a href="#riders">Riders</a><a href="#insights">Insights</a><a href="#daily">Daily report</a><a href="#settings">Settings</a></nav>
   <span class="sp"></span>
   <span class="muted"><span id="dot" class="dot"></span><span id="updated">connecting…</span></span>
@@ -77,9 +83,11 @@
   <section id="live" class="active">
     <div class="pulse" id="pulse"></div>
     <div id="ptodWatchBox" class="hidden"><h2>PTOD watch <span id="ptodWatchCount" class="count red">0</span><span class="sp"></span><span class="muted">live orders at or over the warning time, longest first</span></h2>
-    <div class="stage" style="border-left:5px solid var(--red)"><div class="sb" id="ptodWatch" style="border-top:0"></div></div></div>
-    <h2>Orders by stage <span id="orderCount" class="count">0</span><span class="sp"></span><input id="liveQ" placeholder="find order / rider / restaurant" style="min-width:210px;font-weight:400;text-transform:none;letter-spacing:0"><span class="muted">PTOD counts from dispatch · tap an order for its story</span></h2>
-    <div class="board" id="board"></div>
+    <div class="chips" id="ptodWatch" style="margin-bottom:4px"></div></div>
+    <h2>Live orders <span id="orderCount" class="count">0</span><span class="sp"></span><input id="liveQ" placeholder="find order / rider / restaurant" style="min-width:210px;font-weight:400;text-transform:none;letter-spacing:0"><span class="seg" id="liveView"><button data-v="action" class="active">Needs action</button><button data-v="list">All live</button><button data-v="board">By stage</button></span></h2>
+    <div class="chips" id="stageChips" style="margin:0 0 10px"></div>
+    <div class="rows" id="liveList"></div>
+    <div class="board hidden" id="board"></div>
     <h2>Riders now <span class="muted" id="riderNote"></span></h2>
     <div class="riders" id="riderChips"></div>
   </section>
@@ -141,10 +149,10 @@
     <div class="panel" style="margin-top:0"><div id="placesForm" class="form"></div><div style="margin-top:10px"><button id="savePlaces" class="primary">Save names</button> <span class="muted" id="placesMsg"></span></div></div>
     <h2>Rider phone numbers <span class="muted">(only needed when MotionTools sends none — used by the Call / WhatsApp buttons)</span></h2>
     <div class="panel" style="margin-top:0"><div id="phonesForm" class="form"></div><div style="margin-top:10px"><button id="savePhones" class="primary">Save numbers</button> <span class="muted" id="phonesMsg"></span></div></div>
+    <h2 style="color:var(--red)">🗑 Delete one day's data <span class="muted">(for a day that was recorded wrongly — removes that day's finished orders, alerts, GPS points and frozen report; live orders are kept; cannot be undone)</span></h2>
+    <div class="panel" style="margin-top:0;border-color:var(--red)"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input type="date" id="delDay"><button id="delCheck">Check what would be deleted</button><span class="muted" id="delInfo"></span><button id="delGo" class="hidden" style="border-color:var(--red);color:var(--red);font-weight:700">Yes, delete this day</button></div></div>
     <h2>System</h2>
     <div class="panel" style="margin-top:0" id="system"></div>
-    <h2>Delete one day's data <span class="muted">(for a day that was recorded wrongly — finished orders, alerts, GPS points and the frozen report of that day; live orders are kept; cannot be undone)</span></h2>
-    <div class="panel" style="margin-top:0"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input type="date" id="delDay"><button id="delCheck">Check what would be deleted</button><span class="muted" id="delInfo"></span><button id="delGo" class="hidden" style="border-color:var(--red);color:var(--red);font-weight:700">Yes, delete this day</button></div></div>
   </section>
 </main>
 
@@ -198,22 +206,49 @@ function orderCard(o){ const sev=o.severity||""; const stage=o.in_stage!=null?`$
   const st=o.stack; o.stack_text=st?(st.queued?`⏸ double with ${st.with.join(", ")} — rider is doing ${st.behind} first`:`▶ double with ${st.with.join(", ")} — this one now`):"";
   return `<div class="oc ${sev}" data-order="${o.id}"><div class="r1"><b>${esc(o.ref)}</b>${o.stackedN>1?`<span class="badge">${o.stackedN} orders</span>`:""}${o.rider_online===false?`<span class="badge" style="background:var(--red-bg);color:var(--red)">offline</span>`:""}${ptodChip(o)}</div>
     <div class="r2">${o.phase==="on_hold"?`🕒 created ${o.created||"–"}${o.release?` · <b>to riders ${o.release}</b>`:""}`:`👤 <b>${esc(o.rider||"no rider yet")}</b>${o.phone?` <a href="${tel(o.phone)}" onclick="event.stopPropagation()" style="color:var(--accent);text-decoration:none">📞</a>`:""}${o.timeline.dispatched?` · dispatched ${o.timeline.dispatched}`:""}`}</div>
-    <div class="r3">🏪 ${esc(o.restaurant)}${o.customer_addr?` → ${esc(o.customer_addr)}`:""}</div>
+    <div class="r3">🏪 ${esc(o.restaurant)}${o.customer_zip?` → ${esc(o.customer_zip)}`:""}</div>
     <div class="r4">${stage?`<span>⏱ ${stage}</span>`:""}${o.eta_customer?`<span>· ETA ${o.eta_customer}</span>`:""}${o.plan&&o.phase!=="on_hold"?`<span>· plan ${o.plan}</span>`:""}${alerts}</div>${o.stack_text?`<div class="r5" style="color:var(--blue)">${esc(o.stack_text)}</div>`:""}${o.reassigned?`<div class="r5" style="color:var(--amber)">↩ redispatched ${o.reassigned}× — see story</div>`:""}${o.alert_text?`<div class="r5" style="color:var(--${sev==="red"?"red":"amber"})">→ ${esc(o.alert_text)}</div>`:""}</div>`; }
 function renderPtodWatch(orders){ const hot=orders.filter(o=>o.phase!=="on_hold"&&o.elapsed!=null&&o.elapsed>=(o.warn||TARGET-5)).sort((a,b)=>b.elapsed-a.elapsed);
   document.getElementById("ptodWatchBox").classList.toggle("hidden",!hot.length); document.getElementById("ptodWatchCount").textContent=hot.length;
-  document.getElementById("ptodWatch").innerHTML=hot.map(o=>`<div class="oc ${o.elapsed>=o.target?"red":"amber"}" data-order="${o.id}"><div class="r1"><b>${esc(o.ref)}</b><span class="chip ${o.elapsed>=o.target?"bad":"warn"}">${o.elapsed}′ / ${o.target}</span></div><div class="r2">👤 <b>${esc(o.rider||"no rider yet")}</b>${o.phone?` <a href="${tel(o.phone)}" onclick="event.stopPropagation()" style="color:var(--accent);text-decoration:none">📞</a>`:""} · ${esc(o.phase_label)}${o.in_stage!=null?` ${o.in_stage}′`:""}</div><div class="r3">🏪 ${esc(o.restaurant)}${o.eta_customer?` · ETA ${o.eta_customer}`:""}</div>${o.reason?`<div class="r5" style="color:var(--muted)">📝 ${esc(o.reason)}${o.note?" — "+esc(o.note):""}</div>`:""}</div>`).join(""); }
-let LAST_ORDERS=[];
+  document.getElementById("ptodWatch").innerHTML=hot.slice(0,14).map(o=>`<button data-order="${o.id}" style="border-color:var(--${o.elapsed>=o.target?"red":"amber"});color:var(--${o.elapsed>=o.target?"red":"amber"})" title="${esc(o.phase_label)} · ${esc(o.restaurant)}"><b>${o.elapsed}′</b> ${esc(o.ref)} <span class="muted" style="color:inherit;opacity:.8">${esc((o.rider||"no rider").split(" ")[0])}</span></button>`).join("")+(hot.length>14?`<span class="muted" style="align-self:center">+${hot.length-14} more — all in the list below</span>`:""); }
+let LAST_ORDERS=[], LIVE_VIEW="action", STAGE_FILTER="", SHOW_ONTRACK=false;
+try{ LIVE_VIEW=localStorage.getItem("liveView")||"action"; }catch(e){}
+const SEVN={red:0,amber:1,"":2};
+function liveRow(o){ const sev=o.severity||""; const st=o.stack; const stackTxt=st?(st.queued?`⏸ double, doing ${st.behind} first`:`▶ double with ${st.with.join(", ")}`):"";
+  const what=o.alerts.length?`${o.alerts.map(k=>`<span class="tag ${sev||"grey"}">${KIND[k]||k}</span>`).join("")}${esc((o.alert_heads||[])[0]||"")}${o.alert_heads&&o.alert_heads.length>1?` <span class="muted">+${o.alert_heads.length-1}</span>`:""}`:(o.phase==="on_hold"?`🕒 created ${o.created||"–"}${o.release?` · to riders ${o.release}`:""}`:`${stackTxt||"on track"}${o.reassigned?` · ↩ redispatched ${o.reassigned}×`:""}`);
+  return `<div class="lr ${sev}" data-order="${o.id}" title="tap for the story">${ptodChip(o)}<div class="who"><b>${esc(o.ref)}</b><span class="pill ${o.phase}">${esc(o.phase_label.replace(" — not dispatched yet",""))}</span>${o.in_stage!=null?`<span class="muted">${o.in_stage}′</span>`:""}<span>👤 ${esc(o.rider||"no rider")}${o.phone?` <a href="${tel(o.phone)}" onclick="event.stopPropagation()" style="color:var(--accent);text-decoration:none">📞</a>`:""}${o.rider_online===false?` <span class="badge" style="background:var(--red-bg);color:var(--red)">offline</span>`:""}${o.stackedN>1?` <span class="badge">${o.stackedN}</span>`:""}</span><span class="muted">🏪 ${esc(o.restaurant)}</span>${o.eta_customer?`<span class="muted">ETA ${o.eta_customer}</span>`:""}${o.plan&&o.phase!=="on_hold"&&o.plan!==o.eta_customer?`<span class="muted">plan ${o.plan}</span>`:""}</div><div class="what ${o.alerts.length?sev:""}">${what}</div></div>`; }
 function renderLiveOrders(orders){ LAST_ORDERS=orders; renderPtodWatch(orders); const per={}; orders.forEach(o=>{if(o.rider_id) per[o.rider_id]=(per[o.rider_id]||0)+1;}); orders.forEach(o=>o.stackedN=per[o.rider_id]||0);
   const live=orders.filter(o=>o.phase!=="on_hold"); document.getElementById("orderCount").textContent=live.length;
   const q=(document.getElementById("liveQ").value||"").trim().toLowerCase(); const hit=o=>!q||[o.ref,o.rider,o.restaurant,o.customer_addr,o.customer_zip].some(v=>String(v||"").toLowerCase().includes(q));
-  const idleHint=IDLE.length?`<span class="idle">· ${IDLE.length} idle now: ${IDLE.slice(0,4).map(r=>esc(r.name.split(" ")[0])+(r.phone?`<a href="${tel(r.phone)}" onclick="event.stopPropagation()">📞</a>`:"")).join(", ")}${IDLE.length>4?` +${IDLE.length-4}`:""}</span>`:`<span class="idle" style="color:var(--red)">· no idle rider</span>`;
-  document.getElementById("board").innerHTML=STAGES.map(([k,icon,label,hint])=>{ const all=orders.filter(o=>o.phase===k), rows=all.filter(hit).sort((a,b)=>(b.in_stage??0)-(a.in_stage??0));
-    const avg=all.length&&k!=="on_hold"?Math.round(all.reduce((t,o)=>t+(o.in_stage||0),0)/all.length):null;
-    return `<div class="stage ${k} ${rows.length?"":"empty"}"><div class="sh"><span>${icon}</span><span>${label}</span><span class="count ${k==="unassigned"&&all.length?"red":""}">${all.length}</span>${k==="unassigned"&&all.length?idleHint:""}<span class="muted">${all.length?[avg!=null?`avg ${avg}′ in stage`:"",hint,q&&rows.length!==all.length?`${rows.length} of ${all.length} match`:""].filter(Boolean).join(" · "):"none"}</span></div><div class="sb">${rows.map(orderCard).join("")}</div></div>`; }).join(""); }
+  document.querySelectorAll("#liveView button").forEach(b=>b.classList.toggle("active",b.dataset.v===LIVE_VIEW));
+  const idleHint=IDLE.length?`<span class="idle">${IDLE.length} idle now: ${IDLE.slice(0,4).map(r=>esc(r.name.split(" ")[0])+(r.phone?`<a href="${tel(r.phone)}" onclick="event.stopPropagation()">📞</a>`:"")).join(", ")}${IDLE.length>4?` +${IDLE.length-4}`:""}</span>`:`<span class="idle" style="color:var(--red)">no idle rider</span>`;
+  // stage chips = the summary; tap one to drill into that stage (any view)
+  const act=orders.filter(o=>o.alerts.length&&o.phase!=="on_hold");
+  const chips=[["", "All", live.length, act.length], ...STAGES.map(([k,icon,label])=>{const rs=orders.filter(o=>o.phase===k); return [k, icon+" "+label.replace(" — not dispatched yet",""), rs.length, rs.filter(o=>o.alerts.length).length];})];
+  document.getElementById("stageChips").innerHTML=chips.map(([k,l,n,a])=>`<button data-stage="${k}" class="${STAGE_FILTER===k?"on":""}" ${!n&&k?'style="opacity:.45"':""}>${l} <span class="count ${a?(k==="unassigned"?"red":"amber"):""}">${n}${a?` · ${a}⚠`:""}</span></button>`).join("")+(orders.some(o=>o.phase==="unassigned")?`<span style="align-self:center;margin-left:4px">${idleHint}</span>`:"");
+  const inStage=o=>!STAGE_FILTER||o.phase===STAGE_FILTER;
+  const list=document.getElementById("liveList"), board=document.getElementById("board");
+  list.classList.toggle("hidden",LIVE_VIEW==="board"); board.classList.toggle("hidden",LIVE_VIEW!=="board");
+  if(LIVE_VIEW==="board"){
+    board.innerHTML=STAGES.filter(([k])=>!STAGE_FILTER||k===STAGE_FILTER).map(([k,icon,label,hint])=>{ const all=orders.filter(o=>o.phase===k), rows=all.filter(hit).sort((a,b)=>SEVN[a.severity||""]-SEVN[b.severity||""]||(b.in_stage??0)-(a.in_stage??0));
+      const avg=all.length&&k!=="on_hold"?Math.round(all.reduce((t,o)=>t+(o.in_stage||0),0)/all.length):null;
+      return `<div class="stage ${k} ${rows.length?"":"empty"}"><div class="sh"><span>${icon}</span><span>${label}</span><span class="count ${k==="unassigned"&&all.length?"red":""}">${all.length}</span><span class="muted">${all.length?[avg!=null?`avg ${avg}′ in stage`:"",hint,q&&rows.length!==all.length?`${rows.length} of ${all.length} match`:""].filter(Boolean).join(" · "):"none"}</span></div><div class="sb">${rows.map(orderCard).join("")}</div></div>`; }).join("");
+    return; }
+  let rows=orders.filter(inStage).filter(hit);
+  const onTrack=rows.filter(o=>!o.alerts.length&&o.phase!=="on_hold"), hold=rows.filter(o=>o.phase==="on_hold");
+  if(LIVE_VIEW==="action"&&!SHOW_ONTRACK) rows=rows.filter(o=>o.alerts.length);
+  rows.sort((a,b)=>SEVN[a.severity||""]-SEVN[b.severity||""]||(a.phase==="on_hold")-(b.phase==="on_hold")||(b.elapsed??-1)-(a.elapsed??-1));
+  const foot=LIVE_VIEW==="action"&&!SHOW_ONTRACK&&(onTrack.length||hold.length)?`<div class="ontrack"><span>✅ <b>${onTrack.length}</b> orders are on track (no alert)${hold.length?` · 🕒 <b>${hold.length}</b> on hold`:""} — hidden here</span><button id="showOnTrack">Show them</button></div>`:(LIVE_VIEW==="action"&&SHOW_ONTRACK?`<div class="ontrack"><button id="hideOnTrack">Hide on-track orders</button></div>`:"");
+  list.innerHTML=(rows.length?rows.map(liveRow).join(""):`<div class="empty">${LIVE_VIEW==="action"?"Nothing needs action right now 🎉":"No orders"}${STAGE_FILTER?" in this stage":""}${q?" matching the search":""}.</div>`)+foot;
+  const sb=document.getElementById("showOnTrack"); if(sb) sb.onclick=()=>{SHOW_ONTRACK=true; renderLiveOrders(LAST_ORDERS);};
+  const hb=document.getElementById("hideOnTrack"); if(hb) hb.onclick=()=>{SHOW_ONTRACK=false; renderLiveOrders(LAST_ORDERS);}; }
 function renderRiderChips(riders){ const on=riders.filter(r=>r.online), off=riders.filter(r=>!r.online); document.getElementById("riderNote").textContent=`${on.length} online · ${off.length} offline`;
   const chip=r=>`<div class="rider ${r.status}" data-rider="${r.id}"><span class="st"></span><div><b>${esc(r.name)}</b> <span class="muted">${r.status==="busy"?`${r.orders} order${r.orders>1?"s":""}`:r.status==="idle"?"idle · can take an order":"offline"}</span>${r.status==="busy"&&r.still_min>=4?`<div class="warn">⚠ not moving ${Math.round(r.still_min)} min</div>`:""}</div>${r.phone?`<a class="btn" style="padding:3px 7px" href="${tel(r.phone)}" onclick="event.stopPropagation()">📞</a>`:""}${r.map_url&&r.online?`<a class="btn" style="padding:3px 7px" href="${esc(r.map_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">🗺</a>`:""}</div>`;
-  document.getElementById("riderChips").innerHTML=riders.length?[...on,...off.slice(0,12)].map(chip).join("")+(off.length>12?`<div class="rider offline"><span class="muted">+${off.length-12} more offline</span></div>`:""):`<div class="empty">No riders found yet.</div>`; }
+  const busy=on.filter(r=>r.status==="busy"), idle=on.filter(r=>r.status!=="busy"); const capI=RIDERS_ALL?idle.length:10, capO=RIDERS_ALL?off.length:6;
+  document.getElementById("riderNote").textContent=`${on.length} online · ${busy.length} busy · ${idle.length} idle · ${off.length} offline`;
+  document.getElementById("riderChips").innerHTML=riders.length?[...busy,...idle.slice(0,capI),...off.slice(0,capO)].map(chip).join("")+((idle.length>capI||off.length>capO)?`<div class="rider" id="ridersMore"><span class="muted">+${Math.max(0,idle.length-capI)} idle · +${Math.max(0,off.length-capO)} offline — show all</span></div>`:(RIDERS_ALL&&riders.length>16?`<div class="rider" id="ridersLess"><span class="muted">show fewer</span></div>`:"")):`<div class="empty">No riders found yet.</div>`;
+  const m=document.getElementById("ridersMore"); if(m) m.onclick=()=>{RIDERS_ALL=true; renderRiderChips(riders);}; const l=document.getElementById("ridersLess"); if(l) l.onclick=()=>{RIDERS_ALL=false; renderRiderChips(riders);}; }
+let RIDERS_ALL=false;
 async function refreshState(){ try{ const s=await api("/api/state"); document.getElementById("title").textContent=`Quickzi · ${s.city} ops`; IDLE=s.riders.filter(r=>r.status==="idle"); REASONS=s.reasons||REASONS;
     renderPulse(s.pulse); renderAlerts(s.alerts); renderLiveOrders(s.orders); renderRiderChips(s.riders);
     const sy=s.sync; document.getElementById("dot").className="dot"+(sy.stale||sy.last_error||sy.webhook_silent?" bad":""); document.getElementById("updated").textContent=sy.last_ok?`synced ${hm(sy.last_ok)}`:"waiting for first sync…";
@@ -338,6 +373,8 @@ document.addEventListener("click",async e=>{ const d=e.target.closest("[data-dis
   if(r && !e.target.closest("a")){ showRider(r.dataset.rider, r.dataset.period||"today"); return; } });
 document.getElementById("q").addEventListener("input",()=>{clearTimeout(window._qt); window._qt=setTimeout(loadOrders,300);});
 document.getElementById("liveQ").addEventListener("input",()=>renderLiveOrders(LAST_ORDERS));
+document.querySelectorAll("#liveView button").forEach(b=>b.onclick=()=>{ LIVE_VIEW=b.dataset.v; try{localStorage.setItem("liveView",LIVE_VIEW);}catch(e){} renderLiveOrders(LAST_ORDERS); });
+document.getElementById("stageChips").addEventListener("click",e=>{ const b=e.target.closest("button[data-stage]"); if(!b) return; STAGE_FILTER=STAGE_FILTER===b.dataset.stage?"":b.dataset.stage; renderLiveOrders(LAST_ORDERS); });
 document.getElementById("sound").onclick=e=>{ soundOn=!soundOn; e.target.textContent=soundOn?"🔔":"🔇"; e.target.classList.toggle("on",soundOn); if(soundOn) beep(); };
 refreshState(); route(); setInterval(refreshState,15000); setInterval(()=>{ if((location.hash||"#live")==="#live") return; route(); },60000);
 </script>
