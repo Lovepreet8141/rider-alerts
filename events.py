@@ -100,11 +100,16 @@ class Projector:
 
     def rider(self, rid: str, name: str = "", now: datetime = None):
         r = self.state["riders"].get(rid)
-        if r is None:
+        created = r is None
+        if created:
             r = self.state["riders"][rid] = {"id": rid, "name": "", "phone": self.phones.get(rid, ""), "mt_phone": "",
                                              "online": True, "lat": None, "lng": None, "active_ids": []}
         if name and not r["name"]:
             r["name"] = name
+        if created or (name and not r.get("persisted")):
+            # every rider we hear about is stored at once, so a restart never forgets who is on the road
+            self.store.upsert_rider(rid, r["name"] or "Rider", r.get("phone", ""), True, None, None, [], now or datetime.now(UTC))
+            r["persisted"] = bool(r["name"])
         return r
 
     @staticmethod

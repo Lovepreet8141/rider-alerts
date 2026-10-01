@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.3"
+VERSION = "4.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -616,7 +616,13 @@ async def startup():
     for r in store.riders():
         STATE["riders"][r["id"]] = {"id": r["id"], "name": r["name"], "phone": projector.phone_for(r["id"], r["phone"]),
                                     "mt_phone": r["phone"] if r["phone"] != projector.phones.get(r["id"]) else "",
-                                    "online": bool(r["online"]), "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"]}
+                                    "online": bool(r["online"]), "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"],
+                                    "persisted": True}
+    for o in STATE["orders"].values():                 # a rider holding a live order is on the road, whatever the DB says
+        if o.get("rider_id"):
+            r = projector.rider(o["rider_id"], o.get("rider") or "", now)
+            if not r.get("online") and o["phase"] not in ("on_hold",):
+                r["online"] = True
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
     try:
         n = repair_from_events(now)

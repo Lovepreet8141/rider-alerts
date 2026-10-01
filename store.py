@@ -323,8 +323,10 @@ class Store:
         elif online and not self._rows("SELECT 1 FROM rider_sessions WHERE rider_id=? AND offline_at IS NULL", (rid,)):
             self._exec("INSERT INTO rider_sessions (rider_id, online_at) VALUES (?,?)", (rid, iso(now)))
 
-    def close_stale_sessions(self, now: datetime, max_gap_min=10):
-        """After a restart: sessions left open by a rider whose last update is old are closed at that update."""
+    def close_stale_sessions(self, now: datetime, max_gap_min=180):
+        """After a restart: sessions left open by a rider whose last update is hours old are closed at that update.
+        (In webhook mode a rider only 'updates' on events, so a short gap would log everyone off at every restart;
+        in API mode the next poll corrects the flag within 30 s anyway.)"""
         for r in self._rows("SELECT id, name, updated_at FROM riders"):
             if r["updated_at"] and (now - ts(r["updated_at"])).total_seconds() > max_gap_min * 60:
                 self._exec("UPDATE rider_sessions SET offline_at=? WHERE rider_id=? AND offline_at IS NULL",
