@@ -24,7 +24,12 @@ from datetime import datetime, timedelta
 
 from orders import UTC, new_order, phase_from, ts
 
-DISPATCHED = {"dispatched", "partially_dispatched", "pickable", "claimed", "en_route"}
+# PTOD starts when riders can see / have the order. Real MotionTools tour timeline (1 Oct, order WPC4W7):
+#   On hold (create) 08:37 -> Scheduled 11:00 -> Pickable (ready_to_pick) 11:00 -> En route (pick) 11:00 -> Done 11:34
+# "dispatched"/"partially_dispatched" only means "put into a tour" — that already happens at creation for pre-orders,
+# so it must NOT start the clock.  pickable = offered to riders, claimed/en_route = a rider has it.
+DISPATCHED = {"pickable", "claimed", "en_route"}
+ASSIGNED = {"dispatched", "partially_dispatched", "scheduled"}
 DONE = {"done", "completed", "finished", "paid", "processing_payment"}
 STALE_HOURS = 3           # a live order without any MotionTools event for this long is closed automatically
 
@@ -176,6 +181,7 @@ class Projector:
             for key in [k for k in self.state["open_alerts"] if k[0] == o["id"]]:
                 self.store.resolve_alert(self.state["open_alerts"].pop(key), why, now)
                 self.state["sev"].pop(key, None)
+                self.state.get("heads", {}).pop(key, None)
             self.state["orders"].pop(o["id"], None)
 
     # ---------------- the event switch ----------------
@@ -224,8 +230,8 @@ class Projector:
                     o["cancel_reason"] = o.get("cancel_reason") or "cancelled in MotionTools"
                 elif to in DISPATCHED:
                     self.dispatched(o, now)                                      # PTOD clock starts here
-                    if to in ("dispatched", "partially_dispatched"):
-                        o["assigned_at"] = now
+                elif to in ASSIGNED:
+                    o["assigned_at"] = now                                       # in a tour, still on hold
                 o["status"] = to or o["status"]
             elif ev == "in_progress":
                 self.dispatched(o, now)
@@ -298,11 +304,13 @@ class Projector:
                 ids = d.get("dispatched_booking_ids") or []
                 self.tours[tid] = [ids] if isinstance(ids, str) else list(ids)
                 self.store.set_settings({f"tour:{tid}": ",".join(self.tours[tid])})
+                st = str(d.get("status") or "")
                 for bid in self.tours[tid]:
                     if bid in self.state["orders"]:
                         o = self.state["orders"][bid]
                         o["assigned_at"] = now
-                        self.dispatched(o, now)                                  # a tour exists = offered to riders
+                        if st in DISPATCHED:                                     # tours are usually created on hold
+                            self.dispatched(o, now)
                         self.finish(o, now)
                 return name
             bookings = [self.state["orders"][b] for b in self.tours.get(tid, []) if b in self.state["orders"]]

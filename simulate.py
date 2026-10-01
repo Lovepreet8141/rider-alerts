@@ -47,7 +47,8 @@ def stop(kind, lat, lng, name="", phone="", arrived=None, done=None, eta=None, s
 
 def booking(ref, rider, rest, disp, acc=None, start=None, at_rest=None, picked=None, at_cust=None, delivered=None,
             eta_rest=None, eta_cust=None, loc=None, status=None):
-    events = [{"name": "dispatched", "status": "dispatched", "timestamp": iso(disp)}]
+    events = [{"name": "dispatched", "status": "dispatched", "timestamp": iso(disp - timedelta(minutes=40))},   # put into a tour early (pre-order)
+              {"name": "ready_to_pick", "status": "pickable", "timestamp": iso(disp)}]                        # offered to riders = PTOD start
     if acc:
         events.append({"name": "claimed", "status": "claimed", "timestamp": iso(acc)})
     if start:

@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v3.3)
+# Quickzi — Munich ops platform (v3.5)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -15,12 +15,15 @@ daily report of the evening before.
   - `GET /api/users/{id}` open → rider names + phone numbers.
   - `GET /api/places/{id}` open → restaurant names.
   - nothing open → the dashboard still works on order ids; restaurant names and rider phones can be typed in Settings.
-  The moment a list endpoint opens (`/api/bookings/active`, `/api/bookings` or legacy `/api/hailing/bookings`)
-  the server switches back to API mode on its own — no redeploy.
+  Restricted accounts get a small **hourly quota** per endpoint (429 `restricted_rate_limit`): the client stops
+  calling that endpoint until the next hour and spends the quota on dispatched orders with open alerts first.
+  Paths that answer 404 on this tenant (the documented `/api/bookings…` ones) are never asked again.
+  The moment a list endpoint opens the server switches back to API mode on its own — no redeploy.
+  On startup after an upgrade, dispatch times of open orders are repaired from the stored raw events.
 
 ## Tabs
-- **Live** — city pulse, "needs action now" with Call / WhatsApp / Call restaurant / Map / Story / Snooze / Handled,
-  every live order with its phase timeline and PTOD clock, riders (busy / idle / offline).
+- **Live** — city pulse, the stage board (alerts shown on the order cards; tap a card for the story with
+  Call / Map / Snooze / Handled), riders (busy / idle / offline).
 - **Orders** — every order of the day (live, delivered, cancelled), searchable. Tap → the order's story:
   minutes per phase, alerts raised, GPS route driven.
 - **Riders** — hours online, deliveries, % within target, avg PTOD, delivery minutes per order, busy %,

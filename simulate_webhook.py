@@ -4,6 +4,8 @@
     SIM_OPEN=none  ...   every read endpoint answers 403 restricted_endpoint (worst case)
     SIM_OPEN=detail ...  (default) list endpoints restricted, but /api/bookings/{id}, /api/users/{id}, /api/places/{id} open
     SIM_OPEN=all   ...   nothing restricted -> the server must switch to API mode by itself
+    SIM_OPEN=real  ...   exactly what the real tenant answered on 2026-10-01: documented paths 404, lists restricted,
+                         detail endpoints with a tiny hourly quota (429 restricted_rate_limit), rider detail open
 
 The real mt.py client talks to the fake server, so probing, blocking and enrichment are exercised end to end.
 """
@@ -56,7 +58,7 @@ def order_events(ref, bid, place, rider_id, rider, t0, wait_min=4, deliver=True,
     p1, d1 = f"{bid}-p", f"{bid}-d"
     BOOK[bid] = {"ref": ref, "place": place, "rider_id": rider_id, "rider": rider, "delivered": bool(rider_id and wait_min is not None and deliver)}
     out = [ev("booking", "created", m(t0), booking_id=bid, external_id=ref, customer_id=CUST, place_ids=[place], status="to_be_dispatched"),
-           ev("booking", "transition", m(t0 + 0.5), booking_id=bid, external_id=ref, **{"from": "to_be_dispatched", "to": "dispatched", "event": "dispatch"}),
+           ev("booking", "transition", m(t0 + 0.5), booking_id=bid, external_id=ref, **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"}),
            ev("booking", "etas_recalculated", m(t0 + 1), booking_id=bid, external_id=ref, customer_id=CUST,
               unfinished_stops_info=[{"id": p1, "position": 1, "type": "pickup", "eta": m(t0 + 8)}, {"id": d1, "position": 2, "type": "dropoff", "eta": m(t0 + 22)}])]
     if rider_id:
@@ -89,14 +91,15 @@ EVENTS += order_events("PMCHP6", "b-live1", PLACE_CHO, "r-murat", "Murat K.", -2
 EVENTS += order_events("C3GKJH", "b-live2", PLACE_BK, "r-obaida", "Obaida H.", -26, wait_min=5, deliver=False)
 EVENTS += order_events("Q4VJ9M", "b-live3", PLACE_BK, None, "", -7)
 EVENTS += [ev("booking", "created", m(-6), booking_id="b-live4", external_id="KMW86T", customer_id=CUST, place_ids=[PLACE_CHO], status="to_be_dispatched"),
-           ev("tour", "created", m(-5.5), tour_id="t-9", dispatched_booking_ids=["b-live4"], status="pickable"),
+           ev("tour", "created", m(-5.5), tour_id="t-9", dispatched_booking_ids=["b-live4"], status="on_hold"),
+           ev("tour", "transition", m(-5), tour_id="t-9", **{"from": "on_hold", "to": "pickable", "event": "ready_to_pick"}),
            ev("tour", "transition", m(-4), tour_id="t-9", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-sven"])]
 # pre-orders (Lieferando customers ordering hours ahead): created long ago, still ON HOLD -> no PTOD, no alerts
 EVENTS += [ev("booking", "created", m(-120), booking_id="b-pre1", external_id="PRE001", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched", scheduled_at=m(60)),
            ev("booking", "created", m(-95), booking_id="b-pre2", external_id="PRE002", customer_id=CUST, place_ids=[PLACE_CHO], status="to_be_dispatched", scheduled_at=m(45)),
            # created 130 min ago, dispatched 6 min ago, nobody accepted yet -> PTOD 6, "no rider" alert
            ev("booking", "created", m(-130), booking_id="b-pre3", external_id="PRE003", customer_id=CUST, place_ids=[PLACE_BK], status="to_be_dispatched", scheduled_at=m(10)),
-           ev("booking", "transition", m(-6), booking_id="b-pre3", external_id="PRE003", **{"from": "to_be_dispatched", "to": "dispatched", "event": "dispatch"})]
+           ev("booking", "transition", m(-6), booking_id="b-pre3", external_id="PRE003", **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"})]
 # an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
 EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])
@@ -120,7 +123,7 @@ def booking_json(bid: str) -> dict:
     prof = RIDERS.get(rid)
     done = "done" in seen
     disp = seen.get("transition")                    # the fake only "dispatches" once that transition was delivered
-    events = [{"name": "dispatched", "status": "dispatched", "timestamp": disp}] if disp else []
+    events = [{"name": "ready_to_pick", "status": "pickable", "timestamp": disp}] if disp else []
     if "claimed" in seen:
         events.append({"name": "claimed", "status": "claimed", "timestamp": seen["claimed"]})
     if "in_progress" in seen:
@@ -137,17 +140,37 @@ def booking_json(bid: str) -> dict:
             "events": [e for e in events if e["timestamp"]], "total_estimated_distance_meters": 3400}
 
 
+QUOTA = {"detail": 3, "place": 2}        # SIM_OPEN=real: what the real tenant did on 2026-10-01 — tiny hourly quotas
+LIMITED = Response(content='{"error_code":"restricted_rate_limit","description":"Your account is in restricted API access mode and has reached the hourly limit for this endpoint."}',
+                   status_code=429, media_type="application/json")
+NOT_FOUND = Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
+
+
 def open_(kind: str) -> bool:
     return SIM_OPEN == "all" or (SIM_OPEN == "detail" and kind == "detail")
 
 
+def quota(kind: str):
+    """SIM_OPEN=real: answer 429 once the tiny hourly quota is used up."""
+    QUOTA[kind] -= 1
+    return None if QUOTA[kind] >= 0 else LIMITED
+
+
 @fake.get("/api/user")
 def f_me():
+    if SIM_OPEN == "real":
+        return RESTRICTED
     return {"user": {"id": "admin-1", "role": "admin", "email": "ops@quickzi.de"}}
 
 
 @fake.get("/api/bookings/active")
 @fake.get("/api/bookings")
+def f_list_404():
+    if SIM_OPEN == "real":
+        return NOT_FOUND
+    return f_list()
+
+
 @fake.get("/api/hailing/bookings")
 def f_list():
     if not open_("list"):
@@ -156,9 +179,19 @@ def f_list():
 
 
 @fake.get("/api/bookings/{bid}")
+def f_detail_404(bid: str):
+    if SIM_OPEN == "real":
+        return NOT_FOUND
+    return f_detail(bid)
+
+
 @fake.get("/api/hailing/bookings/{bid}")
 def f_detail(bid: str):
-    if not open_("detail"):
+    if SIM_OPEN == "real":
+        lim = quota("detail")
+        if lim is not None:
+            return lim
+    elif not open_("detail"):
         return RESTRICTED
     if bid not in BOOK:
         return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
@@ -176,7 +209,7 @@ def f_users():
 
 @fake.get("/api/users/{rid}")
 def f_user(rid: str):
-    if not open_("detail"):
+    if not open_("detail") and SIM_OPEN != "real":
         return RESTRICTED
     p = RIDERS.get(rid)
     if not p:
@@ -186,7 +219,11 @@ def f_user(rid: str):
 
 @fake.get("/api/places/{pid}")
 def f_place(pid: str):
-    if not open_("detail"):
+    if SIM_OPEN == "real":
+        lim = quota("place")
+        if lim is not None:
+            return lim
+    elif not open_("detail"):
         return RESTRICTED
     if pid not in PLACES:
         return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
@@ -216,6 +253,7 @@ if __name__ == "__main__":
     # point the real client at the fake server
     appmod.mt._client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{FAKE_PORT}", timeout=20)
     threading.Thread(target=lambda: uvicorn.run(fake, host="127.0.0.1", port=FAKE_PORT, log_level="warning"), daemon=True).start()
-    threading.Thread(target=post_all, daemon=True).start()
+    if os.environ.get("SIM_POST", "1") != "0":
+        threading.Thread(target=post_all, daemon=True).start()
     print(f"Dashboard: http://127.0.0.1:8021/dashboard  (password: test)   fake MotionTools: SIM_OPEN={SIM_OPEN}")
     uvicorn.run(appmod.app, host="127.0.0.1", port=8021, log_level="warning")

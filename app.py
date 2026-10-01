@@ -26,9 +26,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from events import Projector
+from events import DISPATCHED, Projector
 from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
-from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_minutes
+from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, iso, mins, parse_booking, phase_from, phase_minutes, ts
 from store import Store, day_key, day_start
 
 log = logging.getLogger("quickzi")
@@ -53,6 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
+VERSION = "3.5"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -63,7 +64,7 @@ tracker = RiderTracker()
 app = FastAPI()
 basic = HTTPBasic()
 
-STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "raw_samples": {},
+STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, "hidden": {}, "raw_samples": {},
          "sync": {"mode": "api", "last_ok": None, "last_error": None, "orders_seen": 0, "riders_seen": 0, "runs": 0,
                   "webhook_events": 0, "last_webhook": None, "backfilled": 0, "last_snapshot": None,
                   "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None}}
@@ -154,6 +155,7 @@ async def sync_orders(now: datetime):
         for key in [k for k in STATE["open_alerts"] if k[0] == oid]:
             store.resolve_alert(STATE["open_alerts"].pop(key), why, now)
             STATE["sev"].pop(key, None)
+            STATE["heads"].pop(key, None)
         STATE["orders"].pop(oid, None)
     store.close_missing(seen, now)
     STATE["sync"]["orders_seen"] = len(seen)
@@ -277,6 +279,10 @@ async def enrich_after_event(p: dict):
         if rtype == "booking" and ev == "created":
             pids = d.get("place_ids") or []
             await enrich_place(pids[0] if isinstance(pids, list) and pids else (pids if isinstance(pids, str) else ""))
+            # the hourly quota goes to dispatched orders only — a pre-order on hold for 3 hours can wait
+            if (d.get("status") or "") in DISPATCHED and await enrich_order(d.get("booking_id")):
+                evaluate_all(datetime.now(UTC))
+        elif rtype == "booking" and ev == "transition" and str(d.get("to") or "") in DISPATCHED:
             if await enrich_order(d.get("booking_id")):
                 evaluate_all(datetime.now(UTC))
         elif rtype == "booking" and d.get("driver_id"):
@@ -291,16 +297,86 @@ async def enrich_after_event(p: dict):
 
 
 async def refresh_live_orders(now: datetime):
-    """Webhook mode, once a minute: re-read every live order through the open detail endpoint —
-    gives rider GPS, ETAs and status even without the GPS webhook."""
-    if not mt.stats.get("detail_path"):
+    """Webhook mode, every 5 min: re-read a few live orders through the detail endpoint if it is open.
+    MotionTools gives restricted accounts a small HOURLY quota per endpoint, so the budget goes to the
+    orders that matter: those with open alerts, oldest first, at most 5 per run."""
+    tpl = mt.stats.get("detail_path")
+    if not tpl or mt.blocked(tpl):
         return
+    with_alerts = {k[0] for k in STATE["open_alerts"]}
+    todo = sorted((o for o in STATE["orders"].values() if o["id"] in with_alerts and o["phase"] != "on_hold"),
+                  key=lambda o: o.get("dispatched_at") or now)[:5]
     changed = False
-    for bid in list(STATE["orders"])[:40]:
-        if await enrich_order(bid, now):
+    for o in todo:
+        if mt.blocked(tpl):
+            break
+        if await enrich_order(o["id"], now):
             changed = True
     if changed:
         evaluate_all(datetime.now(UTC))
+
+
+def repair_from_events(now: datetime) -> int:
+    """One-time repair after upgrading: earlier versions started the PTOD clock at booking.created.
+    Re-read the stored raw events and set dispatched_at to the real dispatch moment (or none = on hold)."""
+    path = DATA_DIR / "events.jsonl"
+    if not path.exists():
+        return 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-60000:]
+    except Exception:
+        return 0
+    disp, created, tours = {}, {}, {}
+    for line in lines:
+        try:
+            p = json.loads(line)
+        except Exception:
+            continue
+        d = p.get("data") or {}
+        rtype, ev, t = p.get("resource_type"), p.get("event"), ts(p.get("timestamp"))
+        if not t:
+            continue
+        if rtype == "booking":
+            bid = d.get("booking_id")
+            if not bid:
+                continue
+            if ev == "created":
+                created[bid] = (t, d.get("status") or "")
+                if created[bid][1] in DISPATCHED:
+                    disp.setdefault(bid, t)
+            elif ev == "transition" and str(d.get("to")) in DISPATCHED:
+                disp.setdefault(bid, t)
+            elif ev in ("in_progress", "stop_arrived", "stop_completed", "stop_failed"):
+                disp.setdefault(bid, t)
+        elif rtype == "tour":
+            tid = d.get("tour_id")
+            if ev == "created":
+                ids = d.get("dispatched_booking_ids") or []
+                tours[tid] = [ids] if isinstance(ids, str) else list(ids)
+                if str(d.get("status") or "") in DISPATCHED:
+                    for b in tours[tid]:
+                        disp.setdefault(b, t)
+            elif (ev == "transition" and str(d.get("to") or "") in DISPATCHED) or ev == "force_assigned":
+                for b in tours.get(tid, []):
+                    disp.setdefault(b, t)
+    n = 0
+    for o in STATE["orders"].values():
+        if o.get("repaired"):
+            continue
+        bid = o["id"]
+        if bid in disp:
+            o["dispatched_at"] = disp[bid]
+        elif bid in created and not o.get("rider_id") and not o.get("accepted_at"):
+            o["dispatched_at"] = None                       # created, never offered to riders -> on hold
+        else:
+            continue
+        if bid in created:
+            o["created_at"] = created[bid][0]
+        o["repaired"] = True
+        o["phase"] = phase_from(o)
+        store.upsert_order(o, now, stacked=bool(o.get("stacked")))
+        n += 1
+    return n
 
 
 def alert_payload(o: dict, c: dict) -> dict:
@@ -313,6 +389,10 @@ def alert_payload(o: dict, c: dict) -> dict:
 
 
 def evaluate_all(now: datetime):
+    for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:
+        store.resolve_alert(STATE["open_alerts"].pop(key), "order completed", now)
+        STATE["sev"].pop(key, None)
+        STATE["heads"].pop(key, None)
     for o in STATE["orders"].values():
         r = STATE["riders"].get(o["rider_id"] or "")
         conds = {c["kind"]: c for c in evaluate(o, now, rules, tracker, r["online"] if r else None)}
@@ -320,6 +400,7 @@ def evaluate_all(now: datetime):
             key = (o["id"], kind)
             payload = alert_payload(o, c)
             STATE["sev"][key] = c["severity"]
+            STATE["heads"][key] = c["headline"]
             if key in STATE["open_alerts"]:
                 store.update_alert(STATE["open_alerts"][key], payload, now)
             else:
@@ -327,6 +408,7 @@ def evaluate_all(now: datetime):
         for key in [k for k in STATE["open_alerts"] if k[0] == o["id"] and k[1] not in conds]:
             store.resolve_alert(STATE["open_alerts"].pop(key), PHASE_LABEL.get(o["phase"], o["phase"]).lower(), now)
             STATE["sev"].pop(key, None)
+            STATE["heads"].pop(key, None)
 
 
 def snapshot_yesterday(now: datetime):
@@ -368,7 +450,7 @@ async def sync_loop():
                     elif mt.stats.get("detail_path"):
                         for o in list(STATE["orders"].values()):        # finished while we were down? close them now
                             await enrich_order(o["id"], now)
-                if last_refresh is None or (now - last_refresh) >= timedelta(seconds=60):
+                if last_refresh is None or (now - last_refresh) >= timedelta(minutes=5):
                     await refresh_live_orders(now)
                     last_refresh = now
                     n = projector.expire(now)
@@ -427,11 +509,23 @@ async def startup():
     for a in store.open_alerts():
         STATE["open_alerts"][(a["order_id"], a["kind"])] = a["id"]
         STATE["sev"][(a["order_id"], a["kind"])] = a["severity"]
+        STATE["heads"][(a["order_id"], a["kind"])] = a["headline"]
+        if a.get("dismissed_at"):
+            STATE["hidden"][a["id"]] = True
+        elif a.get("snoozed_until") and ts(a["snoozed_until"]) and ts(a["snoozed_until"]) > now:
+            STATE["hidden"][a["id"]] = ts(a["snoozed_until"])
     for r in store.riders():
         STATE["riders"][r["id"]] = {"id": r["id"], "name": r["name"], "phone": projector.phone_for(r["id"], r["phone"]),
                                     "mt_phone": r["phone"] if r["phone"] != projector.phones.get(r["id"]) else "",
                                     "online": bool(r["online"]), "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"]}
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
+    try:
+        n = repair_from_events(now)
+        if n:
+            on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
+            store.log("info", f"repaired dispatch times of {n} open orders from the stored events ({on_hold} now on hold)")
+    except Exception as e:
+        log.exception("repair failed: %s", e)
     if not DASH_PASSWORD:
         store.log("error", "DASHBOARD_PASSWORD not set — dashboard refuses all logins")
     if not mt.enabled:
@@ -485,8 +579,12 @@ def order_view(o: dict, now: datetime) -> dict:
     elapsed = mins(o["dispatched_at"], end if not live else now) if o.get("dispatched_at") and o["phase"] != "closed" else None
     stage_since = o.get(PHASE_START.get(o["phase"], "")) or (o.get("accepted_at") if o["phase"] == "to_restaurant" else None) or o.get("dispatched_at")
     in_stage = mins(stage_since, now) if (live and stage_since) else None
-    kinds = [k[1] for k in STATE["open_alerts"] if k[0] == o["id"]] if live else []
+    def shown(key):                      # "Handled" / snoozed alerts disappear from the card
+        until = STATE["hidden"].get(STATE["open_alerts"][key])
+        return until is None or (until is not True and until < now)
+    kinds = [k[1] for k in STATE["open_alerts"] if k[0] == o["id"] and shown(k)] if live else []
     sevs = [STATE["sev"].get((o["id"], k)) for k in kinds]
+    heads = [STATE["heads"].get((o["id"], k), "") for k in kinds]
     lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o.get("rider_lat"), o.get("rider_lng"))
     return {"id": o["id"], "ref": o["ref"], "rider": o["rider"] or r.get("name") or "", "rider_id": o["rider_id"],
             "phone": r.get("phone") or "", "restaurant": o["restaurant"], "restaurant_phone": o.get("restaurant_phone", ""),
@@ -498,6 +596,7 @@ def order_view(o: dict, now: datetime) -> dict:
             "stacked": bool(o.get("stacked")), "cancel_reason": o.get("cancel_reason", ""),
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
             "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
+            "alert_heads": [h for h in heads if h],
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "waiting_min": int(mins(o.get("created_at"), now) or 0) if o["phase"] == "on_hold" else None}
 
@@ -706,7 +805,7 @@ async def api_settings_set(request: Request):
 @app.get("/api/system", dependencies=[Depends(require_login)])
 def api_system():
     s = STATE["sync"]
-    return {"started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
+    return {"version": VERSION, "started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
             "mode": s["mode"], "event_counts": projector.counts, "endpoint_summary": mt.endpoint_summary(),
             "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
             "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
@@ -714,12 +813,15 @@ def api_system():
 
 @app.post("/api/alerts/{aid}/dismiss", dependencies=[Depends(require_login)])
 def api_dismiss(aid: int):
+    STATE["hidden"][aid] = True
     return {"ok": store.dismiss_alert(aid, datetime.now(UTC))}
 
 
 @app.post("/api/alerts/{aid}/snooze", dependencies=[Depends(require_login)])
 def api_snooze(aid: int, minutes: int = 10):
-    return {"ok": store.snooze_alert(aid, datetime.now(UTC) + timedelta(minutes=max(1, min(minutes, 120))))}
+    until = datetime.now(UTC) + timedelta(minutes=max(1, min(minutes, 120)))
+    STATE["hidden"][aid] = until
+    return {"ok": store.snooze_alert(aid, until)}
 
 
 @app.get("/export.csv", dependencies=[Depends(require_login)])
@@ -742,7 +844,7 @@ def export_events(n: int = 300):
 @app.get("/health")
 def health():
     s = STATE["sync"]
-    return {"ok": True, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
+    return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
@@ -753,4 +855,5 @@ def health():
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def dashboard():
-    return (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})

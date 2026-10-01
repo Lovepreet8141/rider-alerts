@@ -19,7 +19,7 @@ Endpoints (docs.motiontools.io):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -72,7 +72,9 @@ class MotionTools:
         self.stats = {"calls": 0, "errors": 0, "last_status": None, "last_error": None,
                       "bookings_filter_mode": None, "drivers_filter_mode": None,
                       "bookings_path": None, "detail_path": None, "endpoints": {}, "probed_at": None}
-        self.blocked_paths: dict = {}          # endpoint key -> reason (restricted / http 404 …)
+        self.blocked_paths: dict = {}          # endpoint key -> reason (restricted / http 404 / rate limit)
+        self.blocked_until: dict = {}          # endpoint key -> datetime when a rate-limit block expires
+        self.permanent: set = set()            # endpoint keys that answered 404 with a real id -> path does not exist here
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -80,7 +82,17 @@ class MotionTools:
         return bool(self.token)
 
     def blocked(self, key: str) -> bool:
+        until = self.blocked_until.get(key)
+        if until and datetime.now(timezone.utc) >= until:          # hourly quota is back
+            self.blocked_until.pop(key, None)
+            self.blocked_paths.pop(key, None)
+            self.stats["endpoints"][key] = "quota back"
+            return False
         return key in self.blocked_paths
+
+    def quota_left(self, key: str) -> bool:
+        """True when the endpoint is usable right now (not restricted, not out of hourly quota, not missing)."""
+        return not self.blocked(key)
 
     def endpoint_ok(self, key: str) -> bool:
         return self.stats["endpoints"].get(key) == "ok"
@@ -107,12 +119,23 @@ class MotionTools:
             self.stats["errors"] += 1
             self.stats["last_error"] = f"{path} -> {res.status_code} {res.text[:200]}"
             log.warning("MotionTools %s -> %s %s", path, res.status_code, res.text[:200])
+            now = datetime.now(timezone.utc)
             if "restricted_endpoint" in res.text:
                 self.blocked_paths[key] = "restricted"
                 self.stats["endpoints"][key] = "restricted"
-            elif res.status_code in (401, 403) or (res.status_code == 404 and "{id}" not in key):
+            elif res.status_code == 429 or "rate_limit" in res.text:
+                # "restricted API access mode ... reached the hourly limit for this endpoint" -> usable again next hour
+                self.blocked_paths[key] = "hourly quota used"
+                self.blocked_until[key] = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, minutes=1))
+                self.stats["endpoints"][key] = "hourly quota used (back next hour)"
+            elif res.status_code in (401, 403):
                 self.blocked_paths[key] = f"http {res.status_code}"
                 self.stats["endpoints"][key] = f"http {res.status_code}"
+            elif res.status_code == 404:
+                # a 404 with a real id (or on a list path) means this path does not exist on this tenant -> never retry
+                self.blocked_paths[key] = "not available (404)"
+                self.permanent.add(key)
+                self.stats["endpoints"][key] = "not available (404)"
             else:
                 self.stats["endpoints"].setdefault(key, f"http {res.status_code}")
             return res.status_code, None
@@ -195,8 +218,6 @@ class MotionTools:
             if status == 200 and isinstance(data, dict):
                 self.stats["detail_path"] = tpl
                 return _unwrap(data, "booking", "hailing_booking")
-            if status == 404 and self.stats["detail_path"] == tpl:
-                return None                            # known-good path says: no such booking
         return None
 
     def detail_available(self) -> bool:
@@ -245,8 +266,10 @@ class MotionTools:
 
     # ---------- discovery ----------
     async def probe(self, booking_id: str = None, place_id: str = None, user_id: str = None) -> dict:
-        """Forget earlier 403s and test every endpoint once, so the dashboard can show what this token may read."""
-        self.blocked_paths.clear()
+        """Re-test the endpoints that answered 'restricted' earlier (cheap: a few calls), so the dashboard can show
+        what this token may read. Paths that do not exist (404) are never asked again; hourly quotas are respected."""
+        for key in [k for k, why in self.blocked_paths.items() if why == "restricted"]:
+            self.blocked_paths.pop(key, None)
         tests = [(ME_PATH, ME_PATH, []),
                  ("/api/bookings/active", "/api/bookings/active", [("limit", "1")]),
                  ("/api/bookings", "/api/bookings", [("limit", "1")]),
@@ -259,6 +282,8 @@ class MotionTools:
         if user_id:
             tests.append((USER_PATH, USER_PATH.format(id=user_id), []))
         for key, path, params in tests:
+            if key in self.permanent or self.blocked(key) or self.stats["endpoints"].get(key) == "ok":
+                continue                                   # known: missing, out of quota, or already working
             status, data = await self._get(path, params, key=key)
             if status == 200 and key in DETAIL_PATHS and self.stats["detail_path"] is None:
                 self.stats["detail_path"] = key

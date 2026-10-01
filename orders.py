@@ -116,9 +116,9 @@ def parse_booking(b: dict) -> dict:
     created = ts(b.get("created_at"))
     # PTOD starts when MotionTools DISPATCHES the order (offers it to riders) — not when a pre-order is created
     # hours earlier and sits "on hold" (status to_be_dispatched).
-    dispatched = ev("dispatched", "pickable", "partially_dispatched")
-    if dispatched is None and status != "to_be_dispatched":
-        dispatched = created
+    dispatched = ev("pickable", "claimed", "en_route")          # offered to riders / taken by a rider
+    if dispatched is None and status not in ("to_be_dispatched", "dispatched", "partially_dispatched"):
+        dispatched = created                                    # finished order without an event list
     scheduled = ts(b.get("scheduled_at") or b.get("scheduled_for") or pick.get("scheduled_at")
                    or pick.get("earliest_arrival_at") or pick.get("latest_arrival_at"))
     accepted = ev("claimed")
