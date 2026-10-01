@@ -339,12 +339,22 @@ class Store:
             r["active_ids"] = json.loads(r["active_ids"] or "[]")
         return rows
 
+    POSITION_EVERY_S = 30          # one stored GPS point per rider per 30 s is plenty for trails and "not moving"
+    POSITION_KEEP_DAYS = 2
+
     def record_position(self, rid, lat, lng, order_id, now: datetime):
         if lat is None or lng is None:
+            return
+        last_at = getattr(self, "_last_pos", None)
+        if last_at is None:
+            last_at = self._last_pos = {}
+        prev = last_at.get(rid)
+        if prev and (now - prev).total_seconds() < self.POSITION_EVERY_S:
             return
         last = self._rows("SELECT lat, lng FROM positions WHERE rider_id=? ORDER BY at DESC LIMIT 1", (rid,))
         if last and last[0]["lat"] == lat and last[0]["lng"] == lng:
             return
+        last_at[rid] = now
         self._exec("INSERT INTO positions (rider_id, at, lat, lng, order_id) VALUES (?,?,?,?,?)",
                    (rid, iso(now), lat, lng, order_id))
 
@@ -363,7 +373,26 @@ class Store:
         return round(d / 1000, 1)
 
     def cleanup(self, now: datetime):
-        self._exec("DELETE FROM positions WHERE at < ?", (iso(now - timedelta(days=7)),))
+        self._exec("DELETE FROM positions WHERE at < ?", (iso(now - timedelta(days=self.POSITION_KEEP_DAYS)),))
+        self._exec("DELETE FROM rider_sessions WHERE online_at < ?", (iso(now - timedelta(days=60)),))
+        self._exec("DELETE FROM alerts WHERE opened_at < ?", (iso(now - timedelta(days=90)),))
+
+    def db_size_bytes(self) -> int:
+        try:
+            page, cnt = self.db.execute("PRAGMA page_size").fetchone()[0], self.db.execute("PRAGMA page_count").fetchone()[0]
+            return page * cnt
+        except Exception:
+            return 0
+
+    def vacuum(self) -> bool:
+        """Give deleted space back to the disk (SQLite keeps it otherwise). Needs free disk ≈ the DB size."""
+        try:
+            with self.lock:
+                self.db.execute("VACUUM")
+                self.db.commit()
+            return True
+        except Exception:
+            return False
 
     def online_minutes(self, rider_id: str, start: datetime, end: datetime) -> float:
         total = 0.0
@@ -391,7 +420,10 @@ class Store:
         return {h: round(v, 1) for h, v in out.items()}
 
     # ================================================================ analytics
-    def insights(self, period: str, now: datetime, rules) -> dict:
+    def insights(self, period: str, now: datetime, rules, sessions_ok: bool = False) -> dict:
+        """sessions_ok=False (webhook mode): online/offline is only partly known, so every metric built on
+        'hours online' (busy %, orders/hour, idle, rider-hours per hour) is left out; staffing uses the riders
+        who actually handled orders in that hour instead — which comes straight from the orders."""
         start, end = period_range(period, now)
         orders = [o for o in self.orders_in(period, now) if o["dispatched_at"] and start <= o["dispatched_at"] < end]
         done = [o for o in orders if o["phase"] == "delivered" and o["delivered_at"]]
@@ -431,13 +463,17 @@ class Store:
         hours = []
         for h, rs in sorted(group(orders, lambda o: o["hour"]).items(), key=lambda x: ((x[0] is None), ((x[0] or 0) - DAY_STARTS_AT) % 24)):
             d = [o for o in rs if o["phase"] == "delivered"]
-            rh = rider_hours.get(h, 0)
-            hours.append({"hour": h, "orders": len(rs), "delivered": len(d), "cancelled": len(rs) - len(d),
+            rh = rider_hours.get(h, 0) if sessions_ok else 0
+            active = len({o["rider_id"] for o in rs if o["rider_id"]})
+            hours.append({"hour": h, "orders": len(rs), "delivered": len(d), "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                           "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
                           "avg_accept": _avg([o["phases"]["to_accept"] for o in rs if o["accepted_at"]]),
                           "within_pct": _pct(sum(1 for o in d if (o["phases"]["ptod"] or 999) <= tgt), len(d)),
-                          "rider_hours": round(rh / days, 1) if days > 1 else rh,
-                          "orders_per_rider_hour": round(len(rs) / rh, 1) if rh else None})
+                          "rider_hours": (round(rh / days, 1) if days > 1 else rh) if sessions_ok else None,
+                          "orders_per_rider_hour": round(len(rs) / rh, 1) if rh else None,
+                          "riders_active": round(active / days, 1) if days > 1 else active,
+                          "orders_per_rider": round(len(rs) / active, 1) if active else None,
+                          "no_rider_5": sum(1 for o in rs if (o["phases"]["to_accept"] or 0) >= 5 or (not o["accepted_at"] and o["phase"] == "cancelled"))})
 
         # --- riders ---
         handbacks = {}
@@ -452,11 +488,12 @@ class Store:
             d = [o for o in rs if o["phase"] == "delivered"]
             ph = lambda k: _avg([o["phases"][k] for o in d])
             busy = sum((o["phases"]["ptod"] or 0) - (o["phases"]["to_accept"] or 0) for o in d)  # accept -> delivered
-            online = self.online_minutes(rid, start, min(end, now))
+            online = self.online_minutes(rid, start, min(end, now)) if sessions_ok else 0
             kms = [self.trail_km(o) for o in d[-30:]]
             kms = [k for k in kms if k]
             riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "orders": len(rs), "delivered": len(d),
-                           "cancelled": len(rs) - len(d),
+                           "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
+                           "live": sum(1 for o in rs if o["phase"] not in ("delivered", "cancelled", "closed")),
                            "within_pct": _pct(sum(1 for o in d if (o["phases"]["ptod"] or 999) <= tgt), len(d)),
                            "avg_ptod": ph("ptod"), "median_ptod": round(median([o["phases"]["ptod"] for o in d if o["phases"]["ptod"] is not None]), 1) if d else None,
                            "avg_accept": ph("to_accept"), "avg_to_restaurant": ph("to_restaurant"),
@@ -493,7 +530,7 @@ class Store:
             if worst:
                 cause[worst] = cause.get(worst, 0) + 1
 
-        focus = self._focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts)
+        focus = self._focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts, sessions_ok)
         return {"period": period, "start": iso(start), "orders": len(orders), "delivered": len(done),
                 "cancelled": len(cancelled), "cancel_pct": _pct(len(cancelled), len(orders)),
                 "within_pct": _pct(sum(1 for p in ptods if p <= tgt), len(ptods)), "target_within_pct": rules.target_within_pct,
@@ -506,20 +543,23 @@ class Store:
                 "handled": sum(1 for a in alerts if a["dismissed_at"]), "focus": focus,
                 "late_orders": [{"id": o["id"], "ref": o["ref"], "rider": o["rider"], "restaurant": o["restaurant"], "ptod": o["phases"]["ptod"],
                                  "phases": o["phases"], "hour": o["hour"], "reason": o.get("reason", ""), "note": o.get("note", "")} for o in late[:15]],
+                "sessions_ok": sessions_ok,
                 "late_reasons": _count(o.get("reason") for o in late if o.get("reason")),
                 "late_without_reason": sum(1 for o in late if not o.get("reason")),
                 "recent_alerts": alerts[:60]}
 
     @staticmethod
-    def _focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts):
+    def _focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts, sessions_ok=False):
         focus = []
         for x in restaurants:
             if x["delivered"] >= 3 and (x["avg_wait"] or 0) >= rules.wait_restaurant_min:
                 focus.append({"icon": "🏪", "title": f"{x['restaurant']}: riders wait {x['avg_wait']:.0f} min on average ({x['delivered']} orders, max {x['max_wait']:.0f})",
                               "action": "Call the restaurant today: start cooking on dispatch and hand over at the counter. If it stays slow, dispatch riders 5 min later for this restaurant."})
-        under = [h for h in hours if h["orders"] >= 3 and ((h["avg_accept"] or 0) >= 4 or (h["orders_per_rider_hour"] or 0) >= 2.5)]
+        under = [h for h in hours if h["orders"] >= 3 and h["hour"] is not None and ((h["avg_accept"] or 0) >= 4 or (h["orders_per_rider_hour"] or 0) >= 2.5 or (h["orders_per_rider"] or 0) >= 3)]
+        under.sort(key=lambda h: -(h["avg_accept"] or 0))
         for h in under[:2]:
-            focus.append({"icon": "⏱", "title": f"{h['hour']:02d}–{h['hour'] + 1:02d}h is under-staffed: {h['orders']} orders on {h['rider_hours']} rider-hours, accept {h['avg_accept'] or 0:.0f} min",
+            supply = f"{h['rider_hours']} rider-hours" if h.get("rider_hours") is not None else f"{h['riders_active']} riders handling them"
+            focus.append({"icon": "⏱", "title": f"{h['hour']:02d}–{h['hour'] + 1:02d}h is under-staffed: {h['orders']} orders, {supply}, accept {h['avg_accept'] or 0:.0f} min",
                           "action": "Add 1–2 riders to this hour in the shift plan; ask riders to go online 15 min earlier."})
         if cause:
             top = max(cause, key=cause.get)
@@ -544,7 +584,7 @@ class Store:
                 focus.append({"icon": "🧑", "title": f"{x['rider']}: {x['within_pct']}% within target, avg PTOD {x['avg_ptod']:.0f} min — loses most time in {slow.replace('avg_', '').replace('_', ' ')}",
                               "action": "Coach with the numbers from the rider table (tap the name)."})
         for x in riders:
-            if x["online_minutes"] >= 120 and (x["utilisation_pct"] or 0) < 40 and x["delivered"] < 3:
+            if sessions_ok and x["online_minutes"] >= 120 and (x["utilisation_pct"] or 0) < 40 and x["delivered"] < 3:
                 focus.append({"icon": "💤", "title": f"{x['rider']}: online {x['online_minutes'] / 60:.1f} h but only {x['delivered']} deliveries ({x['utilisation_pct']}% busy)",
                               "action": "Check whether this rider accepts orders; otherwise shift them to a busier hour."})
         for d in districts[:1]:

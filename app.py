@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean
@@ -51,9 +53,98 @@ DASH_PASSWORD = env("DASHBOARD_PASSWORD")
 DATA_DIR = Path(env("DATA_DIR", ".") or ".")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
+GPS_EVENTS = ("driver_location_updated",)        # 90 % of all events; processed live, never written to disk
+EVENT_FILE_DAYS = 3                               # daily raw-event files kept on the volume
+
+
+def event_file(now: datetime) -> Path:
+    return DATA_DIR / f"events-{now.astimezone(BERLIN).strftime('%Y-%m-%d')}.jsonl"
+
+
+def event_files() -> list:
+    """Today's and the previous days' event files, oldest first (plus the legacy single file if still present)."""
+    files = sorted(DATA_DIR.glob("events-*.jsonl"))
+    legacy = DATA_DIR / "events.jsonl"
+    return ([legacy] if legacy.exists() else []) + files
+
+
+def tail_lines(path: Path, n: int, max_bytes: int = 80 * 1024 * 1024) -> list:
+    """Last n lines of a file without loading all of it (the legacy file can be hundreds of MB)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+        lines = data.decode("utf-8", "ignore").splitlines()
+        if size > max_bytes and lines:
+            lines = lines[1:]                     # the first line is probably cut in half
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+def recent_event_lines(n: int = 60000) -> list:
+    out = []
+    for p in reversed(event_files()):
+        out = tail_lines(p, n - len(out)) + out
+        if len(out) >= n:
+            break
+    return out[-n:]
+
+
+def disk_report() -> dict:
+    try:
+        u = shutil.disk_usage(str(DATA_DIR))
+        total, used, free = u.total, u.used, u.free
+    except Exception:
+        total = used = free = 0
+    files = {p.name: p.stat().st_size for p in DATA_DIR.glob("*") if p.is_file()}
+    return {"total_mb": round(total / 1e6), "used_mb": round(used / 1e6), "free_mb": round(free / 1e6),
+            "pct": round(100 * used / total) if total else None,
+            "db_mb": round(store.db_size_bytes() / 1e6, 1),
+            "files_mb": {k: round(v / 1e6, 1) for k, v in sorted(files.items(), key=lambda x: -x[1])[:8]}}
+
+
+def housekeeping(now: datetime, startup: bool = False):
+    """Keep the volume small: drop old daily event files, shrink the legacy event file (GPS lines out, last 60k
+    kept), purge old GPS points, and give the space back with VACUUM when the disk has room for it."""
+    freed = 0
+    keep = {event_file(now - timedelta(days=i)).name for i in range(EVENT_FILE_DAYS)}
+    for p in DATA_DIR.glob("events-*.jsonl"):
+        age_days = (now.timestamp() - p.stat().st_mtime) / 86400
+        if p.name not in keep and age_days > EVENT_FILE_DAYS:
+            freed += p.stat().st_size
+            p.unlink(missing_ok=True)
+    legacy = DATA_DIR / "events.jsonl"
+    if legacy.exists():
+        size = legacy.stat().st_size
+        kept = []
+        try:
+            from collections import deque
+            dq = deque(maxlen=60000)
+            with open(legacy, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if '"driver_location_updated"' in line:
+                        continue
+                    dq.append(line.rstrip("\n"))
+            kept = list(dq)
+            tmp = DATA_DIR / "events-legacy.jsonl.tmp"
+            tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            legacy.unlink()
+            tmp.rename(DATA_DIR / "events-0000-legacy.jsonl")
+            freed += size - sum(len(x) + 1 for x in kept)
+        except Exception as e:
+            log.warning("could not shrink the legacy event file: %s", e)
+    store.cleanup(now)
+    rep = disk_report()
+    if rep["free_mb"] > rep["db_mb"] * 1.3 + 20 and (startup or rep["pct"] and rep["pct"] >= 70):
+        if store.vacuum():
+            rep = disk_report()
+    store.log("info", f"housekeeping: freed {freed / 1e6:.0f} MB of event files · DB {rep['db_mb']} MB · volume {rep['used_mb']}/{rep['total_mb']} MB ({rep['pct']}%)")
+    return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.4"
+VERSION = "4.7"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -72,6 +163,7 @@ WAKE = asyncio.Event()
 projector = Projector(STATE, store, tracker, AREAS)
 projector.lead_min = rules.release_lead_min
 ENRICHED_RIDERS: dict = {}          # rider_id -> when we last read it through the API
+DISK_CACHE: dict = {}
 ENRICH_LOCK = asyncio.Lock()
 
 
@@ -377,12 +469,8 @@ class _NullStore:
 
 def replay_events(max_lines: int = 60000) -> dict:
     """Rebuild every order of the stored raw events from scratch (same rules as live), finished ones included."""
-    path = DATA_DIR / "events.jsonl"
-    if not path.exists():
-        return {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-max_lines:]
-    except Exception:
+    lines = recent_event_lines(max_lines)
+    if not lines:
         return {}
     state = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}}
     pj = Projector(state, _NullStore(), RiderTracker(), AREAS, keep_finished=True)
@@ -509,7 +597,7 @@ def snapshot_yesterday(now: datetime):
     if STATE["sync"]["last_snapshot"] == yday or (local.hour == 4 and local.minute < 5):
         return
     if store.daily(yday) is None or STATE["sync"]["last_snapshot"] is None:
-        data = store.insights(yday, now, rules)
+        data = store.insights(yday, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
         data["day"] = yday
         store.save_daily(yday, data)
         store.log("info", f"daily report frozen for {yday}: {data['delivered']} delivered, {data['within_pct']}% within target")
@@ -585,7 +673,7 @@ async def sync_loop():
             evaluate_all(datetime.now(UTC))
             snapshot_yesterday(now)
             if now.minute == 30 and now.second < SYNC_SECONDS:
-                store.cleanup(now)
+                await asyncio.get_event_loop().run_in_executor(None, housekeeping, now, False)
             first = False
         except Exception as e:
             log.exception("sync failed: %s", e)
@@ -625,6 +713,10 @@ async def startup():
                 r["online"] = True
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
     try:
+        await asyncio.get_event_loop().run_in_executor(None, housekeeping, now, True)
+    except Exception as e:
+        log.exception("housekeeping failed: %s", e)
+    try:
         n = repair_from_events(now)
         if n:
             on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
@@ -651,8 +743,9 @@ async def webhook(secret: str, request: Request):
         p = {}
     STATE["sync"]["webhook_events"] += 1
     STATE["sync"]["last_webhook"] = iso(datetime.now(UTC))
-    with open(DATA_DIR / "events.jsonl", "a") as f:
-        f.write(json.dumps(p) + "\n")
+    if str(p.get("event") or "") not in GPS_EVENTS:
+        with open(event_file(datetime.now(UTC)), "a") as f:
+            f.write(json.dumps(p) + "\n")
     if len(STATE["raw_samples"].get("events", [])) < 12:
         STATE["raw_samples"].setdefault("events", []).append(p)
     if STATE["sync"]["mode"] == "webhook":
@@ -746,7 +839,12 @@ def api_state():
              "riders_online": sum(1 for r in riders if r["online"]), "riders_idle": sum(1 for r in riders if r["status"] == "idle"),
              "riders_busy": sum(1 for r in riders if r["status"] == "busy"),
              "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
+    disk = DISK_CACHE.get("rep") if (now - DISK_CACHE.get("at", now - timedelta(hours=1))) < timedelta(minutes=2) else None
+    if disk is None:
+        disk = DISK_CACHE["rep"] = disk_report()
+        DISK_CACHE["at"] = now
     return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
+            "disk": {"pct": disk["pct"], "free_mb": disk["free_mb"], "total_mb": disk["total_mb"]},
             "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS}}
 
 
@@ -819,7 +917,7 @@ async def api_probe():
 @app.get("/api/insights", dependencies=[Depends(require_login)])
 def api_insights(period: str = "today"):
     _check_period(period)
-    return store.insights(period, datetime.now(UTC), rules)
+    return store.insights(period, datetime.now(UTC), rules, sessions_ok=STATE['sync']['mode'] == 'api')
 
 
 def _check_period(period):
@@ -869,16 +967,9 @@ async def api_order_reason(oid: str, request: Request):
 @app.get("/api/orders/{oid}/events", dependencies=[Depends(require_login)])
 def api_order_events(oid: str):
     """Every raw MotionTools event that touched this order (booking events + its tour's events) — the ground truth."""
-    path = DATA_DIR / "events.jsonl"
-    if not path.exists():
-        return {"events": []}
     tours = {tid for tid, ids in projector.tours.items() if oid in ids}
     out = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-60000:]
-    except Exception:
-        return {"events": []}
-    for line in lines:
+    for line in recent_event_lines(60000):
         if oid not in line and not any(t in line for t in tours):
             continue
         try:
@@ -909,7 +1000,7 @@ def api_order_events(oid: str):
 def api_rider(rid: str, period: str = "today"):
     _check_period(period)
     now = datetime.now(UTC)
-    ins = store.insights(period, now, rules)
+    ins = store.insights(period, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
     stats = next((r for r in ins["riders"] if r["rider_id"] == rid), None)
     orders = [order_view(o, now) for o in store.orders_in(period, now) if o["rider_id"] == rid]
     r = STATE["riders"].get(rid, {})
@@ -924,7 +1015,7 @@ def api_daily(day: str = ""):
     data = store.daily(day)
     frozen = data is not None
     if data is None:
-        data = store.insights(day, now, rules)
+        data = store.insights(day, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
         data["day"] = day
     data["frozen"] = frozen
     data["trend"] = store.daily_trend(14)
@@ -976,7 +1067,7 @@ async def api_settings_set(request: Request):
 def api_system():
     s = STATE["sync"]
     return {"version": VERSION, "started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
-            "mode": s["mode"], "event_counts": projector.counts, "endpoint_summary": mt.endpoint_summary(),
+            "mode": s["mode"], "event_counts": projector.counts, "endpoint_summary": mt.endpoint_summary(), "disk": disk_report(),
             "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
             "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
 
@@ -1005,8 +1096,7 @@ def export_csv(period: str = "today"):
 @app.get("/export-events.jsonl", dependencies=[Depends(require_login)])
 def export_events(n: int = 300):
     """The last raw webhook events, for checking field names and event flows."""
-    path = DATA_DIR / "events.jsonl"
-    lines = path.read_text(encoding="utf-8").splitlines()[-max(1, min(n, 2000)):] if path.exists() else []
+    lines = recent_event_lines(max(1, min(n, 2000)))
     return PlainTextResponse("\n".join(lines), media_type="application/json",
                              headers={"Content-Disposition": 'attachment; filename="motiontools-events.jsonl"'})
 

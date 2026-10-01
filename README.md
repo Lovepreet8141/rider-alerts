@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v4.4)
+# Quickzi — Munich ops platform (v4.7)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -28,8 +28,9 @@ daily report of the evening before.
 - **Orders** — every order of the day, searchable, with filters (Live · PTOD risk · Late · Late without reason ·
   On hold · Delivered · Cancelled). Tap → the order's story: minutes per phase, every rider, alerts, route, and a
   **reason box** ("Restaurant late", "No rider available", …) — reasons are counted in Insights and the daily brief.
-- **Riders** — hours online, deliveries, % within target, avg PTOD, delivery minutes per order, busy %,
-  orders/hour, idle time, minutes per phase, km/order, double orders, alerts. Tap a rider → numbers vs the team.
+- **Riders** — deliveries, % within target, avg PTOD, delivery minutes per order, minutes per phase, km/order,
+  double orders, hand-backs, alerts — all from the orders themselves. Hours online / busy % / idle are shown only in
+  API mode (webhook mode cannot know online time reliably). Tap a rider → numbers vs the team.
 - **Insights** — where the minutes go, focus list, staffing hour by hour, restaurants by rider wait (each row shows
   its order numbers; tap → every order of that restaurant with wait/PTOD/alerts, and a box to name an unnamed
   MotionTools place — the name is applied to all its past orders too), districts by postcode, late orders, alert log.
@@ -65,6 +66,11 @@ PTOD at risk (25 min or ETA projects > 30) / breached (30 min) · rider offline 
 `orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI ·
 `simulate.py` API-mode evening · `simulate_webhook.py` restricted-mode evening (fake MotionTools server) ·
 `requirements.txt` · `Procfile`
+
+## Disk (Railway volume)
+GPS events are processed live but never written to disk; other raw events go to daily files (`events-YYYY-MM-DD.jsonl`,
+3 days kept). GPS points are stored at most every 30 s per rider and kept 2 days. Housekeeping runs at startup and
+hourly (old files, old points, VACUUM when there is room); Settings → System shows the volume usage.
 
 ## Railway variables
 `MT_API_TOKEN`, `DASHBOARD_PASSWORD`, `WEBHOOK_PATH_SECRET`, `DATA_DIR=/data`,
