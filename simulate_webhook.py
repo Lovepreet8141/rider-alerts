@@ -116,11 +116,23 @@ EVENTS += [ev("booking", "created", m(-15), booking_id="b-hb", external_id="HB12
            ev("tour", "transition", m(-7), tour_id="t-hb", **{"from": "claimed", "to": "pickable", "event": "unclaim"}, affected_user_ids=["r-sven"]),
            ev("booking", "in_progress", m(-3), booking_id="b-hb", external_id="HB1234", driver_id="r-ahmad", driver_name="Ahmad Sabe", driver_location={"lat": 48.14, "lng": 11.56}),
            ev("tour", "force_assigned", m(-1), tour_id="t-hb", driver_id="r-murat")]
+# pre-orders as Lieferando/MotionTools really create them: already "dispatched" (in a tour on hold) with a planned delivery
+EVENTS += [ev("booking", "created", m(-100), booking_id="b-plan1", external_id="PLAN60", customer_id=CUST, place_ids=[PLACE_BK], status="dispatched"),
+           ev("booking", "etas_recalculated", m(-99), booking_id="b-plan1", external_id="PLAN60", customer_id=CUST,
+              unfinished_stops_info=[{"id": "b-plan1-p", "position": 1, "type": "pickup", "eta": m(45)}, {"id": "b-plan1-d", "position": 2, "type": "dropoff", "eta": m(60)}]),   # planned +60 -> on hold (released at +15)
+           ev("booking", "created", m(-90), booking_id="b-plan2", external_id="PLAN20", customer_id=CUST, place_ids=[PLACE_CHO], status="dispatched"),
+           ev("booking", "etas_recalculated", m(-89), booking_id="b-plan2", external_id="PLAN20", customer_id=CUST,
+              unfinished_stops_info=[{"id": "b-plan2-p", "position": 1, "type": "pickup", "eta": m(10)}, {"id": "b-plan2-d", "position": 2, "type": "dropoff", "eta": m(20)}]),   # planned +20 -> released 25 min ago -> waiting, no rider
+           ev("booking", "created", m(-85), booking_id="b-plan3", external_id="PLAN01", customer_id=CUST, place_ids=[PLACE_BK], status="dispatched"),
+           ev("booking", "etas_recalculated", m(-84), booking_id="b-plan3", external_id="PLAN01", customer_id=CUST,
+              unfinished_stops_info=[{"id": "b-plan3-p", "position": 1, "type": "pickup", "eta": m(36)}, {"id": "b-plan3-d", "position": 2, "type": "dropoff", "eta": m(46)}])]   # planned +46 -> releases in ~1 min (timer test)
 # an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
 EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])
 BOOK["b-live4"] = {"ref": "KMW86T", "place": PLACE_CHO, "rider_id": "r-sven", "rider": "Sven B.", "delivered": False}
 for b, ref, pl in (("b-pre1", "PRE001", PLACE_BK), ("b-pre2", "PRE002", PLACE_CHO), ("b-pre3", "PRE003", PLACE_BK)):
+    BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
+for b, ref, pl in (("b-plan1", "PLAN60", PLACE_BK), ("b-plan2", "PLAN20", PLACE_CHO), ("b-plan3", "PLAN01", PLACE_BK)):
     BOOK[b] = {"ref": ref, "place": pl, "rider_id": None, "rider": "", "delivered": False}
 BOOK["b-dblB"] = {"ref": "DBL-B", "place": PLACE_CHO, "rider_id": "r-obaida", "rider": "Obaida H.", "delivered": False}
 BOOK["b-hb"] = {"ref": "HB1234", "place": PLACE_BK, "rider_id": "r-ahmad", "rider": "Ahmad Sabe", "delivered": False}

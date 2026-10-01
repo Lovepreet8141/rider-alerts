@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v3.9)
+# Quickzi — Munich ops platform (v4.1)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -29,8 +29,9 @@ daily report of the evening before.
   minutes per phase, alerts raised, GPS route driven.
 - **Riders** — hours online, deliveries, % within target, avg PTOD, delivery minutes per order, busy %,
   orders/hour, idle time, minutes per phase, km/order, double orders, alerts. Tap a rider → numbers vs the team.
-- **Insights** — where the minutes go, focus list, staffing hour by hour, restaurants by rider wait,
-  districts by postcode, late orders with the phase that caused it, alert log.
+- **Insights** — where the minutes go, focus list, staffing hour by hour, restaurants by rider wait (each row shows
+  its order numbers; tap → every order of that restaurant with wait/PTOD/alerts, and a box to name an unnamed
+  MotionTools place — the name is applied to all its past orders too), districts by postcode, late orders, alert log.
 - **Daily report** — 14-day trend, frozen report per operating day (04:00 → 04:00), team briefing text, CSV.
 - **Settings** — alert thresholds; restaurant names (by MotionTools place id); rider phone numbers;
   system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples.
@@ -38,7 +39,9 @@ daily report of the evening before.
 ## Order stages (Live tab board, always in this order)
 Waiting for rider · Accepted, not started · Riding to restaurant · At restaurant · Delivering · At customer · **On hold**.
 On hold = created by Lieferando but not yet dispatched by MotionTools (pre-orders, often hours ahead): no PTOD, no alerts.
-**PTOD starts at dispatch** (booking.transition → dispatched / tour.created), not at creation.
+**PTOD starts when the order is released to riders**, not at creation. MotionTools' "pickable" event is the exact
+moment; when it is not sent, the release is derived from the planned delivery time (ETA − *release lead*, the
+MotionTools automatic-scheduling setting, editable under Settings, default 45 min). ASAP orders are released at creation.
 Alerts resolve themselves when the condition ends or the order is delivered/cancelled; a live order without any
 MotionTools event for 3 h is closed automatically ("Closed (no events)") so nothing stays stuck on the board.
 GPS-based alerts (not moving / no GPS / wrong direction) only fire for riders we actually receive positions for.

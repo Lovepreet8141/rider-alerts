@@ -180,6 +180,20 @@ class Store:
              iso(o["picked_up_at"]), iso(o["at_customer_at"]), iso(o["delivered_at"]), cancelled_at,
              o.get("cancel_reason", ""), pm["ptod"], closed, first_seen, iso(now), raw))
 
+    def rename_place(self, place_id: str, name: str) -> int:
+        """A restaurant got its name (Settings / API): apply it to every stored order and alert of that place."""
+        n = 0
+        for r in self._rows("SELECT id, raw FROM orders WHERE place_id=?", (place_id,)):
+            try:
+                raw = json.loads(r["raw"]) if r["raw"] else {}
+            except Exception:
+                raw = {}
+            raw["restaurant"] = name
+            self._exec("UPDATE orders SET restaurant=?, raw=? WHERE id=?", (name, json.dumps(raw), r["id"]))
+            self._exec("UPDATE alerts SET restaurant=? WHERE order_id=?", (name, r["id"]))
+            n += 1
+        return n
+
     def _hydrate(self, r: dict) -> dict:
         o = json.loads(r["raw"]) if r.get("raw") else {}
         for k in DT_FIELDS:
@@ -382,7 +396,10 @@ class Store:
         restaurants = []
         for name, rs in group(done + cancelled, lambda o: o["restaurant"] or "?").items():
             d = [o for o in rs if o["phase"] == "delivered"]
+            rs_sorted = sorted(rs, key=lambda o: -(o["phases"]["at_restaurant"] or 0))
             restaurants.append({"restaurant": name, "orders": len(rs), "delivered": len(d), "cancelled": len(rs) - len(d),
+                                "place_id": next((o.get("place_id") for o in rs if o.get("place_id")), ""),
+                                "refs": [o["ref"] for o in rs_sorted[:4]],
                                 "avg_wait": _avg([o["phases"]["at_restaurant"] for o in d]),
                                 "max_wait": max([o["phases"]["at_restaurant"] or 0 for o in d], default=None),
                                 "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),

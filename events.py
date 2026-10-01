@@ -38,6 +38,7 @@ class Projector:
     def __init__(self, state: dict, store, tracker, areas: list, keep_finished: bool = False):
         self.state, self.store, self.tracker, self.areas = state, store, tracker, areas
         self.keep_finished = keep_finished     # replay mode: finished orders stay in state so their story can be copied
+        self.lead_min = 45                     # see Rules.release_lead_min (kept in sync by the server)
         self.tours: dict = {}          # tour_id -> [booking_id]
         self.busy_at: dict = {}        # driver_id -> time the driver last became busy (≈ accepted an order)
         self.places: dict = {}         # place_id -> restaurant name (editable in Settings / filled from the API)
@@ -61,6 +62,8 @@ class Projector:
         for o in self.state["orders"].values():
             if o.get("place_id") == pid:
                 o["restaurant"] = name or self.restaurant_name(pid)
+        if hasattr(self.store, "rename_place"):
+            self.store.rename_place(pid, name or self.restaurant_name(pid))
 
     def set_phone(self, rid: str, phone: str):
         self.phones[rid] = phone
@@ -140,6 +143,17 @@ class Projector:
             if new_rider:
                 self.note(o, now, "accepted", rid, o["rider"])
 
+    def seen(self, rid, now):
+        """Any event from a rider's app (started, arrived, GPS, busy) proves the rider is online right now."""
+        if not rid:
+            return
+        r = self.rider(rid)
+        r["last_seen"] = now.isoformat(timespec="seconds")
+        if not r.get("online"):
+            r["online"] = True
+            self.store.upsert_rider(rid, r["name"] or "Rider", r.get("phone", ""), True, r.get("lat"), r.get("lng"),
+                                    [o["id"] for o in self.state["orders"].values() if o["rider_id"] == rid], now)
+
     def gps(self, rid, lat, lng, now, order_id=None):
         if rid and lat is not None and lng is not None:
             r = self.rider(rid)
@@ -183,10 +197,52 @@ class Projector:
         o["partial"] = False
         self.finish(o, now)
 
-    def dispatched(self, o: dict, now: datetime):
-        """The order is (or must have been) offered to riders — start the PTOD clock if it isn't running."""
-        if not o.get("dispatched_at"):
-            o["dispatched_at"] = now
+    def dispatched(self, o: dict, now: datetime, exact: bool = False):
+        """The order is (or must have been) offered to riders — start the PTOD clock if it isn't running.
+        exact=True: this event IS the release (pickable).  Otherwise (rider accepted / started / arrived…)
+        the release happened earlier: if a planned delivery time is known, the clock starts at the release
+        moment (planned − lead) — a rider accepting at 12:50 an order released at 12:45 means 5 minutes of
+        waiting that belong to the PTOD."""
+        if o.get("dispatched_at"):
+            return
+        planned = o.get("eta_customer") or o.get("scheduled_at")
+        start = now
+        if planned is not None and not exact:
+            release = planned - timedelta(minutes=self.lead_min)
+            start = max(min(now, release), o.get("created_at") or release)
+        o["dispatched_at"] = start
+
+    def weak_dispatch(self, o: dict, now: datetime):
+        """A signal that only means "the order is in a tour" (created as dispatched, transition to dispatched,
+        tour created). For an ASAP order that IS the release; for a pre-order the tour sits on hold for hours.
+        Decide by the planned delivery time: released = planned − lead (MotionTools' automatic scheduling)."""
+        o["in_tour"] = True
+        if o.get("dispatched_at"):
+            return
+        planned = o.get("eta_customer") or o.get("scheduled_at")
+        if planned is None:
+            # no planned time known (yet): MotionTools sends the ETAs right after creation — wait for them briefly,
+            # then treat the order as ASAP (released at creation)
+            created = o.get("created_at")
+            if created and now - created >= timedelta(minutes=3):
+                self.dispatched(o, created)
+            return
+        release = planned - timedelta(minutes=self.lead_min)
+        if now >= release:
+            self.dispatched(o, now)
+
+    def release_due(self, now: datetime) -> int:
+        """Every sync: pre-orders whose release time has come move from On hold to Waiting for rider,
+        even if MotionTools sends no event for it."""
+        n = 0
+        for o in list(self.state["orders"].values()):
+            if o.get("dispatched_at") or o.get("cancelled") or o.get("closed_auto") or not o.get("in_tour"):
+                continue
+            self.weak_dispatch(o, now)
+            if o.get("dispatched_at"):
+                self.finish(o, now)
+                n += 1
+        return n
 
     def expire(self, now: datetime) -> int:
         """Close live orders that MotionTools stopped talking about (no event for STALE_HOURS)."""
@@ -234,6 +290,8 @@ class Projector:
                 o["created_at"] = o["last_event_at"] = now
                 o["status"] = d.get("status") or ""
                 o["dispatched_at"] = now if o["status"] in DISPATCHED else None      # pre-orders wait "on hold"
+                if o["status"] in ASSIGNED:
+                    self.weak_dispatch(o, now)                                        # ASAP order created straight into a tour
                 o["scheduled_at"] = ts(d.get("scheduled_at") or d.get("scheduled_for") or d.get("pickup_at")
                                        or d.get("earliest_pickup_at") or d.get("delivery_at")) or o.get("scheduled_at")
                 o["partial"] = False
@@ -262,16 +320,18 @@ class Projector:
                 elif to in DISPATCHED:
                     if to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)                                     # back to "pickable" = rider handed it back
-                    self.dispatched(o, now)                                      # PTOD clock starts here
+                    self.dispatched(o, now, exact=(to == "pickable"))            # PTOD clock starts here
                 elif to in ASSIGNED or to == "to_be_dispatched":
                     if o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)
                     if to in ASSIGNED:
-                        o["assigned_at"] = now                                   # in a tour, still on hold
+                        o["assigned_at"] = now                                   # in a tour — on hold or released?
+                        self.weak_dispatch(o, now)
                 o["status"] = to or o["status"]
             elif ev == "in_progress":
                 self.dispatched(o, now)
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now)
+                self.seen(d.get("driver_id"), now)
                 o["started_at"] = o["started_at"] or now
                 loc = d.get("driver_location") or {}
                 o["rider_lat"], o["rider_lng"] = loc.get("lat"), loc.get("lng")
@@ -284,9 +344,12 @@ class Projector:
                     eta = ts(s.get("eta"))
                     if eta:
                         o["eta_restaurant" if kind == "pickup" else "eta_customer"] = eta
+                if o.get("status") != "to_be_dispatched":
+                    self.weak_dispatch(o, now)
             elif ev in ("stop_arrived", "stop_completed", "stop_failed"):
                 self.dispatched(o, now)
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now)
+                self.seen(d.get("driver_id") or o.get("rider_id"), now)
                 kind = str(d.get("stop_type") or o["stop_types"].get(str(d.get("stop_id")), "")).lower()
                 who = o.get("rider") or d.get("driver_name") or ""
                 if kind in ("task", "return"):
@@ -310,6 +373,7 @@ class Projector:
                         o["cancelled"] = True
                         o["cancel_reason"] = "delivery failed"
             elif ev == "driver_location_updated":
+                self.seen(d.get("driver_id") or o.get("rider_id"), now)
                 loc = d.get("driver_location") or {}
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now) if d.get("driver_id") and not o["rider_id"] else None
                 o["rider_lat"], o["rider_lng"] = loc.get("lat"), loc.get("lng")
@@ -331,12 +395,17 @@ class Projector:
                 r["phone"] = self.phone_for(rid, r["mt_phone"])
             if ev == "online":
                 r["online"] = True
+                r["last_seen"] = now.isoformat(timespec="seconds")
                 loc = d.get("location") or {}
                 self.gps(rid, loc.get("lat"), loc.get("lng"), now)
             elif ev == "offline":
                 r["online"] = False
-            elif ev == "busy":
-                self.busy_at[rid] = now
+                r["offline_at"] = now.isoformat(timespec="seconds")
+            elif ev in ("busy", "no_longer_busy"):
+                r["last_seen"] = now.isoformat(timespec="seconds")
+                r["online"] = True
+                if ev == "busy":
+                    self.busy_at[rid] = now
             self.store.upsert_rider(rid, r["name"] or "Rider", r["phone"], r["online"], r.get("lat"), r.get("lng"),
                                     [o["id"] for o in self.state["orders"].values() if o["rider_id"] == rid], now)
             return name
@@ -354,7 +423,9 @@ class Projector:
                         o["assigned_at"] = now
                         o["tour_id"] = tid
                         if st in DISPATCHED:                                     # tours are usually created on hold
-                            self.dispatched(o, now)
+                            self.dispatched(o, now, exact=(st == "pickable"))
+                        else:
+                            self.weak_dispatch(o, now)
                         self.finish(o, now)
                 return name
             bookings = [self.state["orders"][b] for b in self.tours.get(tid, []) if b in self.state["orders"]]
@@ -375,14 +446,17 @@ class Projector:
                             o["rider_id"] = users[0]
                             o["rider"] = self.rider(users[0])["name"]
                             self.note(o, now, "accepted", users[0], o["rider"])
-                    elif to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
-                        self.release(o, now)                                     # tour offered again = handed back
-                        self.dispatched(o, now)
+                    elif to == "pickable":
+                        if o.get("rider_id") and not o.get("picked_up_at"):
+                            self.release(o, now)                                 # tour offered again = handed back
+                        self.dispatched(o, now, exact=True)
                     elif to == "en_route":
                         self.dispatched(o, now)
                         o["started_at"] = o["started_at"] or now
                     elif to in DISPATCHED:
                         self.dispatched(o, now)
+                    elif to in ASSIGNED:
+                        self.weak_dispatch(o, now)
                     elif to in DONE:
                         if not o.get("cancelled"):
                             o["delivered_at"] = o["delivered_at"] or now
@@ -397,6 +471,7 @@ class Projector:
             elif ev == "driver_location_updated":
                 for o in bookings:
                     o["rider_lat"], o["rider_lng"] = d.get("lat"), d.get("lng")
+                    self.seen(o["rider_id"], now)
                     self.gps(o["rider_id"], d.get("lat"), d.get("lng"), now, o["id"])
             return name
         return name

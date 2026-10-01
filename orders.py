@@ -38,9 +38,12 @@ class Rules:
     wait_customer_min: int = 5      # waiting at the customer
     stale_gps_min: int = 6          # no GPS update while riding
     target_within_pct: int = 90     # goal: this % of orders within ptod_target_min
+    release_lead_min: int = 45      # MotionTools releases a pre-order to riders this long before its planned delivery
+                                    # (MotionTools: automatic scheduling lead time) — used when no "pickable" event arrives
 
     EDITABLE = ("ptod_target_min", "ptod_warn_min", "accept_limit_min", "start_limit_min", "stationary_min",
-                "wrong_way_m", "late_grace_min", "wait_restaurant_min", "wait_customer_min", "target_within_pct")
+                "wrong_way_m", "late_grace_min", "wait_restaurant_min", "wait_customer_min", "target_within_pct",
+                "release_lead_min")
 
     def apply(self, values: dict):
         for k, v in values.items():
@@ -182,7 +185,7 @@ def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime]
             "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None, "accepted_at": None,
             "started_at": None, "at_restaurant_at": None, "picked_up_at": None, "at_customer_at": None,
             "delivered_at": None, "stops": 0, "customer_zip": "", "place_id": "", "cancel_reason": "",
-            "est_distance_m": None, "stop_types": {}, "partial": False, "history": [], "reassigned": 0, "tour_id": None}
+            "est_distance_m": None, "stop_types": {}, "partial": False, "history": [], "reassigned": 0, "tour_id": None, "in_tour": False}
 
 
 def phase_from(o: dict) -> str:

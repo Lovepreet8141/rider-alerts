@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "3.9"
+VERSION = "4.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -70,6 +70,7 @@ STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, 
                   "api_retry_at": None, "events": {}, "enriched": 0, "probe_at": None}}
 WAKE = asyncio.Event()
 projector = Projector(STATE, store, tracker, AREAS)
+projector.lead_min = rules.release_lead_min
 ENRICHED_RIDERS: dict = {}          # rider_id -> when we last read it through the API
 ENRICH_LOCK = asyncio.Lock()
 
@@ -223,13 +224,13 @@ async def enrich_order(bid: str, now: datetime = None) -> bool:
     return True
 
 
-async def enrich_rider(rid: str, now: datetime = None) -> bool:
+async def enrich_rider(rid: str, now: datetime = None, force: bool = False) -> bool:
     """Webhook mode: name + phone of a rider through /api/users/{id} (once a day per rider, if open)."""
     if not rid or not mt.enabled or mt.blocked(USER_PATH):
         return False
     now = now or datetime.now(UTC)
     last = ENRICHED_RIDERS.get(rid)
-    if last and now - last < timedelta(hours=24):
+    if last and now - last < timedelta(hours=24) and not force:
         return False
     ENRICHED_RIDERS[rid] = now
     u = await mt.get_user(rid)
@@ -243,6 +244,12 @@ async def enrich_rider(rid: str, now: datetime = None) -> bool:
     if mt_phone:
         r["mt_phone"] = mt_phone
         r["phone"] = projector.phone_for(rid, mt_phone)
+    if u.get("status") in ("online", "offline", "busy"):
+        r["online"] = u["status"] != "offline"
+        r["api_status_at"] = iso(now)
+    loc = u.get("location") or {}
+    if loc.get("lat") is not None:
+        r["lat"], r["lng"] = loc.get("lat"), loc.get("lng")
     if "rider" not in STATE["raw_samples"]:
         STATE["raw_samples"]["rider"] = u
     store.upsert_rider(rid, r["name"] or "Rider", r["phone"], r["online"], r.get("lat"), r.get("lng"),
@@ -296,6 +303,21 @@ async def enrich_after_event(p: dict):
         log.exception("enrichment failed: %s", e)
 
 
+async def recheck_offline_riders(now: datetime):
+    """Every 10 min: riders we show as OFFLINE while they hold an order — ask MotionTools (rider detail is open)
+    whether that is still true, at most 6 per run. A wrong 'offline' would otherwise raise a red alert for nothing."""
+    if mt.blocked(USER_PATH):
+        return
+    holding = {o["rider_id"] for o in STATE["orders"].values() if o["rider_id"] and o["phase"] not in ("on_hold",)}
+    todo = [rid for rid in holding if STATE["riders"].get(rid, {}).get("online") is False][:6]
+    changed = False
+    for rid in todo:
+        if await enrich_rider(rid, now, force=True):
+            changed = True
+    if changed:
+        evaluate_all(datetime.now(UTC))
+
+
 async def refresh_live_orders(now: datetime):
     """Webhook mode, every 5 min: re-read a few live orders through the detail endpoint if it is open.
     MotionTools gives restricted accounts a small HOURLY quota per endpoint, so the budget goes to the
@@ -340,6 +362,7 @@ def replay_events(max_lines: int = 60000) -> dict:
     state = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}}
     pj = Projector(state, _NullStore(), RiderTracker(), AREAS, keep_finished=True)
     pj.places = dict(projector.places)
+    pj.lead_min = rules.release_lead_min
     for line in lines:
         try:
             p = json.loads(line)
@@ -349,6 +372,7 @@ def replay_events(max_lines: int = 60000) -> dict:
             pj.apply(p)
         except Exception as e:            # one bad event must not stop the replay
             log.warning("replay skipped an event: %s", e)
+    pj.release_due(datetime.now(UTC))
     return state["orders"]
 
 
@@ -494,10 +518,14 @@ async def sync_loop():
                             await enrich_order(o["id"], now)
                 if last_refresh is None or (now - last_refresh) >= timedelta(minutes=5):
                     await refresh_live_orders(now)
+                    if int(now.timestamp() // 300) % 2 == 0:
+                        await recheck_offline_riders(now)
                     last_refresh = now
                     n = projector.expire(now)
                     if n:
                         store.log("info", f"{n} order(s) closed automatically — no MotionTools events for hours")
+                if projector.release_due(now):
+                    evaluate_all(now)
                 STATE["sync"]["orders_seen"] = len(STATE["orders"])
                 STATE["sync"]["riders_seen"] = sum(1 for r in STATE["riders"].values() if r.get("online"))
                 STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
@@ -643,6 +671,8 @@ def order_view(o: dict, now: datetime) -> dict:
             "alert_heads": [h for h in heads if h], "stack": STATE["stack"].get(o["id"]) if live else None,
             "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
+            "planned": hm(o.get("eta_customer") or o.get("scheduled_at")),
+            "release": hm((o.get("eta_customer") or o.get("scheduled_at")) - timedelta(minutes=rules.release_lead_min)) if (o.get("eta_customer") or o.get("scheduled_at")) and o["phase"] == "on_hold" else None,
             "waiting_min": int(mins(o.get("created_at"), now) or 0) if o["phase"] == "on_hold" else None}
 
 
@@ -874,13 +904,15 @@ def api_settings_get():
         "target_within_pct": "Goal: % of orders within target", "accept_limit_min": "Alert if nobody accepted after (min)",
         "start_limit_min": "Alert if accepted but not started after (min)", "stationary_min": "Alert if not moving for (min)",
         "wrong_way_m": "Alert if further from next stop by (metres)", "late_grace_min": "Alert if behind ETA by (min)",
-        "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)"}}
+        "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)",
+        "release_lead_min": "Pre-orders are released to riders this many min before the planned delivery (MotionTools auto-scheduling)"}}
 
 
 @app.post("/api/settings", dependencies=[Depends(require_login)])
 async def api_settings_set(request: Request):
     values = await request.json()
     rules.apply(values)
+    projector.lead_min = rules.release_lead_min
     store.set_settings({k: v for k, v in values.items() if k in Rules.EDITABLE})
     store.log("info", "thresholds changed: " + ", ".join(f"{k}={v}" for k, v in values.items() if k in Rules.EDITABLE))
     return {"ok": True, "rules": rules.as_dict()}
