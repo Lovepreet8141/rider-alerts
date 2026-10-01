@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v3.7)
+# Quickzi — Munich ops platform (v3.9)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -19,8 +19,8 @@ daily report of the evening before.
   calling that endpoint until the next hour and spends the quota on dispatched orders with open alerts first.
   Paths that answer 404 on this tenant (the documented `/api/bookings…` ones) are never asked again.
   The moment a list endpoint opens the server switches back to API mode on its own — no redeploy.
-  On startup, dispatch times of every order of the last 7 days (live and delivered) are repaired from the stored
-  raw events — so reports made before an upgrade get the right PTOD too.
+  On startup, every order of the last 7 days (live and delivered) is rebuilt by replaying the stored raw events —
+  dispatch moment, rider history, timestamps — so reports made before an upgrade are correct too.
 
 ## Tabs
 - **Live** — city pulse, the stage board (alerts shown on the order cards; tap a card for the story with
@@ -46,9 +46,10 @@ GPS-based alerts (not moving / no GPS / wrong direction) only fire for riders we
 **Double orders** (two bookings in one tour): each order keeps its own PTOD clock from its own dispatch. The order
 whose next stop has the earliest ETA is the one the rider is doing now; the other is *queued* — shown on the card
 ("double with X — rider is doing X first") and exempt from riding/waiting alerts until it is the current one.
-**Hand-backs**: when a rider releases an order (tour offered again, or another rider takes it), the order history
-records accepted by A → handed back by A → accepted by B; the story shows it, the card says "handed back 1×",
-the Riders tab counts hand-backs per rider, and "accept" minutes measure the wait until the final rider.
+**Redispatched orders**: every order keeps a rider-by-rider history — accepted by A, arrived at restaurant (A),
+handed back by A, accepted by B, picked up (B), delivered (B)… The story shows all of it, the card says
+"redispatched 2×", the Riders tab counts hand-backs per rider, and the phase minutes belong to the rider who
+actually delivered (a hand-back resets accepted/started/arrived for the next rider).
 
 ## Alerts (PTOD clock starts at dispatch; thresholds editable in Settings)
 No rider (5 min) · accepted but not started (3 min) · not moving / no GPS (4 min) · wrong direction (400 m) ·

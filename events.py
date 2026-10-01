@@ -35,8 +35,9 @@ STALE_HOURS = 3           # a live order without any MotionTools event for this 
 
 
 class Projector:
-    def __init__(self, state: dict, store, tracker, areas: list):
+    def __init__(self, state: dict, store, tracker, areas: list, keep_finished: bool = False):
         self.state, self.store, self.tracker, self.areas = state, store, tracker, areas
+        self.keep_finished = keep_finished     # replay mode: finished orders stay in state so their story can be copied
         self.tours: dict = {}          # tour_id -> [booking_id]
         self.busy_at: dict = {}        # driver_id -> time the driver last became busy (≈ accepted an order)
         self.places: dict = {}         # place_id -> restaurant name (editable in Settings / filled from the API)
@@ -86,6 +87,7 @@ class Projector:
             else:
                 o = new_order(bid, d.get("external_id") or "", d.get("service_area_id"), now)
                 o["partial"] = True                   # we did not see this order's creation
+                o["dispatched_at"] = None             # ...so it counts as on hold until a rider-facing event arrives
             self.state["orders"][bid] = o
         if d.get("external_id"):
             o["ref"] = d["external_id"]
@@ -106,8 +108,10 @@ class Projector:
     def note(o: dict, now: datetime, what: str, rid=None, name: str = ""):
         """Order history shown in the story: who accepted, who handed it back, who took it next."""
         h = o.setdefault("history", [])
+        if h and h[-1]["what"] == what and h[-1]["rider_id"] == rid and h[-1]["at"] == now.isoformat(timespec="seconds"):
+            return
         h.append({"at": now.isoformat(timespec="seconds"), "what": what, "rider_id": rid, "rider": name or ""})
-        del h[:-30]
+        del h[:-40]
 
     def release(self, o: dict, now: datetime, why: str = "released"):
         """The rider who had this order no longer has it (handed back / unassigned by the dispatcher)."""
@@ -117,6 +121,8 @@ class Projector:
         o["reassigned"] = (o.get("reassigned") or 0) + 1
         o["rider_id"], o["rider"] = None, ""
         o["accepted_at"], o["started_at"] = None, None          # the next rider's acceptance counts from here
+        if not o.get("picked_up_at"):
+            o["at_restaurant_at"], o["at_customer_at"] = None, None
 
     def set_rider(self, o: dict, rid, name, now):
         if rid:
@@ -128,7 +134,9 @@ class Projector:
             o["rider"] = name or r["name"] or o["rider"]
             if not o["accepted_at"]:
                 busy = self.busy_at.get(rid)
-                o["accepted_at"] = busy if busy and now - busy < timedelta(minutes=20) else now
+                fresh = busy and now - busy < timedelta(minutes=20) and (not o.get("dispatched_at") or busy >= o["dispatched_at"]) \
+                    and not any(h["what"] == "released" and h["at"] > busy.isoformat(timespec="seconds") for h in o.get("history") or [])
+                o["accepted_at"] = busy if fresh else now
             if new_rider:
                 self.note(o, now, "accepted", rid, o["rider"])
 
@@ -196,14 +204,15 @@ class Projector:
         o["phase"] = phase_from(o)
         stacked = o["rider_id"] and sum(1 for x in self.state["orders"].values()
                                         if x["rider_id"] == o["rider_id"] and x["phase"] not in ("delivered", "cancelled")) >= 2
-        self.store.upsert_order(o, now, stacked=bool(stacked))
+        self.store.upsert_order(o, now, stacked=bool(stacked), force=True)   # events are the full truth — no merging
         if o["phase"] in ("delivered", "cancelled", "closed"):
             why = {"closed": "order closed (no events)"}.get(o["phase"], o["phase"])
             for key in [k for k in self.state["open_alerts"] if k[0] == o["id"]]:
                 self.store.resolve_alert(self.state["open_alerts"].pop(key), why, now)
                 self.state["sev"].pop(key, None)
                 self.state.get("heads", {}).pop(key, None)
-            self.state["orders"].pop(o["id"], None)
+            if not self.keep_finished:
+                self.state["orders"].pop(o["id"], None)
 
     # ---------------- the event switch ----------------
     def apply(self, p: dict) -> str:
@@ -249,6 +258,7 @@ class Projector:
                 elif to == "cancelled":
                     o["cancelled"] = True
                     o["cancel_reason"] = o.get("cancel_reason") or "cancelled in MotionTools"
+                    self.note(o, now, "cancelled", o.get("rider_id"), o.get("rider") or "")
                 elif to in DISPATCHED:
                     if to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)                                     # back to "pickable" = rider handed it back
@@ -278,21 +288,27 @@ class Projector:
                 self.dispatched(o, now)
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now)
                 kind = str(d.get("stop_type") or o["stop_types"].get(str(d.get("stop_id")), "")).lower()
+                who = o.get("rider") or d.get("driver_name") or ""
                 if kind in ("task", "return"):
                     pass
                 elif ev == "stop_arrived":
                     key = "at_restaurant_at" if kind == "pickup" else "at_customer_at"
                     o[key] = o[key] or now
+                    self.note(o, now, "arrived_restaurant" if kind == "pickup" else "arrived_customer", o.get("rider_id"), who)
                 elif ev == "stop_completed":
                     if kind == "pickup":
                         o["picked_up_at"] = o["picked_up_at"] or now
                         o["at_restaurant_at"] = o["at_restaurant_at"] or now
+                        self.note(o, now, "picked_up", o.get("rider_id"), who)
                     else:
                         o["at_customer_at"] = o["at_customer_at"] or now
                         o["delivered_at"] = o["delivered_at"] or now
-                elif ev == "stop_failed" and kind == "dropoff":
-                    o["cancelled"] = True
-                    o["cancel_reason"] = "delivery failed"
+                        self.note(o, now, "delivered", o.get("rider_id"), who)
+                elif ev == "stop_failed":
+                    self.note(o, now, "pickup_failed" if kind == "pickup" else "delivery_failed", o.get("rider_id"), who)
+                    if kind == "dropoff":
+                        o["cancelled"] = True
+                        o["cancel_reason"] = "delivery failed"
             elif ev == "driver_location_updated":
                 loc = d.get("driver_location") or {}
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now) if d.get("driver_id") and not o["rider_id"] else None

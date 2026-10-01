@@ -141,7 +141,8 @@ class Store:
                        (k, str(v)))
 
     # ================================================================ orders
-    def upsert_order(self, o: dict, now: datetime, stacked: bool):
+    def upsert_order(self, o: dict, now: datetime, stacked: bool, force: bool = False):
+        """force=True (repair from events): the given timestamps/rider replace what is stored, instead of being merged."""
         pm = phase_minutes(o)
         closed = 1 if o["phase"] in ("delivered", "cancelled", "closed") else 0
         existing = self._rows("SELECT first_seen, stacked, cancelled_at FROM orders WHERE id=?", (o["id"],))
@@ -151,22 +152,27 @@ class Store:
         if o["phase"] == "cancelled":
             cancelled_at = (existing[0]["cancelled_at"] if existing and existing[0]["cancelled_at"] else iso(now))
         raw = json.dumps({k: (iso(v) if isinstance(v, datetime) else v) for k, v in o.items()})
+        merge = ("rider_id=COALESCE(excluded.rider_id, orders.rider_id), rider=CASE WHEN excluded.rider!='' THEN excluded.rider ELSE orders.rider END, "
+                 "accepted_at=COALESCE(excluded.accepted_at, orders.accepted_at), "
+                 "started_at=COALESCE(excluded.started_at, orders.started_at), "
+                 "at_restaurant_at=COALESCE(excluded.at_restaurant_at, orders.at_restaurant_at), "
+                 "picked_up_at=COALESCE(excluded.picked_up_at, orders.picked_up_at), "
+                 "at_customer_at=COALESCE(excluded.at_customer_at, orders.at_customer_at), "
+                 "delivered_at=COALESCE(excluded.delivered_at, orders.delivered_at), ptod_min=COALESCE(excluded.ptod_min, orders.ptod_min), ")
+        if force:
+            merge = ("rider_id=excluded.rider_id, rider=excluded.rider, accepted_at=excluded.accepted_at, started_at=excluded.started_at, "
+                     "at_restaurant_at=excluded.at_restaurant_at, picked_up_at=excluded.picked_up_at, at_customer_at=excluded.at_customer_at, "
+                     "delivered_at=excluded.delivered_at, ptod_min=excluded.ptod_min, ")
         self._exec(
             "INSERT INTO orders (id, ref, area, rider_id, rider, restaurant, place_id, customer_addr, customer_zip, status, "
             "phase, stacked, dispatched_at, accepted_at, started_at, at_restaurant_at, picked_up_at, at_customer_at, "
             "delivered_at, cancelled_at, cancel_reason, ptod_min, closed, first_seen, updated_at, raw) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET ref=excluded.ref, area=excluded.area, "
-            "rider_id=COALESCE(excluded.rider_id, orders.rider_id), rider=CASE WHEN excluded.rider!='' THEN excluded.rider ELSE orders.rider END, "
+            "ON CONFLICT(id) DO UPDATE SET ref=excluded.ref, area=excluded.area, " + merge +
             "restaurant=excluded.restaurant, place_id=excluded.place_id, customer_addr=excluded.customer_addr, "
             "customer_zip=excluded.customer_zip, status=excluded.status, phase=excluded.phase, stacked=excluded.stacked, "
-            "dispatched_at=excluded.dispatched_at, accepted_at=COALESCE(excluded.accepted_at, orders.accepted_at), "
-            "started_at=COALESCE(excluded.started_at, orders.started_at), "
-            "at_restaurant_at=COALESCE(excluded.at_restaurant_at, orders.at_restaurant_at), "
-            "picked_up_at=COALESCE(excluded.picked_up_at, orders.picked_up_at), "
-            "at_customer_at=COALESCE(excluded.at_customer_at, orders.at_customer_at), "
-            "delivered_at=COALESCE(excluded.delivered_at, orders.delivered_at), cancelled_at=excluded.cancelled_at, "
-            "cancel_reason=excluded.cancel_reason, ptod_min=COALESCE(excluded.ptod_min, orders.ptod_min), "
+            "dispatched_at=excluded.dispatched_at, cancelled_at=excluded.cancelled_at, "
+            "cancel_reason=excluded.cancel_reason, "
             "closed=excluded.closed, updated_at=excluded.updated_at, raw=excluded.raw",
             (o["id"], o["ref"], o["area"], o["rider_id"], o["rider"] or "", o["restaurant"], o.get("place_id", ""),
              o["customer_addr"], o.get("customer_zip", ""), o["status"], o["phase"], stacked_flag,

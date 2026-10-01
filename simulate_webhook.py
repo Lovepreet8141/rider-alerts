@@ -111,8 +111,11 @@ EVENTS += [ev("booking", "created", m(-15), booking_id="b-hb", external_id="HB12
            ev("booking", "transition", m(-14), booking_id="b-hb", external_id="HB1234", **{"from": "to_be_dispatched", "to": "pickable", "event": "ready_to_pick"}),
            ev("tour", "created", m(-14), tour_id="t-hb", dispatched_booking_ids=["b-hb"], status="pickable"),
            ev("tour", "transition", m(-13), tour_id="t-hb", **{"from": "pickable", "to": "claimed", "event": "claim"}, affected_user_ids=["r-sven"]),
+           ev("booking", "in_progress", m(-12), booking_id="b-hb", external_id="HB1234", driver_id="r-sven", driver_name="Sven B.", driver_location={"lat": 48.14, "lng": 11.56}),
+           ev("booking", "stop_arrived", m(-9), booking_id="b-hb", external_id="HB1234", driver_id="r-sven", driver_name="Sven B.", stop_id="b-hb-p", stop_type="pickup", stop_position=1),
            ev("tour", "transition", m(-7), tour_id="t-hb", **{"from": "claimed", "to": "pickable", "event": "unclaim"}, affected_user_ids=["r-sven"]),
-           ev("booking", "in_progress", m(-3), booking_id="b-hb", external_id="HB1234", driver_id="r-ahmad", driver_name="Ahmad Sabe", driver_location={"lat": 48.14, "lng": 11.56})]
+           ev("booking", "in_progress", m(-3), booking_id="b-hb", external_id="HB1234", driver_id="r-ahmad", driver_name="Ahmad Sabe", driver_location={"lat": 48.14, "lng": 11.56}),
+           ev("tour", "force_assigned", m(-1), tour_id="t-hb", driver_id="r-murat")]
 # an order MotionTools stopped talking about 4 h ago -> must be closed automatically, alerts resolved
 EVENTS += order_events("OLD999", "b-old", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -250, wait_min=None)
 EVENTS.sort(key=lambda e: e["timestamp"])

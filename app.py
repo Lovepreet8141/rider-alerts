@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "3.7"
+VERSION = "3.9"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -316,70 +316,80 @@ async def refresh_live_orders(now: datetime):
         evaluate_all(datetime.now(UTC))
 
 
-def repair_from_events(now: datetime) -> int:
-    """One-time repair after upgrading: earlier versions started the PTOD clock at booking.created.
-    Re-read the stored raw events and set dispatched_at to the real dispatch moment (or none = on hold)."""
+class _NullStore:
+    """Store stand-in for replays: the projector's side effects go nowhere."""
+    def get_settings(self): return {}
+    def set_settings(self, v): pass
+    def order(self, bid): return None
+    def upsert_order(self, *a, **k): pass
+    def record_position(self, *a, **k): pass
+    def upsert_rider(self, *a, **k): pass
+    def resolve_alert(self, *a, **k): pass
+    def log(self, *a, **k): pass
+
+
+def replay_events(max_lines: int = 60000) -> dict:
+    """Rebuild every order of the stored raw events from scratch (same rules as live), finished ones included."""
     path = DATA_DIR / "events.jsonl"
     if not path.exists():
-        return 0
+        return {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-60000:]
+        lines = path.read_text(encoding="utf-8").splitlines()[-max_lines:]
     except Exception:
-        return 0
-    disp, created, tours = {}, {}, {}
+        return {}
+    state = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}}
+    pj = Projector(state, _NullStore(), RiderTracker(), AREAS, keep_finished=True)
+    pj.places = dict(projector.places)
     for line in lines:
         try:
             p = json.loads(line)
         except Exception:
             continue
-        d = p.get("data") or {}
-        rtype, ev, t = p.get("resource_type"), p.get("event"), ts(p.get("timestamp"))
-        if not t:
-            continue
-        if rtype == "booking":
-            bid = d.get("booking_id")
-            if not bid:
-                continue
-            if ev == "created":
-                created[bid] = (t, d.get("status") or "")
-                if created[bid][1] in DISPATCHED:
-                    disp.setdefault(bid, t)
-            elif ev == "transition" and str(d.get("to")) in DISPATCHED:
-                disp.setdefault(bid, t)
-            elif ev in ("in_progress", "stop_arrived", "stop_completed", "stop_failed"):
-                disp.setdefault(bid, t)
-        elif rtype == "tour":
-            tid = d.get("tour_id")
-            if ev == "created":
-                ids = d.get("dispatched_booking_ids") or []
-                tours[tid] = [ids] if isinstance(ids, str) else list(ids)
-                if str(d.get("status") or "") in DISPATCHED:
-                    for b in tours[tid]:
-                        disp.setdefault(b, t)
-            elif (ev == "transition" and str(d.get("to") or "") in DISPATCHED) or ev == "force_assigned":
-                for b in tours.get(tid, []):
-                    disp.setdefault(b, t)
-    # every order of the last 7 days (delivered ones too — reports and the Orders tab use them), live objects first
+        try:
+            pj.apply(p)
+        except Exception as e:            # one bad event must not stop the replay
+            log.warning("replay skipped an event: %s", e)
+    return state["orders"]
+
+
+COPY_TIMES = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
+              "at_customer_at", "delivered_at", "scheduled_at", "last_event_at", "eta_at")
+
+
+def repair_from_events(now: datetime) -> int:
+    """At startup: replay the stored events and give every order of the last 7 days the full, correct story —
+    real dispatch moment (on hold until pickable), every rider who had it (accepted / handed back / arrived / ...),
+    and the timestamps of the rider who actually delivered.  Enrichment (names, addresses, phones) is kept."""
+    replayed = replay_events()
+    if not replayed:
+        return 0
     targets = {o["id"]: o for o in store.orders_in("week", now)}
     targets.update(STATE["orders"])
     n = 0
-    for o in targets.values():
-        if o.get("repaired"):
+    for bid, o in targets.items():
+        r = replayed.get(bid)
+        if r is None:
             continue
-        bid = o["id"]
         finished = o["phase"] in ("delivered", "cancelled", "closed")
-        if bid in disp:
-            o["dispatched_at"] = disp[bid]
-        elif bid in created and not finished and not o.get("rider_id") and not o.get("accepted_at"):
-            o["dispatched_at"] = None                       # created, never offered to riders -> on hold
-        else:
-            continue
-        if bid in created:
-            o["created_at"] = created[bid][0]
-        o["repaired"] = True
-        if not finished:
-            o["phase"] = phase_from(o)
-        store.upsert_order(o, now, stacked=bool(o.get("stacked")))
+        if r.get("partial") and not r.get("history"):
+            continue                                        # we saw almost nothing of this order — leave it
+        for k in COPY_TIMES:
+            if not r.get("partial") or r.get(k) is not None:
+                o[k] = r.get(k)
+        for k in ("history", "reassigned", "tour_id", "stop_types", "eta_restaurant", "eta_customer", "status"):
+            if r.get(k) not in (None, [], {}):
+                o[k] = r[k]
+        if r.get("rider_id") or r.get("reassigned"):
+            o["rider_id"], o["rider"] = r.get("rider_id"), r.get("rider") or ""
+        if r.get("place_id") and not o.get("place_id"):
+            o["place_id"] = r["place_id"]
+            o["restaurant"] = projector.restaurant_name(r["place_id"])
+        if r.get("cancelled"):
+            o["cancelled"] = True
+            o["cancel_reason"] = o.get("cancel_reason") or r.get("cancel_reason") or ""
+        if not finished or r["phase"] in ("delivered", "cancelled"):
+            o["phase"] = phase_from(r) if not finished else r["phase"]
+        store.upsert_order(o, now, stacked=bool(o.get("stacked")), force=True)
         n += 1
     return n
 
@@ -555,7 +565,9 @@ async def startup():
         n = repair_from_events(now)
         if n:
             on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
-            store.log("info", f"repaired dispatch times of {n} orders of the last 7 days from the stored events ({on_hold} live orders now on hold)")
+            for o in [x for x in STATE["orders"].values() if x["phase"] in ("delivered", "cancelled")]:
+                projector.finish(o, now)              # finished while we were down -> out of the live board
+            store.log("info", f"rebuilt {n} orders of the last 7 days from the stored events ({on_hold} live orders on hold)")
     except Exception as e:
         log.exception("repair failed: %s", e)
     if not DASH_PASSWORD:
@@ -771,6 +783,45 @@ def api_order(oid: str):
                  "route_url": "https://www.google.com/maps/dir/" + "/".join(way) if len(way) >= 2 else "",
                  "times": {k: iso(o.get(k + "_at")) for k in ("dispatched", "accepted", "started", "at_restaurant", "picked_up", "at_customer", "delivered", "cancelled")}})
     return view
+
+
+@app.get("/api/orders/{oid}/events", dependencies=[Depends(require_login)])
+def api_order_events(oid: str):
+    """Every raw MotionTools event that touched this order (booking events + its tour's events) — the ground truth."""
+    path = DATA_DIR / "events.jsonl"
+    if not path.exists():
+        return {"events": []}
+    tours = {tid for tid, ids in projector.tours.items() if oid in ids}
+    out = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-60000:]
+    except Exception:
+        return {"events": []}
+    for line in lines:
+        if oid not in line and not any(t in line for t in tours):
+            continue
+        try:
+            p = json.loads(line)
+        except Exception:
+            continue
+        d = p.get("data") or {}
+        ids = d.get("dispatched_booking_ids") or []
+        hit = d.get("booking_id") == oid or (isinstance(ids, list) and oid in ids) or (d.get("tour_id") in tours)
+        if not hit:
+            continue
+        if d.get("tour_id") and p.get("resource_type") == "tour":
+            tours.add(d["tour_id"])
+        users = d.get("affected_user_ids") or []
+        out.append({"at": p.get("timestamp"), "name": f"{p.get('resource_type')}.{p.get('event')}",
+                    "detail": " ".join(x for x in [
+                        f"{d['from']} → {d['to']}" if d.get("to") else "",
+                        f"({d['event']})" if d.get("event") else "",
+                        f"status={d['status']}" if d.get("status") and not d.get("to") else "",
+                        f"stop={d['stop_type']}" if d.get("stop_type") else "",
+                        f"driver={d.get('driver_name') or d.get('driver_id')}" if d.get("driver_id") or d.get("driver_name") else "",
+                        f"users={','.join(users) if isinstance(users, list) else users}" if users else "",
+                        f"tour={str(d['tour_id'])[:8]}" if d.get("tour_id") else ""] if x)})
+    return {"events": out[-80:]}
 
 
 @app.get("/api/riders/{rid}", dependencies=[Depends(require_login)])
