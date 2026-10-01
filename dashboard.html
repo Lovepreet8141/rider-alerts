@@ -61,7 +61,7 @@
 </head>
 <body>
 <header>
-  <h1 id="title" title="dashboard v4.7">Quickzi · Ops</h1>
+  <h1 id="title" title="dashboard v4.8">Quickzi · Ops</h1>
   <nav id="nav"><a href="#live" class="active">Live</a><a href="#orders">Orders</a><a href="#riders">Riders</a><a href="#insights">Insights</a><a href="#daily">Daily report</a><a href="#settings">Settings</a></nav>
   <span class="sp"></span>
   <span class="muted"><span id="dot" class="dot"></span><span id="updated">connecting…</span></span>
@@ -281,7 +281,7 @@ function renderInsights(d){ const w=d.within_pct;
   const reasons=Object.entries(d.late_reasons||{}); const reasonLine=reasons.length||d.late_without_reason?`<p class="muted" style="margin:0 0 8px">Reasons given: ${reasons.map(([r,n])=>`<b>${esc(r)}</b> ${n}`).join(" · ")||"none"}${d.late_without_reason?` · <span class="tag amber">${d.late_without_reason} without reason</span>`:""}</p>`:"";
   document.getElementById("lateOrders").innerHTML=d.late_orders.length?reasonLine+`<table><tr><th>Order</th><th>Rider</th><th class="n">PTOD</th><th>Where the time went</th><th>Reason</th></tr>${d.late_orders.map(o=>{const p=o.phases; const worst=Object.entries(PH).map(([k])=>[k,(p[k]||0)-(d.phases[k]||0)]).sort((a,b)=>b[1]-a[1])[0]; return `<tr class="click" data-order="${o.id}"><td><b>${esc(o.ref)}</b><br><span class="muted">${esc(o.restaurant)}</span></td><td>${esc(o.rider)}</td><td class="n bad"><b>${f1(o.ptod)}′</b></td><td>${PH[worst[0]]} <b>${f1(p[worst[0]])}′</b> <span class="muted">(+${f1(worst[1])} vs avg)</span></td><td class="muted">${o.reason?`📝 ${esc(o.reason)}`:`<span class="tag amber">add reason</span>`}</td></tr>`;}).join("")}</table>`:`<div class="muted">No late orders 🎉</div>`;
   document.getElementById("alertlog").innerHTML=d.recent_alerts.length?`<div class="muted" style="margin-bottom:6px">${d.alerts_total} alerts · ${d.handled} marked handled · ${Object.entries(d.alerts_by_kind).map(([k,v])=>`${KIND[k]||k} ${v}`).join(" · ")}</div><table><tr><th>When</th><th>Type</th><th>Order</th><th>Rider</th><th>What</th><th>Outcome</th></tr>${d.recent_alerts.slice(0,40).map(a=>`<tr class="click" data-order="${a.order_id}"><td>${dhm(a.opened_at)}</td><td><span class="tag ${a.severity}">${KIND[a.kind]||a.kind}</span></td><td>${esc(a.order_ref)}</td><td>${esc(a.rider)}</td><td>${esc(a.headline)}</td><td>${a.dismissed_at?"handled ✓":a.resolved_at?esc(a.resolution)+` after ${Math.max(0,Math.round((new Date(a.resolved_at)-new Date(a.opened_at))/60000))} min`:"open"}</td></tr>`).join("")}</table>`:`<div class="muted">No alerts in this period.</div>`; }
-async function loadInsights(){ try{ const d=await api(`/api/insights?period=${P.insights}`); SESSIONS_OK=!!d.sessions_ok; renderInsights(d); }catch(e){} }
+async function loadInsights(){ try{ const d=await api(`/api/insights?period=${P.insights}`); SESSIONS_OK=!!d.sessions_ok; renderInsights(d); }catch(e){ document.getElementById("kpis").innerHTML=`<div class="empty" style="grid-column:1/-1">Insights could not be loaded (${esc(e.message||e)}). Settings → System → Log shows the reason.</div>`; } }
 
 /* ---------------- DAILY ---------------- */
 async function loadDaily(){ const d=await api(`/api/daily${day?"?day="+day:""}`); SESSIONS_OK=!!d.sessions_ok; day=d.day; document.getElementById("dayPick").value=day; document.getElementById("csvDay").href=`/export.csv?period=${day}`;

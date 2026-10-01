@@ -144,7 +144,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.7"
+VERSION = "4.8"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -511,12 +511,12 @@ def repair_from_events(now: datetime) -> int:
         if r.get("partial") and not r.get("history"):
             continue                                        # we saw almost nothing of this order — leave it
         for k in COPY_TIMES:
-            if not r.get("partial") or r.get(k) is not None:
-                o[k] = r.get(k)
+            if r.get(k) is not None or (not r.get("partial") and not finished and k in ("dispatched_at", "accepted_at", "started_at")):
+                o[k] = r.get(k)                             # a finished order never loses a timestamp to a gap in the event log
         for k in ("history", "reassigned", "tour_id", "stop_types", "eta_restaurant", "eta_customer", "status"):
             if r.get(k) not in (None, [], {}):
                 o[k] = r[k]
-        if r.get("rider_id") or r.get("reassigned"):
+        if r.get("rider_id") or (r.get("reassigned") and not finished):
             o["rider_id"], o["rider"] = r.get("rider_id"), r.get("rider") or ""
         if r.get("place_id") and not o.get("place_id"):
             o["place_id"] = r["place_id"]
@@ -716,6 +716,13 @@ async def startup():
         await asyncio.get_event_loop().run_in_executor(None, housekeeping, now, True)
     except Exception as e:
         log.exception("housekeeping failed: %s", e)
+    try:
+        backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
+        store.backup_to(str(backup))
+        for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db"))[:-3]:
+            old_b.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("backup failed: %s", e)
     try:
         n = repair_from_events(now)
         if n:
@@ -917,7 +924,12 @@ async def api_probe():
 @app.get("/api/insights", dependencies=[Depends(require_login)])
 def api_insights(period: str = "today"):
     _check_period(period)
-    return store.insights(period, datetime.now(UTC), rules, sessions_ok=STATE['sync']['mode'] == 'api')
+    try:
+        return store.insights(period, datetime.now(UTC), rules, sessions_ok=STATE['sync']['mode'] == 'api')
+    except Exception as e:
+        log.exception("insights failed")
+        store.log("error", f"insights failed: {e}"[:300])
+        raise HTTPException(500, f"insights failed: {e}")
 
 
 def _check_period(period):

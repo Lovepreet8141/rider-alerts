@@ -377,6 +377,13 @@ class Store:
         self._exec("DELETE FROM rider_sessions WHERE online_at < ?", (iso(now - timedelta(days=60)),))
         self._exec("DELETE FROM alerts WHERE opened_at < ?", (iso(now - timedelta(days=90)),))
 
+    def backup_to(self, path: str):
+        import sqlite3 as _sq
+        with self.lock:
+            dst = _sq.connect(path)
+            self.db.backup(dst)
+            dst.close()
+
     def db_size_bytes(self) -> int:
         try:
             page, cnt = self.db.execute("PRAGMA page_size").fetchone()[0], self.db.execute("PRAGMA page_count").fetchone()[0]
