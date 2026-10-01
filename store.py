@@ -6,11 +6,12 @@ Tables
   riders          last known state per rider
   rider_sessions  online/offline sessions (for hours online, utilisation, staffing per hour)
   positions       GPS trail of riders while they hold an order (kept 7 days)
-  daily_stats     frozen report per operating day (written at 04:05, or on demand)
+  daily_stats     frozen report per operating day (frozen 5 min after the day rolls over, or on demand)
   settings        editable thresholds
   syslog          what the system did / errors (for the System panel)
 
-Operating day = 04:00 -> 04:00 Berlin, so orders after midnight belong to the evening before.
+Operating day = midnight -> midnight Berlin by default (Settings: "operating day starts at"; 4 would make
+orders after midnight count for the evening before).
 """
 from __future__ import annotations
 
@@ -26,7 +27,16 @@ from statistics import mean, median
 
 from orders import BERLIN, UTC, haversine_m, iso, mins, on_time, phase_minutes, ts
 
-DAY_STARTS_AT = 4
+DAY_STARTS_AT = 0          # hour (Berlin) at which the operating day starts — set from Settings at startup
+
+
+def set_day_start(hour) -> int:
+    global DAY_STARTS_AT
+    try:
+        DAY_STARTS_AT = max(0, min(23, int(hour)))
+    except (TypeError, ValueError):
+        pass
+    return DAY_STARTS_AT
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -271,6 +281,28 @@ class Store:
     def order(self, oid: str):
         rows = self._rows("SELECT * FROM orders WHERE id=?", (oid,))
         return self._hydrate(rows[0]) if rows else None
+
+    def delete_day(self, day: str, now: datetime, dry_run: bool = False) -> dict:
+        """Wipe one operating day that was recorded wrongly: its finished orders, their alerts and GPS points, and the
+        frozen report. Live orders are never touched. dry_run only counts."""
+        start, end = period_range(day, now)
+        a, b = iso(start), iso(end)
+        where = "closed=1 AND COALESCE(dispatched_at, first_seen) >= ? AND COALESCE(dispatched_at, first_seen) < ?"
+        ids = [r["id"] for r in self._rows(f"SELECT id FROM orders WHERE {where}", (a, b))]
+        alerts = self._rows("SELECT COUNT(*) AS n FROM alerts WHERE opened_at >= ? AND opened_at < ?", (a, b))[0]["n"]
+        reports = self._rows("SELECT COUNT(*) AS n FROM daily_stats WHERE day=?", (day,))[0]["n"]
+        out = {"day": day, "orders": len(ids), "alerts": alerts, "reports": reports, "deleted": False}
+        if dry_run or not (ids or alerts or reports):
+            return out
+        with self.lock:
+            self.db.execute(f"DELETE FROM orders WHERE {where}", (a, b))
+            self.db.execute("DELETE FROM alerts WHERE opened_at >= ? AND opened_at < ?", (a, b))
+            self.db.execute("DELETE FROM positions WHERE at >= ? AND at < ?", (a, b))
+            self.db.execute("DELETE FROM daily_stats WHERE day=?", (day,))
+            self.db.commit()
+        out["deleted"] = True
+        self.log("info", f"data of {day} deleted on request: {len(ids)} orders, {alerts} alerts, {reports} frozen report(s)")
+        return out
 
     def delivered(self, period: str, now: datetime) -> list:
         return [o for o in self.orders_in(period, now) if o["phase"] == "delivered" and o["delivered_at"]]

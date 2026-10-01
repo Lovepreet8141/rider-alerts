@@ -42,10 +42,11 @@ class Rules:
                                     # (MotionTools: automatic scheduling lead time) — used when no "pickable" event arrives
     plan_grace_min: int = 5         # "on time vs plan": delivered no later than the planned delivery time + this
     riders_capacity_per_hour: int = 2   # orders one rider can deliver per hour (staffing plan for tomorrow)
+    day_start_hour: int = 0         # the operating day starts at this hour (Berlin): 0 = midnight; 4 = night orders belong to the evening before
 
     EDITABLE = ("ptod_target_min", "ptod_warn_min", "accept_limit_min", "start_limit_min", "stationary_min",
                 "wrong_way_m", "late_grace_min", "wait_restaurant_min", "wait_customer_min", "target_within_pct",
-                "release_lead_min", "plan_grace_min", "riders_capacity_per_hour")
+                "release_lead_min", "plan_grace_min", "riders_capacity_per_hour", "day_start_hour")
 
     def apply(self, values: dict):
         for k, v in values.items():

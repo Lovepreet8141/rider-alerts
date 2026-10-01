@@ -1,8 +1,8 @@
-# Quickzi — Munich ops platform (v5.1)
+# Quickzi — Munich ops platform (v5.2)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
-volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
-daily report of the evening before.
+volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
+(Berlin) it freezes the daily report of the day that just ended.
 
 ## Two ways to get the truth from MotionTools — chosen automatically
 - **API mode** — the token may read bookings: every 30 s all active orders (full timeline) + all riders (online, GPS).
@@ -50,10 +50,12 @@ daily report of the evening before.
   staffing hour by hour, restaurants by rider wait (each row shows
   its order numbers; tap → every order of that restaurant with wait/PTOD/alerts, and a box to name an unnamed
   MotionTools place — the name is applied to all its past orders too), districts by postcode, late orders, alert log.
-- **Daily report** — 14-day trend, frozen report per operating day (04:00 → 04:00), team briefing text (includes the
+- **Daily report** — 14-day trend, frozen report per operating day (midnight → midnight Berlin; Settings →
+  *operating day starts at* moves it, e.g. 4 so night orders count for the evening before), team briefing text (includes the
   on-time % and tomorrow's riders for the peak hours), CSV.
 - **Settings** — alert thresholds; restaurant names (by MotionTools place id); rider phone numbers;
-  system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples.
+  system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples;
+  **delete one day's data** (for a day that was recorded wrongly: check first, then confirm — live orders are kept).
 
 ## Order stages (Live tab board, always in this order)
 Waiting for rider · Accepted, not started · Riding to restaurant · At restaurant · Delivering · At customer · **On hold**.

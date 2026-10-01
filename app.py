@@ -31,6 +31,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from events import DISPATCHED, Projector
 from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, ts
+import store as store_mod
 from store import Store, day_key, day_start
 
 log = logging.getLogger("quickzi")
@@ -144,13 +145,14 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "5.1"
+VERSION = "5.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
 store = Store(str(DATA_DIR / "quickzi.db"))
 rules = Rules()
 rules.apply(store.get_settings())
+store_mod.set_day_start(rules.day_start_hour)
 tracker = RiderTracker()
 app = FastAPI()
 basic = HTTPBasic()
@@ -617,10 +619,10 @@ def webhook_watch(now: datetime):
 
 
 def snapshot_yesterday(now: datetime):
-    """Freeze yesterday's report once per day (after 04:05 Berlin)."""
+    """Freeze yesterday's report once per day (5 min after the operating day rolls over)."""
     local = now.astimezone(BERLIN)
     yday = day_key(now - timedelta(days=1))
-    if STATE["sync"]["last_snapshot"] == yday or (local.hour == 4 and local.minute < 5):
+    if STATE["sync"]["last_snapshot"] == yday or (local.hour == store_mod.DAY_STARTS_AT and local.minute < 5):
         return
     if store.daily(yday) is None or STATE["sync"]["last_snapshot"] is None:
         data = store.insights(yday, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
@@ -1114,7 +1116,8 @@ def api_settings_get():
         "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)",
         "release_lead_min": "Pre-orders are released to riders this many min before the planned delivery (MotionTools auto-scheduling)",
         "plan_grace_min": "On time for the customer = delivered no later than the planned time + (min)",
-        "riders_capacity_per_hour": "Staffing plan: orders one rider delivers per hour"}}
+        "riders_capacity_per_hour": "Staffing plan: orders one rider delivers per hour",
+        "day_start_hour": "Operating day starts at this hour (Berlin): 0 = midnight, 4 = orders after midnight count for the evening before"}}
 
 
 @app.post("/api/settings", dependencies=[Depends(require_login)])
@@ -1122,9 +1125,29 @@ async def api_settings_set(request: Request):
     values = await request.json()
     rules.apply(values)
     projector.lead_min = rules.release_lead_min
+    if store_mod.set_day_start(rules.day_start_hour) != rules.day_start_hour:
+        rules.day_start_hour = store_mod.DAY_STARTS_AT
+    STATE["sync"]["last_snapshot"] = None                 # the day boundary may have moved — re-freeze yesterday
     store.set_settings({k: v for k, v in values.items() if k in Rules.EDITABLE})
     store.log("info", "thresholds changed: " + ", ".join(f"{k}={v}" for k, v in values.items() if k in Rules.EDITABLE))
     return {"ok": True, "rules": rules.as_dict()}
+
+
+@app.post("/api/admin/delete-day", dependencies=[Depends(require_login)])
+async def api_delete_day(request: Request):
+    """Settings → System: wipe one day that was recorded wrongly. {"day": "YYYY-MM-DD", "dry_run": true} only counts."""
+    body = await request.json()
+    day = str(body.get("day") or "").strip()
+    if not (len(day) == 10 and day[4] == "-" and day[7] == "-"):
+        raise HTTPException(400, "day must be YYYY-MM-DD")
+    now = datetime.now(UTC)
+    res = store.delete_day(day, now, dry_run=bool(body.get("dry_run")))
+    if res["deleted"]:
+        for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:   # alerts of deleted orders
+            STATE["open_alerts"].pop(key, None); STATE["sev"].pop(key, None); STATE["heads"].pop(key, None)
+        if STATE["sync"]["last_snapshot"] == day:
+            STATE["sync"]["last_snapshot"] = None
+    return res
 
 
 @app.get("/api/system", dependencies=[Depends(require_login)])
