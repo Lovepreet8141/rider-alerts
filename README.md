@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v4.1)
+# Quickzi — Munich ops platform (v4.2)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and at 04:05 it freezes the
@@ -23,10 +23,11 @@ daily report of the evening before.
   dispatch moment, rider history, timestamps — so reports made before an upgrade are correct too.
 
 ## Tabs
-- **Live** — city pulse, the stage board (alerts shown on the order cards; tap a card for the story with
-  Call / Map / Snooze / Handled), riders (busy / idle / offline).
-- **Orders** — every order of the day (live, delivered, cancelled), searchable. Tap → the order's story:
-  minutes per phase, alerts raised, GPS route driven.
+- **Live** — city pulse, **PTOD watch** (live orders at/over the warning time, longest first), the stage board
+  (alerts shown on the order cards; tap a card for the story with Call / Map / Snooze / Handled), riders.
+- **Orders** — every order of the day, searchable, with filters (Live · PTOD risk · Late · Late without reason ·
+  On hold · Delivered · Cancelled). Tap → the order's story: minutes per phase, every rider, alerts, route, and a
+  **reason box** ("Restaurant late", "No rider available", …) — reasons are counted in Insights and the daily brief.
 - **Riders** — hours online, deliveries, % within target, avg PTOD, delivery minutes per order, busy %,
   orders/hour, idle time, minutes per phase, km/order, double orders, alerts. Tap a rider → numbers vs the team.
 - **Insights** — where the minutes go, focus list, staffing hour by hour, restaurants by rider wait (each row shows

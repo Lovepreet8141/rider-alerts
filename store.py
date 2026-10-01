@@ -104,6 +104,13 @@ def _pct(ok, n):
     return round(100 * ok / n) if n else None
 
 
+def _count(values) -> dict:
+    out = {}
+    for v in values:
+        out[v] = out.get(v, 0) + 1
+    return dict(sorted(out.items(), key=lambda x: -x[1]))
+
+
 class Store:
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -112,6 +119,10 @@ class Store:
         self.lock = threading.Lock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(orders)").fetchall()}
+            for col in ("reason", "note", "reason_at"):
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
             self.db.commit()
 
     def _rows(self, sql, args=()):
@@ -180,6 +191,11 @@ class Store:
              iso(o["picked_up_at"]), iso(o["at_customer_at"]), iso(o["delivered_at"]), cancelled_at,
              o.get("cancel_reason", ""), pm["ptod"], closed, first_seen, iso(now), raw))
 
+    def set_reason(self, oid: str, reason: str, note: str, now: datetime) -> bool:
+        """The manager's explanation for a late / problematic order (shown in Orders, Insights, daily report)."""
+        return self._exec("UPDATE orders SET reason=?, note=?, reason_at=? WHERE id=?",
+                          (reason or "", note or "", iso(now) if (reason or note) else None, oid)).rowcount > 0
+
     def rename_place(self, place_id: str, name: str) -> int:
         """A restaurant got its name (Settings / API): apply it to every stored order and alert of that place."""
         n = 0
@@ -206,6 +222,7 @@ class Store:
         o["rider_id"] = r.get("rider_id") or o.get("rider_id")
         o["stacked"] = bool(r.get("stacked"))
         o["cancelled_at"] = ts(r.get("cancelled_at"))
+        o["reason"], o["note"] = r.get("reason") or "", r.get("note") or ""
         o["phases"] = phase_minutes(o)
         d = o["dispatched_at"] or o["cancelled_at"]
         o["hour"] = d.astimezone(BERLIN).hour if d else None
@@ -485,8 +502,10 @@ class Store:
                 "restaurants": restaurants[:20], "hours": hours, "riders": riders, "districts": districts[:15],
                 "alerts_by_kind": by_kind, "alerts_total": len(alerts),
                 "handled": sum(1 for a in alerts if a["dismissed_at"]), "focus": focus,
-                "late_orders": [{"ref": o["ref"], "rider": o["rider"], "restaurant": o["restaurant"], "ptod": o["phases"]["ptod"],
-                                 "phases": o["phases"], "hour": o["hour"]} for o in late[:15]],
+                "late_orders": [{"id": o["id"], "ref": o["ref"], "rider": o["rider"], "restaurant": o["restaurant"], "ptod": o["phases"]["ptod"],
+                                 "phases": o["phases"], "hour": o["hour"], "reason": o.get("reason", ""), "note": o.get("note", "")} for o in late[:15]],
+                "late_reasons": _count(o.get("reason") for o in late if o.get("reason")),
+                "late_without_reason": sum(1 for o in late if not o.get("reason")),
                 "recent_alerts": alerts[:60]}
 
     @staticmethod

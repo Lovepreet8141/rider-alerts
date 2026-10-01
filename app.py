@@ -53,7 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AREAS = [a.strip() for a in env("MUNICH_SERVICE_AREA_ID").split(",") if a.strip()]
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "4.1"
+VERSION = "4.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -669,6 +669,7 @@ def order_view(o: dict, now: datetime) -> dict:
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
             "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
             "alert_heads": [h for h in heads if h], "stack": STATE["stack"].get(o["id"]) if live else None,
+            "reason": o.get("reason") or "", "note": o.get("note") or "", "warn": rules.ptod_warn_min,
             "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "planned": hm(o.get("eta_customer") or o.get("scheduled_at")),
@@ -710,7 +711,7 @@ def api_state():
              "riders_online": sum(1 for r in riders if r["online"]), "riders_idle": sum(1 for r in riders if r["status"] == "idle"),
              "riders_busy": sum(1 for r in riders if r["status"] == "busy"),
              "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
-    return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders,
+    return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
             "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS}}
 
 
@@ -815,6 +816,21 @@ def api_order(oid: str):
     return view
 
 
+REASONS = ["Restaurant late", "No rider available", "Rider slow / detour", "Double order", "Wrong address / customer unreachable",
+           "Pre-order released late", "App / GPS problem", "Traffic / weather", "Other"]
+
+
+@app.post("/api/orders/{oid}/reason", dependencies=[Depends(require_login)])
+async def api_order_reason(oid: str, request: Request):
+    body = await request.json()
+    reason, note = str(body.get("reason") or "").strip()[:60], str(body.get("note") or "").strip()[:300]
+    ok = store.set_reason(oid, reason, note, datetime.now(UTC))
+    o = STATE["orders"].get(oid)
+    if o is not None:
+        o["reason"], o["note"] = reason, note
+    return {"ok": ok}
+
+
 @app.get("/api/orders/{oid}/events", dependencies=[Depends(require_login)])
 def api_order_events(oid: str):
     """Every raw MotionTools event that touched this order (booking events + its tour's events) — the ground truth."""
@@ -889,6 +905,9 @@ def daily_brief(d: dict) -> str:
     ph = d["phases"]
     if ph.get("to_accept") is not None:
         lines.append(f"Avg minutes: accept {ph['to_accept']} · to restaurant {ph['to_restaurant']} · at restaurant {ph['at_restaurant']} · to customer {ph['to_customer']} · handover {ph['handover']}")
+    if d.get("late_reasons"):
+        lines.append("Late orders — reasons: " + " · ".join(f"{r} {n}" for r, n in d["late_reasons"].items())
+                     + (f" · {d['late_without_reason']} without reason" if d.get("late_without_reason") else ""))
     if d["riders"]:
         best = d["riders"][0]
         lines.append(f"Best rider: {best['rider']} ({best['within_pct']}% within target, {best['delivered']} orders)")
@@ -899,7 +918,7 @@ def daily_brief(d: dict) -> str:
 
 @app.get("/api/settings", dependencies=[Depends(require_login)])
 def api_settings_get():
-    return {"rules": rules.as_dict(), "labels": {
+    return {"rules": rules.as_dict(), "reasons": REASONS, "labels": {
         "ptod_target_min": "PTOD target (minutes from dispatch to delivered)", "ptod_warn_min": "PTOD warning at (minutes)",
         "target_within_pct": "Goal: % of orders within target", "accept_limit_min": "Alert if nobody accepted after (min)",
         "start_limit_min": "Alert if accepted but not started after (min)", "stationary_min": "Alert if not moving for (min)",
