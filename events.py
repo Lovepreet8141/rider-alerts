@@ -393,6 +393,7 @@ class Projector:
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now) if d.get("driver_id") and not o["rider_id"] else None
                 o["rider_lat"], o["rider_lng"] = loc.get("lat"), loc.get("lng")
                 self.gps(d.get("driver_id") or o["rider_id"], loc.get("lat"), loc.get("lng"), now, bid)
+                return name                                   # position only — nothing to store on the order
             self.finish(o, now)
             return name
 

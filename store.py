@@ -147,7 +147,15 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.Lock()
+        self._alert_written: dict = {}          # alert id -> last payload written (skip identical UPDATEs)
         with self.lock:
+            # WAL + synchronous=NORMAL: a commit no longer fsyncs the main file (the Railway volume is slow at that);
+            # the data is still safe against process crashes.  busy_timeout: never fail on a short lock.
+            for pragma in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=5000", "temp_store=MEMORY", "cache_size=-20000"):
+                try:
+                    self.db.execute(f"PRAGMA {pragma}")
+                except Exception:
+                    pass
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(orders)").fetchall()}
             for col in ("reason", "note", "reason_at"):
@@ -320,12 +328,16 @@ class Store:
         return cur.lastrowid
 
     def update_alert(self, aid: int, a: dict, now: datetime):
+        """Only writes when something visible changed — at peak this runs for ~100 alerts after every event."""
+        key = (a["severity"], a["headline"], a["action"], a["phone"], a["map_url"], a["rider"], a["rider_id"], a["restaurant"], a["restaurant_phone"])
+        if self._alert_written.get(aid) == key:
+            return
+        self._alert_written[aid] = key
         self._exec("UPDATE alerts SET severity=?, headline=?, action=?, phone=?, map_url=?, rider=?, rider_id=?, "
-                   "restaurant=?, restaurant_phone=?, updated_at=? WHERE id=?",
-                   (a["severity"], a["headline"], a["action"], a["phone"], a["map_url"], a["rider"], a["rider_id"],
-                    a["restaurant"], a["restaurant_phone"], iso(now), aid))
+                   "restaurant=?, restaurant_phone=?, updated_at=? WHERE id=?", key + (iso(now), aid))
 
     def resolve_alert(self, aid: int, why: str, now: datetime):
+        self._alert_written.pop(aid, None)
         self._exec("UPDATE alerts SET resolved_at=?, resolution=? WHERE id=? AND resolved_at IS NULL", (iso(now), why, aid))
 
     def dismiss_alert(self, aid: int, now: datetime) -> bool:
@@ -552,7 +564,7 @@ class Store:
             ph = lambda k: _avg([o["phases"][k] for o in d])
             busy = sum((o["phases"]["ptod"] or 0) - (o["phases"]["to_accept"] or 0) for o in d)  # accept -> delivered
             online = self.online_minutes(rid, start, min(end, now)) if sessions_ok else 0
-            kms = [self.trail_km(o) for o in d[-30:]]
+            kms = [self.trail_km(o) for o in d[-8:]]            # one positions query per order — keep it small
             kms = [k for k in kms if k]
             riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "orders": len(rs), "delivered": len(d),
                            "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
@@ -663,47 +675,92 @@ class Store:
         return focus[:7]
 
     # ================================================================ staffing plan
-    def staffing_plan(self, now: datetime, rules, days: int = 7) -> dict:
-        """How many riders each hour needs tomorrow, from the last `days` operating days:
-        orders per hour (average and busiest day) ÷ capacity (orders one rider delivers per hour, Settings),
-        and never fewer than the riders who actually handled that hour — plus one when acceptance was slow."""
-        start = day_start(now) - timedelta(days=days - 1)
+    def staffing_plan(self, now: datetime, rules, day: str = "", weeks: int = 4) -> dict:
+        """Riders needed per hour on a given day (default: tomorrow), weekday-aware:
+        a Saturday is planned from the previous Saturdays (up to `weeks` back); while fewer than 2 of that weekday
+        are recorded, the last 7 days are used instead.  Per hour: orders (average / busiest day) ÷ capacity
+        (orders one rider really delivers per hour, Settings); where acceptance was slow with N riders, at least N+1.
+        Also returns the same summary for each of the next 7 days."""
+        today = day_start(now)
+        start = today - timedelta(days=weeks * 7 - 1)
         rows = self._rows("SELECT * FROM orders WHERE dispatched_at >= ? AND dispatched_at < ?", (iso(start), iso(now + timedelta(days=1))))
-        orders = [self._hydrate(r) for r in rows]
-        by_hour, days_seen = {}, set()
-        for o in orders:
+        per_day = {}                                              # day_key -> hour -> [orders]
+        for r in rows:
+            o = self._hydrate(r)
             d = o["dispatched_at"]
             if not d or o["phase"] == "closed":
                 continue
-            dk = day_key(d)
-            days_seen.add(dk)
-            by_hour.setdefault(d.astimezone(BERLIN).hour, {}).setdefault(dk, []).append(o)
-        n_days = max(1, len(days_seen))
-        cap = max(1, int(rules.riders_capacity_per_hour or 2))
-        hours = []
-        for h in sorted(by_hour, key=lambda x: (x - DAY_STARTS_AT) % 24):
-            per_day = by_hour[h]
-            counts = [len(v) for v in per_day.values()]
-            allo = [o for v in per_day.values() for o in v]
-            done = [o for o in allo if o["phase"] == "delivered"]
-            active = [len({o["rider_id"] for o in v if o["rider_id"]}) for v in per_day.values()]
-            avg = sum(counts) / n_days                                   # days without orders in this hour count as 0
-            had = round(sum(active) / len(active), 1) if active else None
-            accept = _avg([o["phases"]["to_accept"] for o in allo if o["accepted_at"]])
-            no_rider = sum(1 for o in allo if (o["phases"]["to_accept"] or 0) >= rules.accept_limit_min
-                           or (not o["accepted_at"] and o["phase"] == "cancelled"))
-            slow = (accept or 0) >= 4 or no_rider >= max(2, len(allo) // 5)
-            need = math.ceil(avg / cap)
-            plan = max(need, math.ceil(had or 0) + (1 if slow else 0))
-            hours.append({"hour": h, "avg_orders": round(avg, 1), "max_orders": max(counts), "riders_needed": need,
-                          "riders_peak": math.ceil(max(counts) / cap), "riders_had": had, "avg_accept": accept,
-                          "within_pct": _within(done, rules.ptod_target_min), "on_time_pct": _on_time(done, rules.plan_grace_min),
-                          "no_rider": no_rider, "slow": slow, "plan": plan})
-        peak = [x["hour"] for x in sorted(hours, key=lambda x: -x["avg_orders"])[:3]]
-        local = now.astimezone(BERLIN)
-        return {"days": n_days, "from": day_key(start), "to": day_key(now), "capacity": cap,
-                "tomorrow": (local + timedelta(days=1)).strftime("%A"), "hours": hours, "peak_hours": sorted(peak),
-                "rider_hours": sum(x["plan"] for x in hours), "orders_per_day": round(len(orders) / n_days, 1)}
+            per_day.setdefault(day_key(d), {}).setdefault(d.astimezone(BERLIN).hour, []).append(o)
+        today_key = day_key(now)
+        cap = max(0.5, float(rules.riders_capacity_per_hour or 1.5))
+        local_today = today.astimezone(BERLIN).date()
+
+        def weekday_of(dk):
+            return datetime.strptime(dk, "%Y-%m-%d").weekday()
+
+        def plan_for(target):                                     # target: date (Berlin)
+            same = sorted(dk for dk in per_day if weekday_of(dk) == target.weekday() and dk != today_key)
+            if len(same) >= 2:
+                basis, basis_label = same[-weeks:], f"the last {min(len(same), weeks)} {target.strftime('%A')}s"
+            else:
+                last7 = [dk for dk in per_day if dk >= day_key(today - timedelta(days=6))]
+                basis, basis_label = sorted(last7), f"the last {len(last7)} days (no {target.strftime('%A')} recorded yet)" if last7 else "no data yet"
+            n_days = max(1, len(basis))
+            by_hour = {}
+            for dk in basis:
+                for h, os_ in per_day.get(dk, {}).items():
+                    by_hour.setdefault(h, {})[dk] = os_
+            hours = []
+            for h in sorted(by_hour, key=lambda x: (x - DAY_STARTS_AT) % 24):
+                pd = by_hour[h]
+                counts = [len(v) for v in pd.values()]
+                allo = [o for v in pd.values() for o in v]
+                done = [o for o in allo if o["phase"] == "delivered"]
+                active = [len({o["rider_id"] for o in v if o["rider_id"]}) for v in pd.values()]
+                avg = sum(counts) / n_days                           # basis days without orders in this hour count as 0
+                had = round(sum(active) / len(active), 1) if active else None
+                accept = _avg([o["phases"]["to_accept"] for o in allo if o["accepted_at"]])
+                no_rider = sum(1 for o in allo if (o["phases"]["to_accept"] or 0) >= rules.accept_limit_min
+                               or (not o["accepted_at"] and o["phase"] == "cancelled"))
+                slow = (accept or 0) >= 4 or no_rider >= max(2, len(allo) // 5)
+                need = math.ceil(avg / cap)                            # throughput: orders ÷ what one rider delivers per hour
+                plan = max(need, math.ceil(had or 0) + 1) if slow else need   # it was slow with N riders -> at least N+1
+                hours.append({"hour": h, "avg_orders": round(avg, 1), "max_orders": max(counts), "riders_needed": need,
+                              "riders_peak": math.ceil(max(counts) / cap), "riders_had": had, "avg_accept": accept,
+                              "within_pct": _within(done, rules.ptod_target_min), "on_time_pct": _on_time(done, rules.plan_grace_min),
+                              "no_rider": no_rider, "slow": slow, "plan": plan})
+            peak = sorted(x["hour"] for x in sorted(hours, key=lambda x: -x["avg_orders"])[:3])
+            return {"day": target.isoformat(), "weekday": target.strftime("%A"), "basis": basis_label, "basis_days": len(basis),
+                    "same_weekday": len(same) >= 2, "hours": hours, "peak_hours": peak,
+                    "rider_hours": sum(x["plan"] for x in hours), "riders_peak": max([x["plan"] for x in hours], default=0),
+                    "orders_per_day": round(sum(len(v) for dk in basis for v in per_day.get(dk, {}).values()) / n_days, 1)}
+
+        try:
+            target = datetime.strptime(day, "%Y-%m-%d").date() if day else local_today + timedelta(days=1)
+        except ValueError:
+            target = local_today + timedelta(days=1)
+        out = plan_for(target)
+        out["capacity"] = cap
+        out["tomorrow"] = (local_today + timedelta(days=1)).strftime("%A")
+        out["week"] = []
+        for i in range(1, 8):
+            t = local_today + timedelta(days=i)
+            w = plan_for(t)
+            out["week"].append({k: w[k] for k in ("day", "weekday", "basis", "basis_days", "same_weekday", "peak_hours", "rider_hours", "riders_peak", "orders_per_day")})
+        return out
+
+    def staffing_csv(self, now: datetime, rules) -> str:
+        """Next 7 days × hours: the riders to plan — paste into the shift sheet."""
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["date", "weekday", "hour", "orders_avg", "orders_busiest_day", "riders_plan", "riders_at_peak", "based_on"])
+        local_today = day_start(now).astimezone(BERLIN).date()
+        for i in range(1, 8):
+            d = (local_today + timedelta(days=i)).isoformat()
+            pl = self.staffing_plan(now, rules, day=d)
+            for h in pl["hours"]:
+                w.writerow([d, pl["weekday"], f"{h['hour']:02d}:00", h["avg_orders"], h["max_orders"], h["plan"], h["riders_peak"], pl["basis"]])
+        return buf.getvalue()
 
     # ================================================================ daily snapshot
     def save_daily(self, day: str, data: dict):

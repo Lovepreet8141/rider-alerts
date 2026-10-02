@@ -41,7 +41,7 @@ class Rules:
     release_lead_min: int = 45      # MotionTools releases a pre-order to riders this long before its planned delivery
                                     # (MotionTools: automatic scheduling lead time) — used when no "pickable" event arrives
     plan_grace_min: int = 5         # "on time vs plan": delivered no later than the planned delivery time + this
-    riders_capacity_per_hour: int = 2   # orders one rider can deliver per hour (staffing plan for tomorrow)
+    riders_capacity_per_hour: float = 1.5   # orders one rider really delivers per hour (staffing plan)
     day_start_hour: int = 0         # the operating day starts at this hour (Berlin): 0 = midnight; 4 = night orders belong to the evening before
 
     EDITABLE = ("ptod_target_min", "ptod_warn_min", "accept_limit_min", "start_limit_min", "stationary_min",
@@ -52,7 +52,7 @@ class Rules:
         for k, v in values.items():
             if k in self.EDITABLE and v not in (None, ""):
                 try:
-                    setattr(self, k, int(v))
+                    setattr(self, k, float(v) if k == "riders_capacity_per_hour" else int(v))
                 except (TypeError, ValueError):
                     pass
 

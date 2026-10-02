@@ -25,6 +25,7 @@ from pathlib import Path
 from statistics import mean
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -138,14 +139,15 @@ def housekeeping(now: datetime, startup: bool = False):
             log.warning("could not shrink the legacy event file: %s", e)
     store.cleanup(now)
     rep = disk_report()
-    if rep["free_mb"] > rep["db_mb"] * 1.3 + 20 and (startup or rep["pct"] and rep["pct"] >= 70):
+    quiet = not (11 <= now.astimezone(BERLIN).hour < 23)        # VACUUM locks the database for seconds — never at peak
+    if quiet and rep["free_mb"] > rep["db_mb"] * 1.3 + 20 and (startup or rep["pct"] and rep["pct"] >= 70):
         if store.vacuum():
             rep = disk_report()
     store.log("info", f"housekeeping: freed {freed / 1e6:.0f} MB of event files · DB {rep['db_mb']} MB · volume {rep['used_mb']}/{rep['total_mb']} MB ({rep['pct']}%)")
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "5.4"
+VERSION = "5.6"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -155,6 +157,7 @@ rules.apply(store.get_settings())
 store_mod.set_day_start(rules.day_start_hour)
 tracker = RiderTracker()
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=2000)      # /api/state at peak is ~150 KB -> ~15 KB on the wire
 basic = HTTPBasic()
 
 STATE = {"orders": {}, "riders": {}, "open_alerts": {}, "sev": {}, "heads": {}, "hidden": {}, "stack": {}, "raw_samples": {},
@@ -167,7 +170,19 @@ projector = Projector(STATE, store, tracker, AREAS)
 projector.lead_min = rules.release_lead_min
 ENRICHED_RIDERS: dict = {}          # rider_id -> when we last read it through the API
 DISK_CACHE: dict = {}
+PULSE_CACHE: dict = {}              # today's delivered/within/on-time numbers, recomputed at most every 20 s
+INSIGHTS_CACHE: dict = {}           # period -> (computed_at, data); 30 s — the Riders/Insights tabs poll every minute
+DIRTY = {"events": 0}               # webhook events since the last alert evaluation
 ENRICH_LOCK = asyncio.Lock()
+
+
+def cached_insights(period: str, now: datetime) -> dict:
+    hit = INSIGHTS_CACHE.get(period)
+    if hit and (now - hit[0]).total_seconds() < 30:
+        return hit[1]
+    data = store.insights(period, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
+    INSIGHTS_CACHE[period] = (now, data)
+    return data
 
 
 def api_restricted() -> bool:
@@ -499,11 +514,11 @@ COPY_TIMES = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_re
               "at_customer_at", "delivered_at", "scheduled_at", "last_event_at", "eta_at", "promised_at")
 
 
-def repair_from_events(now: datetime) -> int:
+def repair_from_events(now: datetime, replayed: dict = None) -> int:
     """At startup: replay the stored events and give every order of the last 7 days the full, correct story —
     real dispatch moment (on hold until pickable), every rider who had it (accepted / handed back / arrived / ...),
     and the timestamps of the rider who actually delivered.  Enrichment (names, addresses, phones) is kept."""
-    replayed = replay_events()
+    replayed = replay_events() if replayed is None else replayed
     if not replayed:
         return 0
     targets = {o["id"]: o for o in store.orders_in("week", now)}
@@ -632,6 +647,48 @@ def snapshot_yesterday(now: datetime):
     STATE["sync"]["last_snapshot"] = yday
 
 
+async def evaluate_loop():
+    """Alerts are re-evaluated at most every 2 s, not after every single webhook event (at peak MotionTools sends
+    several GPS events per second; evaluating ~100 alerts for each of them kept the server busy with nothing new)."""
+    while True:
+        try:
+            if DIRTY["events"]:
+                DIRTY["events"] = 0
+                evaluate_all(datetime.now(UTC))
+        except Exception as e:
+            log.exception("evaluate failed: %s", e)
+        await asyncio.sleep(2)
+
+
+async def post_start(now: datetime):
+    """The slow parts of a start (housekeeping, DB backup, replaying the event log) run AFTER the server is already
+    answering — a restart at peak must not take the dashboard down for a minute."""
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, housekeeping, now, True)
+    except Exception as e:
+        log.exception("housekeeping failed: %s", e)
+    try:
+        backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
+        await loop.run_in_executor(None, store.backup_to, str(backup))
+        for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db"))[:-3]:
+            old_b.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("backup failed: %s", e)
+    try:
+        replayed = await loop.run_in_executor(None, replay_events)          # pure CPU/file work, off the event loop
+        n = repair_from_events(now, replayed)
+        if n:
+            on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
+            for o in [x for x in STATE["orders"].values() if x["phase"] in ("delivered", "cancelled")]:
+                projector.finish(o, now)              # finished while we were down -> out of the live board
+            store.log("info", f"rebuilt {n} orders of the last 7 days from the stored events ({on_hold} live orders on hold)")
+            INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
+            evaluate_all(datetime.now(UTC))
+    except Exception as e:
+        log.exception("repair failed: %s", e)
+
+
 async def sync_loop():
     first = True
     last_backfill = None
@@ -741,26 +798,8 @@ async def startup():
             if not r.get("online") and o["phase"] not in ("on_hold",):
                 r["online"] = True
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, housekeeping, now, True)
-    except Exception as e:
-        log.exception("housekeeping failed: %s", e)
-    try:
-        backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
-        store.backup_to(str(backup))
-        for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db"))[:-3]:
-            old_b.unlink(missing_ok=True)
-    except Exception as e:
-        log.warning("backup failed: %s", e)
-    try:
-        n = repair_from_events(now)
-        if n:
-            on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
-            for o in [x for x in STATE["orders"].values() if x["phase"] in ("delivered", "cancelled")]:
-                projector.finish(o, now)              # finished while we were down -> out of the live board
-            store.log("info", f"rebuilt {n} orders of the last 7 days from the stored events ({on_hold} live orders on hold)")
-    except Exception as e:
-        log.exception("repair failed: %s", e)
+    asyncio.create_task(post_start(now))
+    asyncio.create_task(evaluate_loop())
     if not DASH_PASSWORD:
         store.log("error", "DASHBOARD_PASSWORD not set — dashboard refuses all logins")
     if not mt.enabled:
@@ -789,7 +828,9 @@ async def webhook(secret: str, request: Request):
         try:
             name = projector.apply(p)
             STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
-            evaluate_all(datetime.now(UTC))
+            DIRTY["events"] += 1                                  # alerts are re-evaluated by evaluate_loop (every 2 s)
+            if str(p.get("event") or "") not in GPS_EVENTS:
+                PULSE_CACHE.clear()                               # an order may have finished — today's numbers change
             if mt.enabled and name != "other area":
                 asyncio.create_task(enrich_after_event(p))      # fill names / phones / GPS through open endpoints
         except Exception as e:
@@ -863,13 +904,15 @@ def api_state():
                        "still_min": tracker.stationary_minutes(r["id"], now, rules.stationary_radius_m) if r["online"] else None,
                        "last_fix_min": int((now - fix[0]).total_seconds() // 60) if fix else None})
     riders.sort(key=lambda x: ({"busy": 0, "idle": 1, "offline": 2}[x["status"]], -x["orders"], x["name"]))
-    today = store.delivered("today", now)
-    ptods = [o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None]
-    plan = [o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None]
+    if not PULSE_CACHE or (now - PULSE_CACHE["at"]).total_seconds() > 20:
+        today = store.delivered("today", now)
+        PULSE_CACHE.update(at=now, n=len(today), ptods=[o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None],
+                           plan=[o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None])
+    ptods, plan = PULSE_CACHE["ptods"], PULSE_CACHE["plan"]
     open_alerts = [a for a in alerts if a["resolved_at"] is None]
     last_ok = STATE["sync"]["last_ok"]
     stale = (not last_ok) or (now - datetime.fromisoformat(last_ok)).total_seconds() > max(180, SYNC_SECONDS * 4)
-    pulse = {"delivered": len(today),
+    pulse = {"delivered": PULSE_CACHE["n"],
              "within_pct": round(100 * sum(1 for p in ptods if p <= rules.ptod_target_min) / len(ptods)) if ptods else None,
              "target_within_pct": rules.target_within_pct, "target": rules.ptod_target_min,
              "avg_ptod": round(mean(ptods)) if ptods else None,
@@ -910,6 +953,7 @@ async def api_places_set(request: Request):
     for pid, name in (body or {}).items():
         if pid and isinstance(name, str):
             projector.set_place(pid, name.strip())
+    INSIGHTS_CACHE.clear()
     evaluate_all(datetime.now(UTC))
     return {"ok": True}
 
@@ -959,7 +1003,7 @@ async def api_probe():
 def api_insights(period: str = "today"):
     _check_period(period)
     try:
-        return store.insights(period, datetime.now(UTC), rules, sessions_ok=STATE['sync']['mode'] == 'api')
+        return cached_insights(period, datetime.now(UTC))
     except Exception as e:
         log.exception("insights failed")
         store.log("error", f"insights failed: {e}"[:300])
@@ -967,9 +1011,16 @@ def api_insights(period: str = "today"):
 
 
 @app.get("/api/staffing", dependencies=[Depends(require_login)])
-def api_staffing():
-    """Tomorrow's riders per hour, from the last 7 operating days."""
-    return store.staffing_plan(datetime.now(UTC), rules)
+def api_staffing(day: str = ""):
+    """Riders per hour for one day (default tomorrow), weekday-aware, plus a summary for the next 7 days."""
+    return store.staffing_plan(datetime.now(UTC), rules, day=day)
+
+
+@app.get("/export-plan.csv", dependencies=[Depends(require_login)])
+def export_plan():
+    body = store.staffing_csv(datetime.now(UTC), rules)
+    return PlainTextResponse(body, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="quickzi-{CITY.lower()}-rider-plan.csv"'})
 
 
 def _check_period(period):
@@ -1010,6 +1061,7 @@ async def api_order_reason(oid: str, request: Request):
     body = await request.json()
     reason, note = str(body.get("reason") or "").strip()[:60], str(body.get("note") or "").strip()[:300]
     ok = store.set_reason(oid, reason, note, datetime.now(UTC))
+    INSIGHTS_CACHE.clear()
     o = STATE["orders"].get(oid)
     if o is not None:
         o["reason"], o["note"] = reason, note
@@ -1052,7 +1104,7 @@ def api_order_events(oid: str):
 def api_rider(rid: str, period: str = "today"):
     _check_period(period)
     now = datetime.now(UTC)
-    ins = store.insights(period, now, rules, sessions_ok=STATE['sync']['mode'] == 'api')
+    ins = cached_insights(period, now)
     stats = next((r for r in ins["riders"] if r["rider_id"] == rid), None)
     orders = [order_view(o, now) for o in store.orders_in(period, now) if o["rider_id"] == rid]
     r = STATE["riders"].get(rid, {})
@@ -1100,9 +1152,9 @@ def daily_brief(d: dict, staffing: dict = None) -> str:
         lines.append(f"• {f['title']}")
     if staffing and staffing.get("hours"):
         peak = [h for h in staffing["hours"] if h["hour"] in staffing["peak_hours"]]
-        lines.append(f"Riders for {staffing['tomorrow']} (from the last {staffing['days']} days): "
+        lines.append(f"Riders for {staffing['weekday']} {staffing['day']} (from {staffing['basis']}): "
                      + " · ".join(f"{h['hour']:02d}–{(h['hour'] + 1) % 24:02d}h {h['plan']}" for h in peak)
-                     + " — full plan in Insights")
+                     + f" — up to {staffing['riders_peak']} riders at the peak, full week in Insights")
     return "\n".join(lines)
 
 
@@ -1116,7 +1168,7 @@ def api_settings_get():
         "wait_restaurant_min": "Alert if waiting at restaurant (min)", "wait_customer_min": "Alert if waiting at customer (min)",
         "release_lead_min": "Pre-orders are released to riders this many min before the planned delivery (MotionTools auto-scheduling)",
         "plan_grace_min": "On time for the customer = delivered no later than the planned time + (min)",
-        "riders_capacity_per_hour": "Staffing plan: orders one rider delivers per hour",
+        "riders_capacity_per_hour": "Staffing plan: orders one rider really delivers per hour (e.g. 1.5)",
         "day_start_hour": "Operating day starts at this hour (Berlin): 0 = midnight, 4 = orders after midnight count for the evening before"}}
 
 
@@ -1143,6 +1195,7 @@ async def api_delete_day(request: Request):
     now = datetime.now(UTC)
     res = store.delete_day(day, now, dry_run=bool(body.get("dry_run")))
     if res["deleted"]:
+        INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
         for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:   # alerts of deleted orders
             STATE["open_alerts"].pop(key, None); STATE["sev"].pop(key, None); STATE["heads"].pop(key, None)
         if STATE["sync"]["last_snapshot"] == day:

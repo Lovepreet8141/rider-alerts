@@ -1,4 +1,4 @@
-# Quickzi — Munich ops platform (v5.4)
+# Quickzi — Munich ops platform (v5.6)
 
 A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
@@ -48,10 +48,12 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   % on time for the customer, avg PTOD, delivery minutes per order, minutes per phase, km/order, double orders,
   hand-backs, alerts — all from the orders themselves. Hours online / busy % / idle are shown only in
   API mode (webhook mode cannot know online time reliably). Tap a rider → numbers vs the team.
-- **Insights** — where the minutes go, focus list, **riders needed tomorrow** hour by hour (from the last 7 days:
-  orders per hour ÷ capacity per rider — Settings, default 2/h — never fewer than the riders who handled that hour,
-  +1 where acceptance was slow; the busiest hours are marked *peak*; the total is the rider-hours to plan),
-  staffing hour by hour, restaurants by rider wait (each row shows
+- **Insights** — where the minutes go, focus list, **riders needed — next 7 days**: one line per day (orders/day,
+  peak hours, riders at the peak, rider-hours) and, per selected day, the hour-by-hour plan. Weekday-aware: a
+  Saturday is planned from the previous Saturdays (up to 4 weeks); until two of that weekday are recorded, the
+  last 7 days are used. Per hour: orders ÷ capacity (orders one rider really delivers per hour, Settings, default
+  1.5); where acceptance was slow with N riders, at least N+1. *Plan CSV* exports the week for the shift sheet.
+  Then staffing hour by hour, restaurants by rider wait (each row shows
   its order numbers; tap → every order of that restaurant with wait/PTOD/alerts, and a box to name an unnamed
   MotionTools place — the name is applied to all its past orders too), districts by postcode, late orders, alert log.
 - **Daily report** — 14-day trend, frozen report per operating day (midnight → midnight Berlin; Settings →
@@ -97,6 +99,13 @@ Settings → Webhooks that the webhook is still active". It is logged in Setting
 `orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI ·
 `simulate.py` API-mode evening · `simulate_webhook.py` restricted-mode evening (fake MotionTools server) ·
 `requirements.txt` · `Procfile`
+
+## Built for peak load
+At peak MotionTools sends several GPS events per second. Each event only touches memory; alerts are re-evaluated at
+most every 2 s, alert rows are written only when something changed, GPS events never re-write the order, SQLite runs
+in WAL mode (no fsync per commit on the slow volume), today's numbers and the Insights are cached for 20–30 s, and
+API responses are gzipped. A restart answers within a second — housekeeping, backup and the event replay run in the
+background afterwards. VACUUM never runs between 11:00 and 23:00.
 
 ## Disk (Railway volume)
 GPS events are processed live but never written to disk; other raw events go to daily files (`events-YYYY-MM-DD.jsonl`,
