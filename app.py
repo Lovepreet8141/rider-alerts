@@ -147,7 +147,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "5.6"
+VERSION = "5.7"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -173,6 +173,8 @@ DISK_CACHE: dict = {}
 PULSE_CACHE: dict = {}              # today's delivered/within/on-time numbers, recomputed at most every 20 s
 INSIGHTS_CACHE: dict = {}           # period -> (computed_at, data); 30 s — the Riders/Insights tabs poll every minute
 DIRTY = {"events": 0}               # webhook events since the last alert evaluation
+EVENT_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=100000)   # the webhook only queues; event_worker() processes
+WEBHOOK_STATS = {"rejected": 0, "dropped": 0, "worker_errors": 0, "last_rejected_path": ""}
 ENRICH_LOCK = asyncio.Lock()
 
 
@@ -800,6 +802,7 @@ async def startup():
     store.log("info", f"server started — {len(STATE['orders'])} open orders, {len(STATE['open_alerts'])} open alerts restored")
     asyncio.create_task(post_start(now))
     asyncio.create_task(evaluate_loop())
+    asyncio.create_task(event_worker())
     if not DASH_PASSWORD:
         store.log("error", "DASHBOARD_PASSWORD not set — dashboard refuses all logins")
     if not mt.enabled:
@@ -810,35 +813,70 @@ async def startup():
 # ====================================================================== webhook (wakes the sync)
 @app.post("/mt/{secret}")
 async def webhook(secret: str, request: Request):
+    """Answers MotionTools in microseconds and queues the event.  MotionTools blocks a webhook after 250 failed
+    deliveries in a row (timeouts count), so this handler must never wait for the database or the event loop —
+    all processing happens in event_worker()."""
     if not secrets.compare_digest(secret, PATH_SECRET):
+        WEBHOOK_STATS["rejected"] += 1
+        WEBHOOK_STATS["last_rejected_path"] = secret[:12] + "…"
+        if WEBHOOK_STATS["rejected"] in (1, 10, 100, 1000):
+            store.log("error", f"{WEBHOOK_STATS['rejected']} webhook call(s) rejected — the URL secret does not match WEBHOOK_PATH_SECRET "
+                               "(MotionTools counts these as failed deliveries and will block the webhook)")
         raise HTTPException(404)
     try:
         p = await request.json()
     except Exception:
         p = {}
-    STATE["sync"]["webhook_events"] += 1
-    STATE["sync"]["last_webhook"] = iso(datetime.now(UTC))
-    STATE["sync"]["silent_min"], STATE["sync"]["webhook_silent"] = 0, False
+    s = STATE["sync"]
+    s["webhook_events"] += 1
+    s["last_webhook"] = iso(datetime.now(UTC))
+    s["silent_min"], s["webhook_silent"] = 0, False
+    try:
+        EVENT_QUEUE.put_nowait(p)
+    except asyncio.QueueFull:
+        WEBHOOK_STATS["dropped"] += 1
+    return {"ok": True}
+
+
+def process_event(p: dict):
+    """One queued webhook event: raw log, projector, enrichment."""
     if str(p.get("event") or "") not in GPS_EVENTS:
-        with open(event_file(datetime.now(UTC)), "a") as f:
-            f.write(json.dumps(p) + "\n")
+        try:
+            with open(event_file(datetime.now(UTC)), "a") as f:
+                f.write(json.dumps(p) + "\n")
+        except Exception as e:                                    # a full disk must never cost an event or a delivery
+            log.warning("could not write the event log: %s", e)
     if len(STATE["raw_samples"].get("events", [])) < 12:
         STATE["raw_samples"].setdefault("events", []).append(p)
     if STATE["sync"]["mode"] == "webhook":
-        try:
-            name = projector.apply(p)
-            STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
-            DIRTY["events"] += 1                                  # alerts are re-evaluated by evaluate_loop (every 2 s)
-            if str(p.get("event") or "") not in GPS_EVENTS:
-                PULSE_CACHE.clear()                               # an order may have finished — today's numbers change
-            if mt.enabled and name != "other area":
-                asyncio.create_task(enrich_after_event(p))      # fill names / phones / GPS through open endpoints
-        except Exception as e:
-            log.exception("event failed: %s", e)
-            store.log("error", f"event {p.get('resource_type')}.{p.get('event')} failed: {e}"[:300])
+        name = projector.apply(p)
+        STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
+        DIRTY["events"] += 1                                      # alerts are re-evaluated by evaluate_loop (every 2 s)
+        if str(p.get("event") or "") not in GPS_EVENTS:
+            PULSE_CACHE.clear()                                   # an order may have finished — today's numbers change
+        if mt.enabled and name != "other area":
+            asyncio.create_task(enrich_after_event(p))          # fill names / phones / GPS through open endpoints
     else:
         WAKE.set()
-    return {"ok": True}
+
+
+async def event_worker():
+    """Processes queued webhook events one by one; a bad event is logged and skipped, never retried, never fatal."""
+    while True:
+        p = await EVENT_QUEUE.get()
+        try:
+            process_event(p)
+        except Exception as e:
+            WEBHOOK_STATS["worker_errors"] += 1
+            log.exception("event failed: %s", e)
+            try:
+                store.log("error", f"event {p.get('resource_type')}.{p.get('event')} failed: {e}"[:300])
+            except Exception:
+                pass
+        finally:
+            EVENT_QUEUE.task_done()
+        if EVENT_QUEUE.qsize() == 0:
+            await asyncio.sleep(0)                                # let HTTP requests through between bursts
 
 
 # ====================================================================== API
@@ -929,7 +967,8 @@ def api_state():
         DISK_CACHE["at"] = now
     return {"now": iso(now), "city": CITY, "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
             "disk": {"pct": disk["pct"], "free_mb": disk["free_mb"], "total_mb": disk["total_mb"]},
-            "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS, "started": iso(STARTED)}}
+            "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS, "started": iso(STARTED),
+                     "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize()}}}
 
 
 @app.get("/api/places", dependencies=[Depends(require_login)])
@@ -1209,7 +1248,8 @@ def api_system():
     return {"version": VERSION, "started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
             "mode": s["mode"], "event_counts": projector.counts, "endpoint_summary": mt.endpoint_summary(), "disk": disk_report(),
             "api": mt.stats, "areas": AREAS, "sync_seconds": SYNC_SECONDS, "log": store.syslog(40),
-            "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"]}
+            "db_orders": len(store.orders_in("month", datetime.now(UTC))), "samples": STATE["raw_samples"],
+            "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize(), "path_secret_set": PATH_SECRET != "change-me"}}
 
 
 @app.post("/api/alerts/{aid}/dismiss", dependencies=[Depends(require_login)])
@@ -1250,7 +1290,7 @@ def health():
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
             "sync": {k: s[k] for k in ("last_ok", "last_error", "runs", "orders_seen", "riders_seen", "backfilled", "webhook_events", "last_snapshot",
                                        "last_webhook", "silent_min", "webhook_silent", "mode")},
-            "api": mt.stats}
+            "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize()}, "api": mt.stats}
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
