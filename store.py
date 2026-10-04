@@ -25,7 +25,7 @@ import threading
 from datetime import datetime, timedelta
 from statistics import mean, median
 
-from orders import BERLIN, UTC, haversine_m, iso, mins, on_time, phase_minutes, ts
+from orders import BERLIN, UTC, haversine_m, iso, mins, new_order, on_time, phase_minutes, restaurant_waits, ts
 
 DAY_STARTS_AT = 0          # hour (Berlin) at which the operating day starts — set from Settings at startup
 
@@ -158,10 +158,54 @@ class Store:
                     pass
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(orders)").fetchall()}
-            for col in ("reason", "note", "reason_at"):
+            for col, typ in (("reason", "TEXT"), ("note", "TEXT"), ("reason_at", "TEXT"), ("city", "TEXT"), ("day", "TEXT"), ("hour", "INTEGER"),
+                             ("on_time", "INTEGER"), ("vs_plan", "REAL"), ("kitchen_wait", "REAL"), ("accept_min", "REAL"), ("fleet", "TEXT")):
                 if col not in cols:
-                    self.db.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+                    self.db.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+            rcols = {r[1] for r in self.db.execute("PRAGMA table_info(riders)").fetchall()}
+            for col in ("city", "fleet"):
+                if col not in rcols:
+                    self.db.execute(f"ALTER TABLE riders ADD COLUMN {col} TEXT")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_city_day ON orders(city, day)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_day ON orders(day)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_ref ON orders(ref)")
             self.db.commit()
+        self.city_map: dict = {}        # MotionTools service-area id -> city name (Settings "city:<id>")
+        self.fleet_map: dict = {}       # rider id -> fleet name (Settings "fleet:<rider id>")
+        self.plan_grace = 5
+        self._rider_city: dict = {}
+        self._load_maps()
+
+    def _load_maps(self):
+        for k, v in self.get_settings().items():
+            if k.startswith("city:"):
+                self.city_map[k[5:]] = v
+            elif k.startswith("fleet:"):
+                self.fleet_map[k[6:]] = v
+
+    def city_of(self, o: dict) -> str:
+        """City name of an order: the name given in Settings for its MotionTools service area, else the area's own
+        name from the API, else the first 8 characters of the area id (so every area shows up even before it is named)."""
+        area = o.get("area") or ""
+        return self.city_map.get(area) or (o.get("area_name") or "") or (area[:8] if area else "")
+
+    def set_city_name(self, area_id: str, name: str):
+        self.city_map[area_id] = name
+        self.set_settings({f"city:{area_id}": name})
+        self._exec("UPDATE orders SET city=? WHERE area=?", (name, area_id))
+        self._exec("UPDATE riders SET city=? WHERE city=? OR city=?", (name, area_id[:8], area_id))
+
+    def set_fleet(self, rider_id: str, fleet: str):
+        self.fleet_map[rider_id] = fleet
+        self.set_settings({f"fleet:{rider_id}": fleet})
+        self._exec("UPDATE riders SET fleet=? WHERE id=?", (fleet, rider_id))
+        self._exec("UPDATE orders SET fleet=? WHERE rider_id=?", (fleet, rider_id))
+
+    def areas_seen(self) -> list:
+        """Every service area that ever appeared on an order, with its name (if given) and order count (30 days)."""
+        rows = self._rows("SELECT area, city, COUNT(*) AS n, MAX(updated_at) AS last FROM orders WHERE area IS NOT NULL AND area != '' "
+                          "AND updated_at >= ? GROUP BY area ORDER BY n DESC", (iso(datetime.now(UTC) - timedelta(days=30)),))
+        return [{"area": r["area"], "name": self.city_map.get(r["area"], ""), "shown_as": r["city"] or r["area"][:8], "orders": r["n"], "last": r["last"]} for r in rows]
 
     def _rows(self, sql, args=()):
         with self.lock:
@@ -200,7 +244,18 @@ class Store:
         cancelled_at = None
         if o["phase"] == "cancelled":
             cancelled_at = (existing[0]["cancelled_at"] if existing and existing[0]["cancelled_at"] else iso(now))
-        raw = json.dumps({k: (iso(v) if isinstance(v, datetime) else v) for k, v in o.items()})
+        raw = json.dumps({k: (iso(v) if isinstance(v, datetime) else v) for k, v in o.items() if k not in ("phases", "hour", "day", "city", "fleet")})
+        city = self.city_of(o)
+        o["city"] = city
+        when = o.get("dispatched_at") or o.get("delivered_at") or o.get("created_at")
+        day = day_key(when) if when else None
+        hour = (o.get("dispatched_at") or o.get("cancelled_at") or when).astimezone(BERLIN).hour if when else None
+        ot = on_time(o, self.plan_grace) if o["phase"] == "delivered" else None
+        kitchen = restaurant_waits(o)[0] if o["phase"] == "delivered" else None
+        fleet = self.fleet_map.get(o.get("rider_id") or "", "")
+        if o.get("rider_id") and self._rider_city.get(o["rider_id"]) != city and city:
+            self._rider_city[o["rider_id"]] = city
+            self._exec("UPDATE riders SET city=? WHERE id=?", (city, o["rider_id"]))
         merge = ("rider_id=COALESCE(excluded.rider_id, orders.rider_id), rider=CASE WHEN excluded.rider!='' THEN excluded.rider ELSE orders.rider END, "
                  "accepted_at=COALESCE(excluded.accepted_at, orders.accepted_at), "
                  "started_at=COALESCE(excluded.started_at, orders.started_at), "
@@ -215,19 +270,23 @@ class Store:
         self._exec(
             "INSERT INTO orders (id, ref, area, rider_id, rider, restaurant, place_id, customer_addr, customer_zip, status, "
             "phase, stacked, dispatched_at, accepted_at, started_at, at_restaurant_at, picked_up_at, at_customer_at, "
-            "delivered_at, cancelled_at, cancel_reason, ptod_min, closed, first_seen, updated_at, raw) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "delivered_at, cancelled_at, cancel_reason, ptod_min, closed, first_seen, updated_at, raw, "
+            "city, day, hour, on_time, vs_plan, kitchen_wait, accept_min, fleet) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET ref=excluded.ref, area=excluded.area, " + merge +
             "restaurant=excluded.restaurant, place_id=excluded.place_id, customer_addr=excluded.customer_addr, "
             "customer_zip=excluded.customer_zip, status=excluded.status, phase=excluded.phase, stacked=excluded.stacked, "
             "dispatched_at=excluded.dispatched_at, cancelled_at=excluded.cancelled_at, "
             "cancel_reason=excluded.cancel_reason, "
-            "closed=excluded.closed, updated_at=excluded.updated_at, raw=excluded.raw",
+            "closed=excluded.closed, updated_at=excluded.updated_at, raw=excluded.raw, "
+            "city=excluded.city, day=excluded.day, hour=excluded.hour, on_time=excluded.on_time, vs_plan=excluded.vs_plan, "
+            "kitchen_wait=excluded.kitchen_wait, accept_min=excluded.accept_min, fleet=excluded.fleet",
             (o["id"], o["ref"], o["area"], o["rider_id"], o["rider"] or "", o["restaurant"], o.get("place_id", ""),
              o["customer_addr"], o.get("customer_zip", ""), o["status"], o["phase"], stacked_flag,
              iso(o["dispatched_at"]), iso(o["accepted_at"]), iso(o["started_at"]), iso(o["at_restaurant_at"]),
              iso(o["picked_up_at"]), iso(o["at_customer_at"]), iso(o["delivered_at"]), cancelled_at,
-             o.get("cancel_reason", ""), pm["ptod"], closed, first_seen, iso(now), raw))
+             o.get("cancel_reason", ""), pm["ptod"], closed, first_seen, iso(now), raw,
+             city, day, hour, (None if ot is None else int(ot)), pm["vs_plan"], kitchen, pm["to_accept"], fleet))
 
     def set_reason(self, oid: str, reason: str, note: str, now: datetime) -> bool:
         """The manager's explanation for a late / problematic order (shown in Orders, Insights, daily report)."""
@@ -249,7 +308,13 @@ class Store:
         return n
 
     def _hydrate(self, r: dict) -> dict:
-        o = json.loads(r["raw"]) if r.get("raw") else {}
+        o = json.loads(r["raw"]) if r.get("raw") else new_order(r["id"], r.get("ref") or "", r.get("area"))
+        if not r.get("raw"):                       # archived row: rebuild what the columns know
+            for k in ("rider_id", "rider", "restaurant", "place_id", "customer_addr", "customer_zip", "status", "phase", "cancel_reason",
+                      "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at", "at_customer_at", "delivered_at"):
+                if r.get(k) is not None:
+                    o[k] = r[k]
+            o["created_at"] = r.get("first_seen"); o["archived"] = True
         for k in DT_FIELDS:
             o[k] = ts(o.get(k))
         # DB columns win for timestamps we merged (COALESCE), so a later poll can't blank an earlier phase
@@ -261,6 +326,7 @@ class Store:
         o["stacked"] = bool(r.get("stacked"))
         o["cancelled_at"] = ts(r.get("cancelled_at"))
         o["reason"], o["note"] = r.get("reason") or "", r.get("note") or ""
+        o["city"], o["fleet"], o["day"] = r.get("city") or self.city_of(o), r.get("fleet") or "", r.get("day")
         o["phases"] = phase_minutes(o)
         d = o["dispatched_at"] or o["cancelled_at"]
         o["hour"] = d.astimezone(BERLIN).hour if d else None
@@ -274,11 +340,13 @@ class Store:
             if r["id"] not in keep_ids:
                 self._exec("UPDATE orders SET closed=1, updated_at=? WHERE id=? AND closed=0", (iso(now), r["id"]))
 
-    def orders_in(self, period: str, now: datetime, q: str = "") -> list:
+    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "") -> list:
         start, end = period_range(period, now)
-        rows = self._rows("SELECT * FROM orders WHERE (dispatched_at >= ? AND dispatched_at < ?) OR closed=0 "
-                          "OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?) "
-                          "ORDER BY COALESCE(dispatched_at, first_seen) DESC", (iso(start), iso(end), iso(start), iso(end)))
+        where = "((dispatched_at >= ? AND dispatched_at < ?) OR closed=0 OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?))"
+        args = [iso(start), iso(end), iso(start), iso(end)]
+        if city:
+            where += " AND city=?"; args.append(city)
+        rows = self._rows(f"SELECT * FROM orders WHERE {where} ORDER BY COALESCE(dispatched_at, first_seen) DESC", args)
         out = [self._hydrate(r) for r in rows]
         if q:
             ql = q.lower()
@@ -290,20 +358,25 @@ class Store:
         rows = self._rows("SELECT * FROM orders WHERE id=?", (oid,))
         return self._hydrate(rows[0]) if rows else None
 
-    def delete_day(self, day: str, now: datetime, dry_run: bool = False) -> dict:
+    def order_by_ref(self, ref: str):
+        rows = self._rows("SELECT * FROM orders WHERE upper(ref)=? ORDER BY first_seen DESC LIMIT 1", (ref.upper(),))
+        return self._hydrate(rows[0]) if rows else None
+
+    def delete_day(self, day: str, now: datetime, dry_run: bool = False, city: str = "") -> dict:
         """Wipe one operating day that was recorded wrongly: its finished orders, their alerts and GPS points, and the
         frozen report. Live orders are never touched. dry_run only counts."""
         start, end = period_range(day, now)
         a, b = iso(start), iso(end)
-        where = "closed=1 AND COALESCE(dispatched_at, first_seen) >= ? AND COALESCE(dispatched_at, first_seen) < ?"
-        ids = [r["id"] for r in self._rows(f"SELECT id FROM orders WHERE {where}", (a, b))]
+        where = "closed=1 AND COALESCE(dispatched_at, first_seen) >= ? AND COALESCE(dispatched_at, first_seen) < ?" + (" AND city=?" if city else "")
+        wargs = (a, b, city) if city else (a, b)
+        ids = [r["id"] for r in self._rows(f"SELECT id FROM orders WHERE {where}", wargs)]
         alerts = self._rows("SELECT COUNT(*) AS n FROM alerts WHERE opened_at >= ? AND opened_at < ?", (a, b))[0]["n"]
         reports = self._rows("SELECT COUNT(*) AS n FROM daily_stats WHERE day=?", (day,))[0]["n"]
         out = {"day": day, "orders": len(ids), "alerts": alerts, "reports": reports, "deleted": False}
         if dry_run or not (ids or alerts or reports):
             return out
         with self.lock:
-            self.db.execute(f"DELETE FROM orders WHERE {where}", (a, b))
+            self.db.execute(f"DELETE FROM orders WHERE {where}", wargs)
             self.db.execute("DELETE FROM alerts WHERE opened_at >= ? AND opened_at < ?", (a, b))
             self.db.execute("DELETE FROM positions WHERE at >= ? AND at < ?", (a, b))
             self.db.execute("DELETE FROM daily_stats WHERE day=?", (day,))
@@ -312,8 +385,41 @@ class Store:
         self.log("info", f"data of {day} deleted on request: {len(ids)} orders, {alerts} alerts, {reports} frozen report(s)")
         return out
 
-    def delivered(self, period: str, now: datetime) -> list:
-        return [o for o in self.orders_in(period, now) if o["phase"] == "delivered" and o["delivered_at"]]
+    def delivered(self, period: str, now: datetime, city: str = "") -> list:
+        return [o for o in self.orders_in(period, now, city=city) if o["phase"] == "delivered" and o["delivered_at"]]
+
+    def backfill_columns(self, limit: int = 2000) -> int:
+        """Rows written before 6.1 have no city/day/hour columns yet — fill them batch by batch (runs after startup)."""
+        rows = self._rows("SELECT * FROM orders WHERE day IS NULL AND raw IS NOT NULL LIMIT ?", (limit,))
+        for r in rows:
+            o = self._hydrate(r)
+            self.upsert_order(o, ts(r.get("updated_at")) or datetime.now(UTC), stacked=bool(r.get("stacked")), force=True)
+        return len(rows)
+
+    def cities_on(self, day: str) -> list:
+        return [r["city"] for r in self._rows("SELECT DISTINCT city FROM orders WHERE day=? AND city IS NOT NULL AND city != ''", (day,))]
+
+    def archive_old(self, now: datetime, keep_days: int = 90) -> int:
+        """Rows older than keep_days lose their raw JSON (history, addresses, phones) but keep every number the reports
+        use. At 170 000 orders a month this keeps the database at a fraction of the size."""
+        cutoff = day_key(now - timedelta(days=keep_days))
+        return self._exec("UPDATE orders SET raw=NULL WHERE day < ? AND raw IS NOT NULL AND closed=1", (cutoff,)).rowcount
+
+    def network_today(self, now: datetime, grace: int) -> dict:
+        """Per city, today, straight from SQL: delivered, on-time %, avg PTOD, cancelled, orders per hour."""
+        day = day_key(now)
+        out = {}
+        for r in self._rows("SELECT city, SUM(phase='delivered') AS delivered, SUM(phase='cancelled') AS cancelled, COUNT(*) AS orders, "
+                            "AVG(CASE WHEN phase='delivered' THEN ptod_min END) AS avg_ptod, "
+                            "SUM(CASE WHEN on_time=1 THEN 1 ELSE 0 END) AS ot, SUM(CASE WHEN on_time IS NOT NULL THEN 1 ELSE 0 END) AS otn, "
+                            "SUM(CASE WHEN ptod_min IS NOT NULL AND ptod_min > 30 THEN 1 ELSE 0 END) AS late "
+                            "FROM orders WHERE day=? GROUP BY city", (day,)):
+            out[r["city"] or ""] = {"delivered": r["delivered"] or 0, "cancelled": r["cancelled"] or 0, "orders": r["orders"] or 0,
+                                    "avg_ptod": round(r["avg_ptod"], 1) if r["avg_ptod"] is not None else None,
+                                    "on_time_pct": _pct(r["ot"] or 0, r["otn"] or 0), "late": r["late"] or 0, "hours": {}}
+        for r in self._rows("SELECT city, hour, COUNT(*) AS n FROM orders WHERE day=? AND hour IS NOT NULL GROUP BY city, hour", (day,)):
+            out.setdefault(r["city"] or "", {"delivered": 0, "cancelled": 0, "orders": 0, "avg_ptod": None, "on_time_pct": None, "late": 0, "hours": {}})["hours"][r["hour"]] = r["n"]
+        return out
 
     # ================================================================ alerts
     def open_alerts(self):
@@ -398,7 +504,7 @@ class Store:
                 self._exec("UPDATE riders SET online=0 WHERE id=?", (r["id"],))
 
     def riders(self) -> list:
-        rows = self._rows("SELECT * FROM riders ORDER BY online DESC, name")
+        rows = self._rows("SELECT * FROM riders ORDER BY name")
         for r in rows:
             r["active_ids"] = json.loads(r["active_ids"] or "[]")
         return rows
@@ -491,14 +597,14 @@ class Store:
         return {h: round(v, 1) for h, v in out.items()}
 
     # ================================================================ analytics
-    def insights(self, period: str, now: datetime, rules, sessions_ok: bool = False) -> dict:
+    def insights(self, period: str, now: datetime, rules, sessions_ok: bool = False, city: str = "") -> dict:
         """sessions_ok=False (webhook mode): online/offline is only partly known, so every metric built on
         'hours online' (busy %, orders/hour, idle, rider-hours per hour) is left out; staffing uses the riders
         who actually handled orders in that hour instead — which comes straight from the orders."""
         start, end = period_range(period, now)
         def when(o):                       # an order belongs to the period of its dispatch; if that is unknown, of its delivery / creation
             return o["dispatched_at"] or o["delivered_at"] or o.get("created_at")
-        orders = [o for o in self.orders_in(period, now) if when(o) and start <= when(o) < end]
+        orders = [o for o in self.orders_in(period, now, city=city) if when(o) and start <= when(o) < end]
         done = [o for o in orders if o["phase"] == "delivered" and o["delivered_at"]]
         cancelled = [o for o in orders if o["phase"] == "cancelled"]
         tgt = rules.ptod_target_min
@@ -520,14 +626,22 @@ class Store:
 
         # --- restaurants ---
         restaurants = []
+        kitchen, own_waits = {}, {}                         # per order: kitchen wait (any rider) · per rider: own waits
+        for o in orders:
+            k, w = restaurant_waits(o)
+            kitchen[o["id"]] = k
+            for rid, (m, gave_up) in w.items():
+                if rid and m is not None:
+                    own_waits.setdefault(rid, []).append((m, gave_up))
         for name, rs in group(done + cancelled, lambda o: o["restaurant"] or "?").items():
             d = [o for o in rs if o["phase"] == "delivered"]
-            rs_sorted = sorted(rs, key=lambda o: -(o["phases"]["at_restaurant"] or 0))
+            rs_sorted = sorted(rs, key=lambda o: -(kitchen.get(o["id"]) or 0))
             restaurants.append({"restaurant": name, "orders": len(rs), "delivered": len(d), "cancelled": len(rs) - len(d),
                                 "place_id": next((o.get("place_id") for o in rs if o.get("place_id")), ""),
                                 "refs": [o["ref"] for o in rs_sorted[:4]],
-                                "avg_wait": _avg([o["phases"]["at_restaurant"] for o in d]),
-                                "max_wait": max([o["phases"]["at_restaurant"] or 0 for o in d], default=None),
+                                "avg_wait": _avg([kitchen.get(o["id"]) for o in d]),          # first rider's arrival -> pickup
+                                "max_wait": max([kitchen.get(o["id"]) or 0 for o in d], default=None),
+                                "gave_up": sum(1 for o in rs for _, g in restaurant_waits(o)[1].values() if g),
                                 "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
                                 "within_pct": _within(d, tgt)})
         restaurants.sort(key=lambda x: -(x["avg_wait"] or 0))
@@ -551,11 +665,14 @@ class Store:
                           "no_rider_5": sum(1 for o in rs if (o["phases"]["to_accept"] or 0) >= 5 or (not o["accepted_at"] and o["phase"] == "cancelled"))})
 
         # --- riders ---
-        handbacks = {}
+        handbacks, excused = {}, {}
         for o in orders:
             for h in o.get("history") or []:
                 if h.get("what") == "released" and h.get("rider_id"):
                     handbacks[h["rider_id"]] = handbacks.get(h["rider_id"], 0) + 1
+            for rid, (m, gave_up) in restaurant_waits(o)[1].items():
+                if gave_up and rid and m is not None and m >= rules.wait_restaurant_min:
+                    excused[rid] = excused.get(rid, 0) + 1       # handed back after waiting long enough — the kitchen's fault
         riders = []
         for rid, rs in group(orders, lambda o: o["rider_id"] or "").items():
             if not rid:
@@ -566,20 +683,24 @@ class Store:
             online = self.online_minutes(rid, start, min(end, now)) if sessions_ok else 0
             kms = [self.trail_km(o) for o in d[-8:]]            # one positions query per order — keep it small
             kms = [k for k in kms if k]
-            riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "orders": len(rs), "delivered": len(d),
+            riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "city": rs[-1].get("city") or "", "fleet": rs[-1].get("fleet") or "",
+                           "orders": len(rs), "delivered": len(d),
                            "cancelled": sum(1 for o in rs if o["phase"] == "cancelled"),
                            "live": sum(1 for o in rs if o["phase"] not in ("delivered", "cancelled", "closed")),
                            "within_pct": _within(d, tgt), "on_time_pct": _on_time(d, grace),
                            "avg_vs_plan": _avg([o["phases"]["vs_plan"] for o in d]),
                            "avg_ptod": ph("ptod"), "median_ptod": _median([o["phases"]["ptod"] for o in d]),
                            "avg_accept": ph("to_accept"), "avg_to_restaurant": ph("to_restaurant"),
-                           "avg_wait": ph("at_restaurant"), "avg_to_customer": ph("to_customer"), "avg_handover": ph("handover"),
+                           "avg_wait": _avg([m for m, _ in own_waits.get(rid, [])]) if own_waits.get(rid) else ph("at_restaurant"),
+                           "waits_given_up": sum(1 for _, g in own_waits.get(rid, []) if g),
+                           "avg_to_customer": ph("to_customer"), "avg_handover": ph("handover"),
                            "avg_delivery_min": round(busy / len(d), 1) if d else None,
                            "delivery_minutes": round(busy), "online_minutes": online,
                            "utilisation_pct": _pct(busy, online) if online else None,
                            "orders_per_hour": round(len(d) / (online / 60), 1) if online >= 30 else None,
                            "idle_minutes": round(max(0, online - busy)) if online else None,
                            "avg_km": _avg(kms), "double": sum(1 for o in rs if o["stacked"]), "handbacks": handbacks.get(rid, 0),
+                           "handbacks_excused": excused.get(rid, 0),
                            "alerts": sum(by_rider_alerts.get(rid, {}).values()), "alert_kinds": by_rider_alerts.get(rid, {})})
         riders.sort(key=lambda x: (-(x["within_pct"] if x["within_pct"] is not None else -1), x["avg_ptod"] or 0, -x["delivered"]))
 
@@ -607,7 +728,16 @@ class Store:
                 cause[worst] = cause.get(worst, 0) + 1
 
         focus = self._focus(rules, restaurants, hours, riders, phases, single, double, by_kind, late, cause, districts, sessions_ok)
-        return {"period": period, "start": iso(start), "orders": len(orders), "delivered": len(done),
+        fleets = []
+        for fl, rs in group([o for o in orders if o.get("fleet")], lambda o: o["fleet"]).items():
+            d = [o for o in rs if o["phase"] == "delivered"]
+            fleets.append({"fleet": fl, "orders": len(rs), "delivered": len(d), "riders": len({o["rider_id"] for o in rs if o["rider_id"]}),
+                           "within_pct": _within(d, tgt), "on_time_pct": _on_time(d, grace), "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
+                           "avg_accept": _avg([o["phases"]["to_accept"] for o in rs if o["accepted_at"]]),
+                           "handbacks": sum(1 for o in rs for h in (o.get("history") or []) if h.get("what") == "released"),
+                           "per_rider": round(len(d) / len({o["rider_id"] for o in d if o["rider_id"]}), 1) if d else None})
+        fleets.sort(key=lambda x: -(x["on_time_pct"] if x["on_time_pct"] is not None else x["within_pct"] or 0))
+        return {"period": period, "city": city, "fleets": fleets, "start": iso(start), "orders": len(orders), "delivered": len(done),
                 "cancelled": len(cancelled), "cancel_pct": _pct(len(cancelled), len(orders)),
                 "within_pct": _pct(sum(1 for p in ptods if p <= tgt), len(ptods)), "target_within_pct": rules.target_within_pct,
                 "on_time_pct": _pct(sum(1 for v in vs_plan if v <= grace), len(vs_plan)), "plan_known": len(vs_plan),
@@ -675,7 +805,7 @@ class Store:
         return focus[:7]
 
     # ================================================================ staffing plan
-    def staffing_plan(self, now: datetime, rules, day: str = "", weeks: int = 4) -> dict:
+    def staffing_plan(self, now: datetime, rules, day: str = "", weeks: int = 4, city: str = "") -> dict:
         """Riders needed per hour on a given day (default: tomorrow), weekday-aware:
         a Saturday is planned from the previous Saturdays (up to `weeks` back); while fewer than 2 of that weekday
         are recorded, the last 7 days are used instead.  Per hour: orders (average / busiest day) ÷ capacity
@@ -683,14 +813,19 @@ class Store:
         Also returns the same summary for each of the next 7 days."""
         today = day_start(now)
         start = today - timedelta(days=weeks * 7 - 1)
-        rows = self._rows("SELECT * FROM orders WHERE dispatched_at >= ? AND dispatched_at < ?", (iso(start), iso(now + timedelta(days=1))))
-        per_day = {}                                              # day_key -> hour -> [orders]
-        for r in rows:
-            o = self._hydrate(r)
-            d = o["dispatched_at"]
-            if not d or o["phase"] == "closed":
-                continue
-            per_day.setdefault(day_key(d), {}).setdefault(d.astimezone(BERLIN).hour, []).append(o)
+        # aggregated in SQL: at 170 000 orders a month this must not touch rows one by one
+        where = "day >= ? AND day <= ? AND dispatched_at IS NOT NULL AND phase != 'closed'"
+        args = [day_key(start), day_key(now + timedelta(days=1))]
+        if city:
+            where += " AND city=?"; args.append(city)
+        per_day = {}                                              # day_key -> hour -> aggregate dict
+        for r in self._rows(f"SELECT day, hour, COUNT(*) AS n, COUNT(DISTINCT rider_id) AS riders, AVG(accept_min) AS accept, "
+                            f"SUM(CASE WHEN accept_min >= ? OR (accepted_at IS NULL AND phase='cancelled') THEN 1 ELSE 0 END) AS no_rider, "
+                            f"SUM(CASE WHEN phase='delivered' AND ptod_min <= ? THEN 1 ELSE 0 END) AS within, SUM(CASE WHEN phase='delivered' AND ptod_min IS NOT NULL THEN 1 ELSE 0 END) AS withn, "
+                            f"SUM(CASE WHEN on_time=1 THEN 1 ELSE 0 END) AS ot, SUM(CASE WHEN on_time IS NOT NULL THEN 1 ELSE 0 END) AS otn "
+                            f"FROM orders WHERE {where} GROUP BY day, hour", [rules.accept_limit_min, rules.ptod_target_min] + args):
+            if r["day"] and r["hour"] is not None:
+                per_day.setdefault(r["day"], {})[r["hour"]] = dict(r)
         today_key = day_key(now)
         cap = max(0.5, float(rules.riders_capacity_per_hour or 1.5))
         local_today = today.astimezone(BERLIN).date()
@@ -708,32 +843,32 @@ class Store:
             n_days = max(1, len(basis))
             by_hour = {}
             for dk in basis:
-                for h, os_ in per_day.get(dk, {}).items():
-                    by_hour.setdefault(h, {})[dk] = os_
+                for h, agg in per_day.get(dk, {}).items():
+                    by_hour.setdefault(h, {})[dk] = agg
             hours = []
             for h in sorted(by_hour, key=lambda x: (x - DAY_STARTS_AT) % 24):
                 pd = by_hour[h]
-                counts = [len(v) for v in pd.values()]
-                allo = [o for v in pd.values() for o in v]
-                done = [o for o in allo if o["phase"] == "delivered"]
-                active = [len({o["rider_id"] for o in v if o["rider_id"]}) for v in pd.values()]
-                avg = sum(counts) / n_days                           # basis days without orders in this hour count as 0
+                counts = [a["n"] for a in pd.values()]
+                total = sum(counts)
+                active = [a["riders"] for a in pd.values()]
+                avg = total / n_days                                  # basis days without orders in this hour count as 0
                 had = round(sum(active) / len(active), 1) if active else None
-                accept = _avg([o["phases"]["to_accept"] for o in allo if o["accepted_at"]])
-                no_rider = sum(1 for o in allo if (o["phases"]["to_accept"] or 0) >= rules.accept_limit_min
-                               or (not o["accepted_at"] and o["phase"] == "cancelled"))
-                slow = (accept or 0) >= 4 or no_rider >= max(2, len(allo) // 5)
+                acc_vals = [(a["accept"], a["n"]) for a in pd.values() if a["accept"] is not None]
+                accept = round(sum(v * n for v, n in acc_vals) / sum(n for _, n in acc_vals), 1) if acc_vals else None
+                no_rider = sum(a["no_rider"] or 0 for a in pd.values())
+                slow = (accept or 0) >= 4 or no_rider >= max(2, total // 5)
                 need = math.ceil(avg / cap)                            # throughput: orders ÷ what one rider delivers per hour
                 plan = max(need, math.ceil(had or 0) + 1) if slow else need   # it was slow with N riders -> at least N+1
+                within_n = sum(a["withn"] or 0 for a in pd.values()); ot_n = sum(a["otn"] or 0 for a in pd.values())
                 hours.append({"hour": h, "avg_orders": round(avg, 1), "max_orders": max(counts), "riders_needed": need,
                               "riders_peak": math.ceil(max(counts) / cap), "riders_had": had, "avg_accept": accept,
-                              "within_pct": _within(done, rules.ptod_target_min), "on_time_pct": _on_time(done, rules.plan_grace_min),
+                              "within_pct": _pct(sum(a["within"] or 0 for a in pd.values()), within_n), "on_time_pct": _pct(sum(a["ot"] or 0 for a in pd.values()), ot_n),
                               "no_rider": no_rider, "slow": slow, "plan": plan})
             peak = sorted(x["hour"] for x in sorted(hours, key=lambda x: -x["avg_orders"])[:3])
             return {"day": target.isoformat(), "weekday": target.strftime("%A"), "basis": basis_label, "basis_days": len(basis),
                     "same_weekday": len(same) >= 2, "hours": hours, "peak_hours": peak,
                     "rider_hours": sum(x["plan"] for x in hours), "riders_peak": max([x["plan"] for x in hours], default=0),
-                    "orders_per_day": round(sum(len(v) for dk in basis for v in per_day.get(dk, {}).values()) / n_days, 1)}
+                    "orders_per_day": round(sum(a["n"] for dk in basis for a in per_day.get(dk, {}).values()) / n_days, 1)}
 
         try:
             target = datetime.strptime(day, "%Y-%m-%d").date() if day else local_today + timedelta(days=1)
@@ -741,6 +876,7 @@ class Store:
             target = local_today + timedelta(days=1)
         out = plan_for(target)
         out["capacity"] = cap
+        out["city"] = city
         out["tomorrow"] = (local_today + timedelta(days=1)).strftime("%A")
         out["week"] = []
         for i in range(1, 8):
@@ -749,30 +885,36 @@ class Store:
             out["week"].append({k: w[k] for k in ("day", "weekday", "basis", "basis_days", "same_weekday", "peak_hours", "rider_hours", "riders_peak", "orders_per_day")})
         return out
 
-    def staffing_csv(self, now: datetime, rules) -> str:
+    def staffing_csv(self, now: datetime, rules, city: str = "") -> str:
         """Next 7 days × hours: the riders to plan — paste into the shift sheet."""
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["date", "weekday", "hour", "orders_avg", "orders_busiest_day", "riders_plan", "riders_at_peak", "based_on"])
+        w.writerow(["city", "date", "weekday", "hour", "orders_avg", "orders_busiest_day", "riders_plan", "riders_at_peak", "based_on"])
         local_today = day_start(now).astimezone(BERLIN).date()
         for i in range(1, 8):
             d = (local_today + timedelta(days=i)).isoformat()
-            pl = self.staffing_plan(now, rules, day=d)
+            pl = self.staffing_plan(now, rules, day=d, city=city)
             for h in pl["hours"]:
-                w.writerow([d, pl["weekday"], f"{h['hour']:02d}:00", h["avg_orders"], h["max_orders"], h["plan"], h["riders_peak"], pl["basis"]])
+                w.writerow([city or "all", d, pl["weekday"], f"{h['hour']:02d}:00", h["avg_orders"], h["max_orders"], h["plan"], h["riders_peak"], pl["basis"]])
         return buf.getvalue()
 
     # ================================================================ daily snapshot
-    def save_daily(self, day: str, data: dict):
+    def save_daily(self, day: str, data: dict, city: str = ""):
+        key = f"{day}#{city}" if city else day
         self._exec("INSERT INTO daily_stats (day, computed_at, data) VALUES (?,?,?) ON CONFLICT(day) DO UPDATE SET "
-                   "computed_at=excluded.computed_at, data=excluded.data", (day, iso(datetime.now(UTC)), json.dumps(data)))
+                   "computed_at=excluded.computed_at, data=excluded.data", (key, iso(datetime.now(UTC)), json.dumps(data)))
 
-    def daily(self, day: str):
-        rows = self._rows("SELECT data FROM daily_stats WHERE day=?", (day,))
+    def daily(self, day: str, city: str = ""):
+        rows = self._rows("SELECT data FROM daily_stats WHERE day=?", (f"{day}#{city}" if city else day,))
         return json.loads(rows[0]["data"]) if rows else None
 
-    def daily_trend(self, days=14) -> list:
-        rows = self._rows("SELECT day, data FROM daily_stats ORDER BY day DESC LIMIT ?", (days,))
+    def daily_trend(self, days=14, city: str = "") -> list:
+        if city:
+            rows = self._rows("SELECT day, data FROM daily_stats WHERE day LIKE ? ORDER BY day DESC LIMIT ?", (f"%#{city}", days))
+            for r in rows:
+                r["day"] = r["day"].split("#")[0]
+        else:
+            rows = self._rows("SELECT day, data FROM daily_stats WHERE day NOT LIKE '%#%' ORDER BY day DESC LIMIT ?", (days,))
         out = []
         for r in rows:
             d = json.loads(r["data"])
@@ -781,13 +923,13 @@ class Store:
         return list(reversed(out))
 
     # ================================================================ export
-    def export_csv(self, period: str, now: datetime, rules=None) -> str:
-        rows = self.orders_in(period, now)
+    def export_csv(self, period: str, now: datetime, rules=None, city: str = "") -> str:
+        rows = self.orders_in(period, now, city=city)
         tgt = rules.ptod_target_min if rules else 30
         grace = rules.plan_grace_min if rules else 5
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["order", "status", "rider", "restaurant", "customer", "postcode", "created", "dispatched", "accepted", "at_restaurant",
+        w.writerow(["order", "city", "fleet", "status", "rider", "restaurant", "customer", "postcode", "created", "dispatched", "accepted", "at_restaurant",
                     "picked_up", "at_customer", "delivered", "min_to_accept", "min_to_restaurant", "min_at_restaurant",
                     "min_to_customer", "min_handover", "ptod_min", f"within_{tgt}", "planned_delivery", "min_vs_plan", "on_time_plan",
                     "double_order", "redispatched", "riders_history", "reason", "note", "cancel_reason"])
@@ -795,7 +937,7 @@ class Store:
         for o in rows:
             p = o["phases"]
             hist = " > ".join(f"{h.get('what')} {h.get('rider') or ''}".strip() for h in (o.get("history") or []))
-            w.writerow([o["ref"], o["phase"], o["rider"], o["restaurant"], o["customer_addr"], o.get("customer_zip", ""),
+            w.writerow([o["ref"], o.get("city", ""), o.get("fleet", ""), o["phase"], o["rider"], o["restaurant"], o["customer_addr"], o.get("customer_zip", ""),
                         f(o.get("created_at")), f(o["dispatched_at"]), f(o["accepted_at"]), f(o["at_restaurant_at"]), f(o["picked_up_at"]),
                         f(o["at_customer_at"]), f(o["delivered_at"]), p["to_accept"], p["to_restaurant"], p["at_restaurant"],
                         p["to_customer"], p["handover"], p["ptod"], "" if p["ptod"] is None else ("yes" if p["ptod"] <= tgt else "no"),

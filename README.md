@@ -1,8 +1,27 @@
-# Quickzi — Munich ops platform (v5.7)
+# Quickzi — fleet ops platform, all cities (v6.2)
 
-A 24/7 control room for Quickzi's Munich delivery operation. Everything is written to SQLite on the Railway
+A 24/7 control room for Quickzi's delivery operation in every city — one server, one webhook stream, one database. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
 (Berlin) it freezes the daily report of the day that just ended.
+
+## Network edition (6.1): every city in one tool
+- **A city = a MotionTools service area.** Events only carry the area id, so each area is named once in Settings → Cities
+  (names coming from the booking API are taken automatically). Until named, an area shows as the first 8 characters of its id.
+- **City selector** in the header: every tab — City (live board), Orders, Riders, Insights, Daily report, CSV exports,
+  staffing plan, delete-day — works for the selected city or for all cities. The choice is remembered per browser.
+- **Overview tab**: the whole network — delivered, on time, PTOD, live, waiting, riders on orders, alerts — then one tile per
+  city sorted by status (critical → strained → ok) with live/waiting/riders, on time, avg, orders-per-hour bars and the top
+  issue in words; a per-city watchdog ("silent 18′") when a city stops sending events while it has live orders; the 14-day
+  on-time trend; the list of cities that need the network team now. Tap a city → its live board.
+- **Fleets = MotionTools organizations.** Every rider has an *Organization* in MotionTools; the server reads it through the
+  rider-detail endpoint (open on the restricted token) after each start, one rider every 2 s, and uses it as the fleet.
+  A fleet typed in Settings wins over the API value. The Riders tab then shows a Fleets table — riders, deliveries, per rider, within target, on time, PTOD, accept, hand-backs — same metrics for every fleet.
+- **Built for 170 000 orders a month**: city/day/hour and the result numbers are stored as columns, the staffing plan and
+  the network view aggregate in SQL, alerts are indexed, the event replay streams the daily files, and orders older than
+  90 days keep their numbers but drop their details. Measured with 25 cities, 1 000 live orders, 600 riders: a city page
+  answers in ~10 ms, the network overview in ~2 ms (cached 10 s), alert evaluation of 1 000 orders in ~30 ms.
+- **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
+  of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
 ## Two ways to get the truth from MotionTools — chosen automatically
 - **API mode** — the token may read bookings: every 30 s all active orders (full timeline) + all riders (online, GPS).
@@ -63,6 +82,12 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   system panel: mode, event counts, **which MotionTools endpoints are open**, log, raw samples;
   **delete one day's data** (for a day that was recorded wrongly: check first, then confirm — live orders are kept).
 
+## Riders are counted from orders only
+"Riders on orders" = distinct riders holding a live order; "delivered today" = riders with at least one delivery.
+There is no "online" count: MotionTools' online/offline events are unreliable for this (no event when the app is just
+closed) and arrive for every rider in the account, other fleets included. Riders you never see on a Quickzi order are
+never counted. A rider whose live order had no event for 60 min is flagged "no event 60′+" instead of counted as busy.
+
 ## Order stages (Live tab board, always in this order)
 Waiting for rider · Accepted, not started · Riding to restaurant · At restaurant · Delivering · At customer · **On hold**.
 On hold = created by Lieferando but not yet dispatched by MotionTools (pre-orders, often hours ahead): no PTOD, no alerts.
@@ -76,6 +101,11 @@ GPS-based alerts (not moving / no GPS / wrong direction) only fire for riders we
 **Double orders** (two bookings in one tour): each order keeps its own PTOD clock from its own dispatch. The order
 whose next stop has the earliest ETA is the one the rider is doing now; the other is *queued* — shown on the card
 ("double with X — rider is doing X first") and exempt from riding/waiting alerts until it is the current one.
+**Waiting at the restaurant when a rider handed back**: three measures. *Kitchen wait* (Restaurants table) = first
+arrival of any rider → pickup, hand-backs included, plus "gave up" = riders who handed back after waiting. *Own wait*
+(Riders table) = only that rider's minutes, including before a hand-back. A hand-back after waiting at least the
+restaurant threshold (8 min) is *excused* — the kitchen's fault, not counted against the rider. The alert on the live
+board always uses the current rider's own clock.
 **Redispatched orders**: every order keeps a rider-by-rider history — accepted by A, arrived at restaurant (A),
 handed back by A, accepted by B, picked up (B), delivered (B)… The story shows all of it, the card says
 "redispatched 2×", the Riders tab counts hand-backs per rider, and the phase minutes belong to the rider who
@@ -114,7 +144,7 @@ hourly (old files, old points, VACUUM when there is room); Settings → System s
 
 ## Railway variables
 `MT_API_TOKEN`, `DASHBOARD_PASSWORD`, `WEBHOOK_PATH_SECRET`, `DATA_DIR=/data`,
-`MUNICH_SERVICE_AREA_ID` (comma-separated area ids; empty = all). Optional: `SYNC_SECONDS` (30), `CITY_NAME`.
+`MUNICH_SERVICE_AREA_ID` (optional: comma-separated area ids to keep; **empty = all cities**). Optional: `SYNC_SECONDS` (30), `CITY_NAME`.
 
 ## MotionTools webhooks (required in webhook mode)
 Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
@@ -123,9 +153,16 @@ Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
    tour.created, tour.transition (+ driver.busy if offered).
 2. "Munich GPS": same endpoint, filter customer_id = the Lieferando customer, only booking.driver_location_updated.
 
+## Intercom rider bot — lookup endpoint
+`GET /api/intercom/customer?ref=WPC4W7` with header `X-Api-Key: <WEBHOOK_PATH_SECRET>` answers
+`{found, ref, phone, address, zip, restaurant, restaurant_phone, rider, status, message}` for that order; `POST` on the
+same URL first fetches the booking detail from MotionTools when the number is not known yet (one call of the restricted
+hourly quota, only when a rider asks). Used by the Intercom Workflow (Data connector) or an external bot — the dashboard
+itself does not talk to Intercom.
+
 ## Pages
 `/dashboard` (any username + DASHBOARD_PASSWORD) · `/export.csv?period=today|yesterday|week|month|YYYY-MM-DD` ·
-`/health` (no login) · `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`, `/api/staffing`,
+`/health` (no login) · `/api/network`, `/api/cities`, `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`, `/api/staffing`,
 `/export-events.jsonl` (last raw webhook events, for debugging) (login).
 
 ## Test locally

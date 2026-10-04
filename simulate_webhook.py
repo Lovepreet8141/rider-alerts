@@ -85,6 +85,20 @@ EVENTS = [ev("driver", "online", m(-90), driver_id="r-ahmad", profile={"first_na
 EVENTS += order_events("D1", "b-D1", PLACE_BK, "r-ahmad", "Ahmad Sabe", -75, wait_min=13)
 EVENTS += order_events("D2", "b-D2", PLACE_CHO, "r-murat", "Murat K.", -70, wait_min=3)
 EVENTS += order_events("D3", "b-D3", PLACE_BK, "r-obaida", "Obaida H.", -62, wait_min=11)
+# ---- a second city (Hamburg): same event shapes, another service area id — the master tool must keep them apart
+AREA_HH = "7a1b2c3d-hamburg-area-0000-000000000002"
+_ev_backup = ev
+def ev_hh(rtype, event_name, t, **data):
+    e = _ev_backup(rtype, event_name, t, **data); e["data"]["service_area_id"] = AREA_HH; return e
+ev = ev_hh
+RIDERS["r-lena"] = ("Lena", "W.", "+49 151 2000001"); RIDERS["r-jonas"] = ("Jonas", "P.", "+49 151 2000002")
+EVENTS += [ev("driver", "online", m(-70), driver_id="r-lena", profile={"first_name": "Lena", "last_name": "W."}),
+           ev("driver", "online", m(-70), driver_id="r-jonas", profile={"first_name": "Jonas", "last_name": "P."})]
+EVENTS += order_events("HH0001", "b-hh1", PLACE_CHO, "r-lena", "Lena W.", -58, wait_min=3)
+EVENTS += order_events("HH0002", "b-hh2", PLACE_CHO, "r-jonas", "Jonas P.", -40, wait_min=14)
+EVENTS += order_events("HH0003", "b-hh3", PLACE_CHO, "r-lena", "Lena W.", -18, wait_min=4, deliver=False)
+EVENTS += order_events("HH0004", "b-hh4", PLACE_CHO, None, "", -9, wait_min=None)
+ev = _ev_backup
 EVENTS += order_events("D4", "b-D4", PLACE_CHO, "r-ahmad", "Ahmad Sabe", -48, wait_min=2)
 # live now: Murat waiting at restaurant 12 min, Obaida delivering, new order without rider 7 min, Sven accepted (busy) but not started
 EVENTS += order_events("PMCHP6", "b-live1", PLACE_CHO, "r-murat", "Murat K.", -21, wait_min=None)
@@ -250,6 +264,7 @@ def f_user(rid: str):
     if not p:
         return Response(content='{"error_code":"not_found"}', status_code=404, media_type="application/json")
     return {"user": {"id": rid, "role": "driver", "status": "offline" if rid == "r-sven" else "online",
+                     "organization": {"id": "org-" + ("hh" if rid in ("r-lena", "r-jonas") else "muc"), "name": "FPAA00" + ("2" if rid in ("r-lena", "r-jonas") else "1")},
                      "profile": {"first_name": p[0], "last_name": p[1], "phone_number": p[2]}}}
 
 

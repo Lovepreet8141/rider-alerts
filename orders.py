@@ -243,6 +243,30 @@ def phase_minutes(o: dict) -> dict:
     }
 
 
+def restaurant_waits(o: dict) -> tuple:
+    """Waiting at the restaurant, rider by rider, from the order history.
+    Returns (kitchen_wait, waits): kitchen_wait = first arrival of ANY rider -> pickup (hand-backs included — that is
+    how long the kitchen really took); waits = {rider_id: (minutes this rider waited, gave_up)} where gave_up means the
+    rider handed the order back after waiting.  Falls back to the plain phase when there is no history."""
+    hist = o.get("history") or []
+    arrivals, waits, first = {}, {}, None
+    for h in hist:
+        at, rid = ts(h.get("at")), h.get("rider_id")
+        if not at:
+            continue
+        if h.get("what") == "arrived_restaurant":
+            arrivals.setdefault(rid, at)
+            first = first or at
+        elif h.get("what") in ("released", "picked_up", "pickup_failed", "cancelled") and rid in arrivals:
+            waits[rid] = (mins(arrivals.pop(rid), at), h.get("what") == "released")
+    kitchen = mins(first, o.get("picked_up_at")) if first and o.get("picked_up_at") else None
+    if kitchen is None:
+        kitchen = mins(o.get("at_restaurant_at"), o.get("picked_up_at"))
+    if o.get("rider_id") and o.get("rider_id") not in waits and o.get("at_restaurant_at") and o.get("picked_up_at"):
+        waits[o["rider_id"]] = (mins(o["at_restaurant_at"], o["picked_up_at"]), False)
+    return kitchen, waits
+
+
 def on_time(o: dict, grace_min: int) -> Optional[bool]:
     """Delivered by the planned time (+ grace)?  None when the plan or the delivery time is unknown."""
     v = (o.get("phases") or phase_minutes(o)).get("vs_plan")
