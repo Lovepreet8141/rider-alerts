@@ -1,4 +1,4 @@
-# Quickzi — fleet ops platform, all cities (v6.2)
+# Quickzi — fleet ops platform, all cities (v6.3)
 
 A 24/7 control room for Quickzi's delivery operation in every city — one server, one webhook stream, one database. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
@@ -22,6 +22,73 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   answers in ~10 ms, the network overview in ~2 ms (cached 10 s), alert evaluation of 1 000 orders in ~30 ms.
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
+
+## 6.3 — the designed screens, on real data
+**One new file this time: `intercom_msg.py`** (GitHub → *Add file → Upload files*). The other 11 are replaced as usual.
+Nothing changes for existing data; the two new tables (shift sheet, hand-backs) are created on the first start and the
+hand-backs of the last 90 days are indexed in the background.
+
+- **Overview** — the fleet-partner numbers only: delivered today (vs the last same weekday by this hour), on time
+  (Lieferando scoring), avg delivery, riders with orders now, deliveries per rider, cancelled, live orders, cities.
+  One tile per city (critical → strained → ok), the 14-day on-time line, orders per hour today vs the forecast
+  (average of the last 4 same weekdays — bars turn red when today is 10 % under), and the riders table from orders +
+  the shift sheet (no-shows, first order late, working less, left early, delivering as usual).
+- **City** — the live board in the v2 layout: tiles, the **pipeline** (one card per stage, one dot per order, tap to
+  filter), *Needs action* (PTOD clock counting live, order + rider + restaurant, the alert and what to do, **Msg / Call /
+  10′ / ✓**), *All live* (MotionTools-style groups: waiting · active · on hold, with "1 of 2 stops · 3 min to last
+  stop"), *Done today*. The side panel shows the selected order: PTOD, ETA / plan / vs plan, alerts, rider card with
+  Message · Call · WhatsApp · Restaurant · Map, the story, reason chips, Snooze / Mark handled, raw events. Below it the
+  **live map** (OpenStreetMap): riders on orders, free riders, orders waiting for a rider, restaurant and customer
+  stops; tap a row to highlight its route. The red bar lists the free riders nearest to a waiting order. Riders panel:
+  Free now · Needs a check (no event 60′, not moving, in sheet without an order) · On orders, and *Broadcast to riders*.
+  Keys: **J / K** move, **M** message, **H** handled, **S** snooze, **Esc** close.
+- **Riders** — riders in sheet, delivered, no order yet, first order late, working less, deliveries per rider, fleet on
+  time; per rider: status now, shift (sheet), first → last order, deliveries, usual (avg per worked day in the 4 weeks
+  before), per working hour, on time, PTOD, accept, handed back (excused ones not counted), double, **score 0–100**;
+  filters (no order yet · first order late · working less · score < 60); deliveries-per-day heatmap for the last 7
+  days; reliability by city (shift sheet vs orders: fulfilment, no order, first order late); the Intercom automation
+  rules with on/off switches and the log of what was (or would have been) sent.
+- **Fleets** — one tab per MotionTools organization with its score; riders active/total, deliveries, per rider-day,
+  on time, avg delivery, accept, hand-backs, fleet score (all vs the network); on time fleet vs network over 14 days;
+  where the fleet loses minutes (phase minutes vs network); rider scores per band; the all-fleets table with
+  sparklines; every rider of the fleet with days worked / planned, flags ("no order on 6 planned days", "coach:
+  accept + restaurant wait") and the change vs last week. **🖨 Weekly scorecard** prints the page (PDF via the browser).
+- **Rider score** (0–100, needs 3 deliveries): *Customer 40* = on time for the customer 25 · PTOD vs target 10 ·
+  handover 5. *Productivity 30* = deliveries per working hour (first accept → last delivery, per day) vs the average
+  rider of the same period and city. *Reliability 30* = acceptance 12 (≤ 2′ full, −2 per minute) · hand-backs 10
+  (−4 each, excused ones not counted) · shift sheet 8 (planned days without an order, first order > 45′ late).
+  A rider in the sheet with no order at all on a planned day scores 0.
+- **Shift sheet** (Settings → Shift sheet): CSV from Excel — columns *rider* (name as in MotionTools or the id),
+  *date*, *start*, *end*, optional *city*, *fleet*; German or English headers; one row per rider and day.
+  Names are matched to the riders seen on orders ("Last First" works too); unmatched names are kept and linked
+  when the rider appears. Re-uploading the same days replaces them.
+- **Light / dark**: the ◐ button in the header; dark is the default.
+
+## Intercom — messaging and automation (6.3)
+`intercom_msg.py` (from the Live board v2 package) does the talking: every rider is an Intercom user with
+`external_id = rider:<MotionTools id>` (found by that or by phone, created if missing); the first message is an in-app
+message that opens a conversation, later ones are replies in it; rider replies arrive through the Intercom webhook
+and show in the **Messages** drawer (header button, unread badge). Threads are kept in `DATA_DIR/intercom_threads.json`.
+
+Railway variables: `INTERCOM_TOKEN` (Developer Hub → your app → Authentication), `INTERCOM_ADMIN_ID`
+(`GET https://api.intercom.io/admins` with the token lists them), `INTERCOM_REGION` (`eu` default, `us`, `au`).
+Intercom webhook for replies: `https://<railway-url>/intercom/<WEBHOOK_PATH_SECRET>`, topics
+`conversation.user.replied` and `conversation.user.created`. Without the token everything still works — the Msg
+buttons report "Intercom not configured" and the rules run in **dry-run**.
+
+**The five rules** (every minute; texts editable in Settings → Intercom automation texts; switches on the Riders page):
+
+| Rule | Fires when | Limit |
+|---|---|---|
+| In sheet, no order 30′ after shift start | shift sheet row, shift started 30′ ago, no order today | once; one reminder after 90′ |
+| Late for the customer | live order: ETA > planned time + grace, or plan passed and not delivered | once per order |
+| Accepted, not started | accepted ≥ start limit (3′) ago, no tour started | once per order |
+| Idle while orders wait | no live order, last delivery ≥ 45′ ago, shift not over, an order in the city waited ≥ 3′ for a rider | once per 45′ |
+| Morning scorecard | 10:00–12:00, every rider who delivered yesterday | once a day |
+
+Guardrails: quiet hours 23:30–09:00 (only the two live-order rules may send), max 3 messages per rider per day
+(scorecard excluded), nothing while MotionTools is silent, every message logged on the order story and the Riders page.
+"Test → me" in Settings sends one rule's text to one rider id.
 
 ## Two ways to get the truth from MotionTools — chosen automatically
 - **API mode** — the token may read bookings: every 30 s all active orders (full timeline) + all riders (online, GPS).
@@ -126,7 +193,7 @@ Settings → Webhooks that the webhook is still active". It is logged in Setting
 
 ## Files
 `app.py` server · `mt.py` MotionTools client (multi-path, self-probing) · `events.py` webhook projector ·
-`orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI ·
+`orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI · `intercom_msg.py` Intercom messaging (6.3) ·
 `simulate.py` API-mode evening · `simulate_webhook.py` restricted-mode evening (fake MotionTools server) ·
 `requirements.txt` · `Procfile`
 
@@ -144,7 +211,8 @@ hourly (old files, old points, VACUUM when there is room); Settings → System s
 
 ## Railway variables
 `MT_API_TOKEN`, `DASHBOARD_PASSWORD`, `WEBHOOK_PATH_SECRET`, `DATA_DIR=/data`,
-`MUNICH_SERVICE_AREA_ID` (optional: comma-separated area ids to keep; **empty = all cities**). Optional: `SYNC_SECONDS` (30), `CITY_NAME`.
+`MUNICH_SERVICE_AREA_ID` (optional: comma-separated area ids to keep; **empty = all cities**). Optional: `SYNC_SECONDS` (30), `CITY_NAME`,
+`INTERCOM_TOKEN`, `INTERCOM_ADMIN_ID`, `INTERCOM_REGION` (see Intercom above).
 
 ## MotionTools webhooks (required in webhook mode)
 Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
@@ -163,6 +231,7 @@ itself does not talk to Intercom.
 ## Pages
 `/dashboard` (any username + DASHBOARD_PASSWORD) · `/export.csv?period=today|yesterday|week|month|YYYY-MM-DD` ·
 `/health` (no login) · `/api/network`, `/api/cities`, `/api/system`, `/api/settings`, `/api/riders`, `/api/places`, `/api/probe`, `/api/staffing`,
+`/api/riders-page`, `/api/fleets`, `/api/shifts` (GET status · POST CSV · DELETE), `/api/automations`, `/api/intercom/*`,
 `/export-events.jsonl` (last raw webhook events, for debugging) (login).
 
 ## Test locally

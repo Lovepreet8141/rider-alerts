@@ -151,7 +151,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.2"
+VERSION = "6.3"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -160,6 +160,7 @@ rules = Rules()
 rules.apply(store.get_settings())
 store_mod.set_day_start(rules.day_start_hour)
 store.plan_grace = rules.plan_grace_min
+store.wait_restaurant_min = rules.wait_restaurant_min
 tracker = RiderTracker()
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=2000)      # /api/state at peak is ~150 KB -> ~15 KB on the wire
@@ -845,6 +846,15 @@ async def post_start(now: datetime):
         INSIGHTS_CACHE.clear(); PULSE_CACHE.clear(); NETWORK_CACHE.clear()
     except Exception as e:
         log.exception("backfill failed: %s", e)
+    try:
+        hb = await loop.run_in_executor(None, store.backfill_handbacks, now)
+        if hb:
+            store.log("info", f"hand-backs of {hb} stored orders indexed for the Riders / Fleets pages")
+        linked = await loop.run_in_executor(None, store.shifts_relink, rider_names())
+        if linked:
+            store.log("info", f"{linked} shift-sheet names linked to riders seen on orders")
+    except Exception as e:
+        log.exception("6.3 backfill failed: %s", e)
     asyncio.create_task(fleet_fill_loop())
 
 
@@ -965,6 +975,7 @@ async def startup():
     if not mt.enabled:
         store.log("error", "MT_API_TOKEN not set — no data will be pulled from MotionTools")
     asyncio.create_task(sync_loop())
+    asyncio.create_task(automation_loop())
 
 
 # ====================================================================== webhook (wakes the sync)
@@ -1067,7 +1078,15 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
     sevs = [STATE["sev"].get((o["id"], k)) for k in kinds]
     heads = [STATE["heads"].get((o["id"], k), "") for k in kinds]
     lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o.get("rider_lat"), o.get("rider_lng"))
+    # stops: MotionTools counts pickup + dropoff(s); the events tell us which ones are done
+    stops_total = o.get("stops") or max(2, len(o.get("stop_types") or {}))
+    stops_done = (1 if o.get("picked_up_at") else 0) + (1 if o.get("delivered_at") else 0)
+    last_eta = o.get("eta_customer")
+    to_last = mins(now, last_eta) if (live and last_eta and o["phase"] not in ("unassigned", "on_hold")) else None
     return {"id": o["id"], "ref": o["ref"], "rider": o["rider"] or r.get("name") or "", "rider_id": o["rider_id"], "city": city_of(o), "fleet": o.get("fleet") or store.fleet_map.get(o["rider_id"] or "", ""),
+            "dispatched_iso": iso(o.get("dispatched_at")), "stops_total": int(stops_total), "stops_done": stops_done, "to_last_stop_min": int(round(to_last)) if to_last is not None else None,
+            "rider_lat": lat if live else None, "rider_lng": lng if live else None, "pick_lat": o.get("pick_lat"), "pick_lng": o.get("pick_lng"),
+            "drop_lat": o.get("drop_lat"), "drop_lng": o.get("drop_lng"), "km": round(o["est_distance_m"] / 1000, 1) if isinstance(o.get("est_distance_m"), (int, float)) else None,
             "phone": r.get("phone") or "", "restaurant": o["restaurant"], "restaurant_phone": o.get("restaurant_phone", ""),
             "customer_addr": o["customer_addr"], "customer_zip": o.get("customer_zip", ""), "phase": o["phase"],
             "phase_label": PHASE_LABEL.get(o["phase"], o["phase"]), "elapsed": int(elapsed) if elapsed is not None else None,
@@ -1088,7 +1107,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
 
 
 @app.get("/api/state", dependencies=[Depends(require_login)])
-def api_state(city: str = ""):
+def api_state(city: str = "", done: int = 0):
     now = datetime.now(UTC)
     idx = alerts_index()
     mine = live_orders(city)
@@ -1106,8 +1125,10 @@ def api_state(city: str = ""):
                 done_by[o["rider_id"]] = done_by.get(o["rider_id"], 0) + 1
                 if o.get("delivered_at") and (o["rider_id"] not in last_by or o["delivered_at"] > last_by[o["rider_id"]]):
                     last_by[o["rider_id"]] = o["delivered_at"]
+        recent = sorted(today, key=lambda o: o["delivered_at"], reverse=True)[:40]
         pc = PULSE_CACHE["by_city"][city] = dict(at=now, n=len(today), ptods=[o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None],
-                                                 plan=[o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None], done_by=done_by, last_by=last_by)
+                                                 plan=[o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None], done_by=done_by, last_by=last_by,
+                                                 recent=recent, cancelled=store.cancelled_today(now, city))
     ptods, plan = pc["ptods"], pc["plan"]
     # Riders are counted from ORDERS only: holding a live order = on an order; delivered today = worked today.
     # "Online" is never used — MotionTools does not tell us reliably, and other fleets' riders share the account.
@@ -1126,7 +1147,7 @@ def api_state(city: str = ""):
         last_min = int((now - last).total_seconds() // 60) if last else None
         status = "on_order" if n else ("free" if last_min is not None and last_min <= 30 else "done")
         fix = tracker.last_fix(rid)
-        riders.append({"id": rid, "name": r["name"] or "Rider", "phone": r["phone"], "online": r.get("online"), "orders": n,
+        riders.append({"id": rid, "name": r["name"] or "Rider", "phone": r["phone"], "online": r.get("online"), "orders": n, "lat": r.get("lat"), "lng": r.get("lng"),
                        "fleet": store.fleet_map.get(rid, ""), "done_today": pc["done_by"].get(rid, 0), "last_min": last_min, "status": status,
                        "stale": bool(n and last_min is not None and last_min >= 60),
                        "map_url": f"https://maps.google.com/?q={r['lat']:.5f},{r['lng']:.5f}" if r.get("lat") is not None and n else "",
@@ -1146,13 +1167,16 @@ def api_state(city: str = ""):
              "unassigned": sum(1 for o in orders if o["phase"] == "unassigned"),
              "riders_on_orders": sum(1 for r in riders if r["status"] == "on_order"), "riders_stale": sum(1 for r in riders if r["stale"]),
              "riders_free": sum(1 for r in riders if r["status"] == "free"), "riders_today": sum(1 for r in riders if r["done_today"] or r["orders"]),
-             "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber")}
+             "red": sum(1 for a in open_alerts if a["severity"] == "red"), "amber": sum(1 for a in open_alerts if a["severity"] == "amber"),
+             "cancelled": pc.get("cancelled", 0), "p90_ptod": round(sorted(ptods)[int(len(ptods) * 0.9) - 1]) if len(ptods) >= 5 else None,
+             "per_rider": round(pc["n"] / len(pc["done_by"]), 1) if pc["done_by"] else None}
     disk = DISK_CACHE.get("rep") if (now - DISK_CACHE.get("at", now - timedelta(hours=1))) < timedelta(minutes=2) else None
     if disk is None:
         disk = DISK_CACHE["rep"] = disk_report()
         DISK_CACHE["at"] = now
     return {"now": iso(now), "city": city or CITY, "selected_city": city, "cities": [c["city"] for c in network_now(now)["cities"]],
             "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
+            "done": [order_view(o, now, idx) for o in pc["recent"][:done]] if done else [],
             "disk": {"pct": disk["pct"], "free_mb": disk["free_mb"], "total_mb": disk["total_mb"]},
             "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS, "started": iso(STARTED),
                      "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize()}}}
@@ -1164,8 +1188,41 @@ def api_network():
     now = datetime.now(UTC)
     data = network_now(now)
     s = STATE["sync"]
-    return {**data, "now": iso(now), "sync": {"mode": s["mode"], "last_webhook": s["last_webhook"], "silent_min": s["silent_min"], "webhook_silent": s["webhook_silent"]},
-            "trend": store.daily_trend(14)}
+
+    def riders_summary():
+        rs = store.rider_stats("today", now, rules)
+        live_by = live_by_rider()
+        hhmm_now = now.astimezone(BERLIN).strftime("%H:%M")
+        by = {"no_show": [], "first_late": [], "working_less": [], "left_early": [], "usual": 0, "with_orders": 0, "in_sheet": 0}
+        for r in rs["riders"]:
+            live = live_by.get(r["rider_id"], 0)
+            last = ts(r.get("last_at")); last_min = int((now - last).total_seconds() // 60) if last else None
+            if r["in_sheet"]:
+                by["in_sheet"] += 1
+            if r["delivered"] or live:
+                by["with_orders"] += 1
+            if r["in_sheet"] and not r["delivered"] and not live and not (r["shift_start"] and hhmm_now < r["shift_start"]):
+                by["no_show"].append(r["city"])
+            elif r["first_late_days"]:
+                by["first_late"].append(r["city"])
+            elif r.get("usual") and r["delivered"] < 0.6 * r["usual"] and not live and (last_min or 0) >= 60:
+                by["working_less"].append(r["city"])
+            elif r["in_sheet"] and r.get("shift_end") and last and not live and (last_min or 0) >= 60 and hhmm_now < r["shift_end"]:
+                by["left_early"].append(r["city"])
+            elif r["delivered"] or live:
+                by["usual"] += 1
+        def top(cities):
+            c = {}
+            for x in cities:
+                c[x or "?"] = c.get(x or "?", 0) + 1
+            return " · ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: -kv[1])[:3])
+        return {"sheet": rs["sheet"], "in_sheet": by["in_sheet"], "with_orders": by["with_orders"], "usual": by["usual"],
+                "no_show": len(by["no_show"]), "no_show_where": top(by["no_show"]), "first_late": len(by["first_late"]), "first_late_where": top(by["first_late"]),
+                "working_less": len(by["working_less"]), "working_less_where": top(by["working_less"]), "left_early": len(by["left_early"]), "left_early_where": top(by["left_early"])}
+
+    extra = cached(("network-extra",), 60, now, lambda: {"forecast": store.hourly_forecast(now), "riders": riders_summary(),
+                                                           "trend": store.daily_trend(14), "target_within_pct": rules.target_within_pct})
+    return {**data, **extra, "now": iso(now), "sync": {"mode": s["mode"], "last_webhook": s["last_webhook"], "silent_min": s["silent_min"], "webhook_silent": s["webhook_silent"]}}
 
 
 @app.get("/api/cities", dependencies=[Depends(require_login)])
@@ -1252,6 +1309,326 @@ async def api_riders_set(request: Request):
     return {"ok": True}
 
 
+def rider_names() -> dict:
+    return {rid: (r.get("name") or "") for rid, r in STATE["riders"].items()}
+
+
+def live_by_rider(city: str = "") -> dict:
+    out = {}
+    for o in STATE["orders"].values():
+        if o["rider_id"] and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed") and (not city or city_of(o) == city):
+            out[o["rider_id"]] = out.get(o["rider_id"], 0) + 1
+    return out
+
+
+def rider_status_now(r: dict, live: int, now: datetime, is_today: bool) -> tuple:
+    """What the rider is doing right now — from orders (and the shift sheet when one is loaded). (text, tone)."""
+    last = ts(r.get("last_at"))
+    last_min = int((now - last).total_seconds() // 60) if last else None
+    slow = (r.get("delivered") or 0) >= 3 and ((r.get("on_time_pct") is not None and r["on_time_pct"] < 75) or (r.get("avg_accept") or 0) >= 4)
+    local = now.astimezone(BERLIN).strftime("%H:%M")
+    if not is_today:
+        if not r.get("delivered"):
+            if r.get("live"):
+                return ("on an order now", "green")
+            return ("no order on planned days" if r.get("in_sheet") else "no order", "red" if r.get("in_sheet") else "grey")
+        return (("slow · " if slow else "") + f"{r['delivered']} deliveries", "amber" if slow else "green")
+    if live:
+        return ("delivering · slow" if slow else "delivering", "amber" if slow else "green")
+    if not r.get("delivered") and not r.get("cancelled"):
+        if r.get("shift_start") and local < r["shift_start"]:
+            return (f"shift starts {r['shift_start']}", "grey")
+        return ("no order today", "red" if r.get("in_sheet") else "grey")
+    if r.get("first_late_days") and (r.get("delivered") or 0) < 3:
+        return ("first order late", "amber")
+    if last_min is not None and last_min >= 45:
+        if r.get("shift_end") and local >= r["shift_end"]:
+            return (f"finished {last.astimezone(BERLIN).strftime('%H:%M')}", "grey")
+        return (f"no order for {last_min}′", "amber")
+    return ("between orders", "green")
+
+
+AUTOMATIONS = [("no_start", "In shift sheet, no order 30′ after shift start", "Your shift started {start} — are you on the road?"),
+               ("late_plan", "Running late vs planned time (ETA > plan + grace)", "{ref} is late for the customer — please go direct"),
+               ("not_started", "Accepted, not started 3′", "You accepted {ref} — please start now"),
+               ("idle_waiting", "No order for 45′ while orders are waiting", "Orders waiting at {restaurant} — can you take one?"),
+               ("scorecard", "Morning scorecard 10:00", "Yesterday: {deliveries} deliveries · {on_time}% on time · score {score}")]
+PAGE_CACHE: dict = {}
+
+
+def cached(key: tuple, ttl: int, now: datetime, build):
+    hit = PAGE_CACHE.get(key)
+    if hit and (now - hit[0]).total_seconds() < ttl:
+        return hit[1]
+    data = build()
+    PAGE_CACHE[key] = (now, data)
+    return data
+
+
+@app.get("/api/riders-page", dependencies=[Depends(require_login)])
+def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
+    """The Riders page: every rider from orders + the shift sheet, status now, usual, per working hour, score."""
+    _check_period(period)
+    now = datetime.now(UTC)
+    rs = cached(("riders", period, city, fleet), 30, now, lambda: store.rider_stats(period, now, rules, city=city, fleet=fleet))
+    rs = json.loads(json.dumps(rs))                       # the cache stays untouched by the per-request decoration
+    live_by = live_by_rider(city)
+    is_today = period == "today"
+    riders = rs["riders"]
+    for r in riders:
+        if is_today:
+            r["live"] = live_by.get(r["rider_id"], 0)
+        r["status"], r["tone"] = rider_status_now(r, r["live"] if is_today else 0, now, is_today)
+        st = STATE["riders"].get(r["rider_id"], {})
+        r["phone"] = st.get("phone") or projector.phones.get(r["rider_id"], "")
+        last = ts(r.get("last_at"))
+        r["last_min"] = int((now - last).total_seconds() // 60) if last else None
+        r["first"] = hm(ts(r.get("first_at"))); r["last"] = hm(last)
+        r["working_less"] = bool(r.get("usual") and r["delivered"] < 0.6 * r["usual"] * max(1, r["days"]) and (not is_today or (not r["live"] and (r["last_min"] or 0) >= 60)))
+        if r["status"].startswith("shift starts"):
+            r["score"] = None                                 # not judged before the shift has begun
+    delivered_total = sum(r["delivered"] for r in riders)
+    with_orders = [r for r in riders if r["delivered"]]
+    otn = [r for r in riders if r["on_time_pct"] is not None and r["delivered"]]
+    tiles = {"in_sheet": sum(1 for r in riders if r["in_sheet"]), "with_orders": len(with_orders), "riders": len(riders),
+             "no_order_yet": sum(1 for r in riders if r["in_sheet"] and not r["delivered"] and not r["live"] and not (r["shift_start"] and is_today and now.astimezone(BERLIN).strftime("%H:%M") < r["shift_start"])),
+             "first_late": sum(1 for r in riders if r["first_late_days"]), "working_less": sum(1 for r in riders if r["working_less"]),
+             "per_rider": round(delivered_total / len(with_orders), 1) if with_orders else None, "delivered": delivered_total,
+             "on_time_pct": round(sum(r["on_time_pct"] * r["delivered"] for r in otn) / sum(r["delivered"] for r in otn)) if otn else None,
+             "sheet": rs["sheet"], "avg_per_hour": rs["avg_per_hour"]}
+    settings = store.get_settings()
+    autos = [{"key": k, "trigger": t, "message": m, "on": settings.get(f"auto:{k}") == "1"} for k, t, m in AUTOMATIONS]
+    return {**rs, "tiles": tiles, "week": store.rider_week_grid(now, city, fleet), "by_city": store.reliability_by_city(period, now),
+            "automations": autos, "target_within_pct": rules.target_within_pct, "shifts": store.shifts_status(), "is_today": is_today}
+
+
+@app.get("/api/automations", dependencies=[Depends(require_login)])
+def api_automations_get():
+    settings = store.get_settings()
+    now = datetime.now(UTC)
+    counts = store.auto_counts(now)
+    return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
+                       **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
+            "intercom": {"enabled": intercom.ic.enabled, "ok": intercom.ic.status.get("ok"), "admin": intercom.ic.status.get("admin_name"), "error": intercom.ic.status.get("error")},
+            "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "23:30–09:00", "daily_cap": AUTO_DAILY_CAP}
+
+
+@app.post("/api/automations", dependencies=[Depends(require_login)])
+async def api_automations_set(request: Request):
+    body = await request.json() or {}
+    keys = {a[0] for a in AUTOMATIONS}
+    vals = {}
+    for k, v in (body.get("on") or {}).items():
+        if k in keys:
+            vals[f"auto:{k}"] = "1" if v else ""
+    for k, v in (body.get("text") or {}).items():
+        if k in keys and isinstance(v, str):
+            vals[f"auto_text:{k}"] = v.strip()[:500]
+    if vals:
+        store.set_settings(vals)
+        store.log("info", "automation rules changed: " + ", ".join(f"{k}={'on' if v == '1' else v or 'off'}" for k, v in vals.items()))
+    return {"ok": True}
+
+
+@app.get("/api/automations/order/{oid}", dependencies=[Depends(require_login)])
+def api_automations_order(oid: str):
+    return {"messages": list(reversed(store.auto_recent(20, order_id=oid)))}
+
+
+@app.post("/api/automations/test", dependencies=[Depends(require_login)])
+async def api_automations_test(request: Request):
+    """'Send a test to me': the rule's text with sample values to one rider id (yours)."""
+    body = await request.json() or {}
+    key, rid = body.get("rule"), str(body.get("rider_id") or "").strip()
+    rule = next((a for a in AUTOMATIONS if a[0] == key), None)
+    if not rule or not rid:
+        raise HTTPException(400, "rule and rider_id required")
+    text = (store.get_settings().get(f"auto_text:{key}") or rule[2]).format_map(SafeDict(start="17:00", ref="TEST01", restaurant="Burger King", deliveries=12, on_time=83, score=78, tip="restaurant wait", name="Rider"))
+    r = STATE["riders"].get(rid, {})
+    if not intercom.ic.enabled:
+        return {"ok": False, "dry": True, "text": text, "error": "Intercom not configured — would have sent this"}
+    m = await intercom.ic.send(rid, r.get("name") or "Rider", r.get("phone") or "", "[TEST] " + text, "TEST01")
+    return {"ok": m["status"] == "sent", "text": text, "error": m.get("error", "")}
+
+
+class SafeDict(dict):
+    def __missing__(self, k):
+        return "{" + k + "}"
+
+
+AUTO_DAILY_CAP = 3
+
+
+def automation_tick(now: datetime) -> list:
+    """Evaluate the five rider rules once. Returns the messages to send (already logged as dry-run or pending)."""
+    settings = store.get_settings()
+    on = {k: settings.get(f"auto:{k}") == "1" for k, _, _ in AUTOMATIONS}
+    text_of = {k: (settings.get(f"auto_text:{k}") or m) for k, _, m in AUTOMATIONS}
+    live_mode = intercom.ic.enabled
+    local = now.astimezone(BERLIN)
+    hhmm = local.strftime("%H:%M")
+    quiet = hhmm >= "23:30" or hhmm < "09:00"
+    if STATE["sync"].get("webhook_silent"):
+        return []                                           # stale data — never message riders on it
+    today = day_key(now)
+    sent_keys = store.auto_keys_since(now - timedelta(hours=26))
+    cap = store.auto_today(now)
+    out = []
+
+    def fire(rule: str, rid: str, name: str, oid: str, ref: str, **vals):
+        if (rule, rid, oid) in sent_keys:
+            return
+        if rule != "scorecard" and cap.get(rid, 0) >= AUTO_DAILY_CAP:
+            return
+        if quiet and rule not in ("late_plan", "not_started"):
+            return
+        text = text_of[rule].format_map(SafeDict(name=name, ref=ref, **vals))
+        mode = "pending" if (live_mode and on.get(rule)) else ("dry" if not on.get(rule) else "dry-nointercom")
+        aid = store.auto_log(now, rule, rid, name, oid, ref, text, mode)
+        sent_keys.add((rule, rid, oid)); cap[rid] = cap.get(rid, 0) + 1
+        if mode == "pending":
+            out.append((aid, rid, name, text, ref))
+
+    riders = STATE["riders"]
+    grace, start_limit = rules.plan_grace_min, rules.start_limit_min
+    live_by = live_by_rider()
+    done_by = store.delivered_by_rider(today)
+    # R2 late for the customer · R3 accepted, not started
+    for o in list(STATE["orders"].values()):
+        if o["phase"] in ("on_hold", "unassigned", "delivered", "cancelled", "closed") or not o.get("rider_id"):
+            continue
+        rid, name, ref = o["rider_id"], o.get("rider") or riders.get(o["rider_id"], {}).get("name") or "Rider", o.get("ref") or ""
+        plan = planned_at(o)
+        if plan:
+            late = (o.get("eta_customer") and o["eta_customer"] > plan + timedelta(minutes=grace)) or now > plan + timedelta(minutes=grace)
+            if late:
+                fire("late_plan", rid, name, o["id"], ref, plan=hm(plan), eta=hm(o.get("eta_customer")) or "?")
+        if o["phase"] == "accepted" and o.get("accepted_at") and not o.get("started_at") and (now - o["accepted_at"]).total_seconds() >= start_limit * 60:
+            fire("not_started", rid, name, o["id"], ref)
+    # R1 in the sheet, no order 30′ after the shift start (reminder after 60′)
+    for sh in store.shifts_between(today, today):
+        rid = sh["rider_id"]
+        if rid.startswith("?") or not sh.get("start") or live_by.get(rid) or done_by.get(rid):
+            continue
+        try:
+            st = datetime.strptime(f"{today} {sh['start']}", "%Y-%m-%d %H:%M").replace(tzinfo=BERLIN)
+        except ValueError:
+            continue
+        waited = (now - st).total_seconds() / 60
+        if waited >= 30:
+            fire("no_start", rid, sh.get("rider") or riders.get(rid, {}).get("name") or "Rider", f"shift:{today}:1", "", start=sh["start"])
+        if waited >= 90:
+            fire("no_start", rid, sh.get("rider") or riders.get(rid, {}).get("name") or "Rider", f"shift:{today}:2", "", start=sh["start"])
+    # R4 idle 45′ while an order waits ≥3′ for a rider in the same city
+    waiting = {}
+    for o in STATE["orders"].values():
+        if o["phase"] == "unassigned" and o.get("dispatched_at") and (now - o["dispatched_at"]).total_seconds() >= 180:
+            waiting.setdefault(city_of(o), []).append(o)
+    if waiting:
+        shifts_today = {s["rider_id"]: s for s in store.shifts_between(today, today)}
+        for rid, d in done_by.items():
+            if live_by.get(rid) or not d.get("last"):
+                continue
+            last = ts(d["last"])
+            if not last or (now - last).total_seconds() < 45 * 60:
+                continue
+            sh = shifts_today.get(rid)
+            if sh and sh.get("end") and hhmm >= sh["end"]:
+                continue                                        # shift is over — not idle, finished
+            city = store._rider_city.get(rid) or ""
+            ws = waiting.get(city) or (next(iter(waiting.values())) if not city else [])
+            if not ws:
+                continue
+            fire("idle_waiting", rid, d.get("name") or riders.get(rid, {}).get("name") or "Rider", f"idle:{today}:{local.hour * 60 + local.minute // 45}", "",
+                 restaurant=ws[0].get("restaurant") or "the restaurant", n=len(ws))
+    # R5 scorecard at 10:00
+    if hhmm >= "10:00" and hhmm < "12:00":
+        yday = day_key(now - timedelta(days=1))
+        rs = cached(("auto-scorecard", yday), 3600, now, lambda: store.rider_stats(yday, now, rules))
+        for r in rs["riders"]:
+            if not r["delivered"]:
+                continue
+            worst = None
+            parts = {"restaurant wait": r.get("avg_wait"), "acceptance": r.get("avg_accept"), "handover": r.get("avg_handover")}
+            if (r.get("avg_wait") or 0) >= rules.wait_restaurant_min:
+                worst = "restaurant wait"
+            elif (r.get("avg_accept") or 0) >= 3:
+                worst = "accept faster"
+            elif (r.get("handbacks_bad") or 0):
+                worst = "no hand-backs"
+            fire("scorecard", r["rider_id"], r["rider"], f"scorecard:{yday}", "", deliveries=r["delivered"], on_time=r["on_time_pct"] if r["on_time_pct"] is not None else "–",
+                 score=r["score"] if r["score"] is not None else "–", tip=worst or "keep it up")
+    return out
+
+
+async def automation_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            now = datetime.now(UTC)
+            todo = await asyncio.get_event_loop().run_in_executor(None, automation_tick, now)
+            for aid, rid, name, text, ref in todo:
+                r = STATE["riders"].get(rid, {})
+                m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref)
+                store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
+        except Exception as e:
+            log.exception("automation failed: %s", e)
+        await asyncio.sleep(60)
+
+
+@app.get("/api/fleets", dependencies=[Depends(require_login)])
+def api_fleets(period: str = "week", city: str = ""):
+    """The Fleets page: every MotionTools organization on the same metrics, 14-day trend, phases vs network, riders."""
+    _check_period(period)
+    now = datetime.now(UTC)
+    data = cached(("fleets", period, city), 60, now, lambda: store.fleet_report(period, now, rules, city=city))
+    data = json.loads(json.dumps(data))
+    live_by = live_by_rider(city) if period == "today" else {}
+    for f in data["fleets"]:
+        for r in f["riders"]:
+            r["status"], r["tone"] = rider_status_now(r, live_by.get(r["rider_id"], 0), now, period == "today")
+            r["phone"] = STATE["riders"].get(r["rider_id"], {}).get("phone") or projector.phones.get(r["rider_id"], "")
+            r["working_less"] = bool(r.get("usual") and r["delivered"] < 0.6 * r["usual"] * max(1, r["days"]) and period != "today")
+    data["fleet_fill"] = FLEET_FILL
+    data["target_within_pct"] = rules.target_within_pct
+    return data
+
+
+@app.get("/api/shifts", dependencies=[Depends(require_login)])
+def api_shifts_get(day: str = ""):
+    st = store.shifts_status()
+    d = day or day_key(datetime.now(UTC))
+    rows = store.shifts_between(d, d)
+    return {**st, "day": d, "today_rows": sorted(rows, key=lambda r: (r.get("city") or "", r.get("start") or "", r.get("rider") or ""))[:400]}
+
+
+@app.post("/api/shifts", dependencies=[Depends(require_login)])
+async def api_shifts_import(request: Request):
+    """Upload the shift sheet as CSV text (the dashboard reads the file in the browser and sends its text)."""
+    raw = await request.body()
+    text = raw.decode("utf-8-sig", errors="replace")
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            text = (json.loads(text) or {}).get("csv", "")
+        except ValueError:
+            pass
+    if not text.strip():
+        raise HTTPException(400, "empty upload")
+    res = store.shifts_import(text, datetime.now(UTC), rider_names())
+    if res.get("ok"):
+        store.shifts_relink(rider_names())
+        PAGE_CACHE.clear()
+    return res
+
+
+@app.delete("/api/shifts", dependencies=[Depends(require_login)])
+def api_shifts_clear():
+    n = store.shifts_clear()
+    PAGE_CACHE.clear()
+    store.log("info", f"shift sheet cleared ({n} rows)")
+    return {"ok": True, "deleted": n}
+
+
 @app.post("/api/probe", dependencies=[Depends(require_login)])
 async def api_probe():
     """Button in Settings: re-check which MotionTools endpoints this token may read, right now."""
@@ -1288,8 +1665,8 @@ def export_plan(city: str = ""):
 
 
 def _check_period(period):
-    if period not in ("today", "yesterday", "week", "month") and not (len(period) == 10 and period[4] == "-"):
-        raise HTTPException(400, "period must be today, yesterday, week, month or YYYY-MM-DD")
+    if period not in ("today", "yesterday", "week", "lastweek", "month") and not (len(period) == 10 and period[4] == "-"):
+        raise HTTPException(400, "period must be today, yesterday, week, lastweek, month or YYYY-MM-DD")
 
 
 @app.get("/api/orders", dependencies=[Depends(require_login)])
@@ -1444,6 +1821,7 @@ async def api_settings_set(request: Request):
     rules.apply(values)
     projector.lead_min = rules.release_lead_min
     store.plan_grace = rules.plan_grace_min
+    store.wait_restaurant_min = rules.wait_restaurant_min
     if store_mod.set_day_start(rules.day_start_hour) != rules.day_start_hour:
         rules.day_start_hour = store_mod.DAY_STARTS_AT
     STATE["sync"]["last_snapshot"] = None                 # the day boundary may have moved — re-freeze yesterday
@@ -1541,6 +1919,11 @@ def export_events(n: int = 300):
     lines = recent_event_lines(max(1, min(n, 2000)))
     return PlainTextResponse("\n".join(lines), media_type="application/json",
                              headers={"Content-Disposition": 'attachment; filename="motiontools-events.jsonl"'})
+
+
+from intercom_msg import make_router as _intercom_router  # noqa: E402
+intercom = _intercom_router(require_login, DATA_DIR, PATH_SECRET, lambda rid: STATE["riders"].get(rid) or {})
+app.include_router(intercom)
 
 
 @app.get("/health")

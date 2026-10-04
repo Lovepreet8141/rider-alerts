@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 CREATE INDEX IF NOT EXISTS ix_positions ON positions(rider_id, at);
 CREATE TABLE IF NOT EXISTS daily_stats (day TEXT PRIMARY KEY, computed_at TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS shifts (
+  rider_id TEXT, rider TEXT, day TEXT, start TEXT, end TEXT, city TEXT, fleet TEXT, imported_at TEXT,
+  PRIMARY KEY (rider_id, day)
+);
+CREATE INDEX IF NOT EXISTS ix_shifts_day ON shifts(day);
+CREATE TABLE IF NOT EXISTS handbacks (
+  order_id TEXT, rider_id TEXT, day TEXT, at TEXT, waited REAL, excused INTEGER DEFAULT 0, city TEXT, fleet TEXT,
+  PRIMARY KEY (order_id, rider_id)
+);
+CREATE INDEX IF NOT EXISTS ix_handbacks_day ON handbacks(day);
+CREATE TABLE IF NOT EXISTS auto_msgs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, day TEXT, rule TEXT, rider_id TEXT, rider TEXT, order_id TEXT, order_ref TEXT,
+  text TEXT, mode TEXT, error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_auto_day ON auto_msgs(day, rider_id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS syslog (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, level TEXT, msg TEXT);
 """
@@ -94,6 +109,10 @@ def period_range(period: str, now: datetime):
     start = day_start(now)
     if period == "yesterday":
         return start - timedelta(days=1), start
+    if period == "lastweek":
+        local = start.astimezone(BERLIN)
+        this_week = (local - timedelta(days=local.weekday())).astimezone(UTC)
+        return this_week - timedelta(days=7), this_week
     if period == "week":
         local = start.astimezone(BERLIN)
         start = (local - timedelta(days=local.weekday())).astimezone(UTC)
@@ -173,6 +192,7 @@ class Store:
         self.city_map: dict = {}        # MotionTools service-area id -> city name (Settings "city:<id>")
         self.fleet_map: dict = {}       # rider id -> fleet name (Settings "fleet:<rider id>")
         self.plan_grace = 5
+        self.wait_restaurant_min = 8
         self._rider_city: dict = {}
         self._load_maps()
 
@@ -287,6 +307,36 @@ class Store:
              iso(o["picked_up_at"]), iso(o["at_customer_at"]), iso(o["delivered_at"]), cancelled_at,
              o.get("cancel_reason", ""), pm["ptod"], closed, first_seen, iso(now), raw,
              city, day, hour, (None if ot is None else int(ot)), pm["vs_plan"], kitchen, pm["to_accept"], fleet))
+        if any(h.get("what") == "released" for h in (o.get("history") or [])):
+            self._write_handbacks(o, day, city)
+
+    def _write_handbacks(self, o: dict, day: str, city: str):
+        """One row per rider who handed this order back (from the order's history); excused = waited at the restaurant
+        at least the restaurant threshold first (the kitchen's fault, not the rider's)."""
+        waits = restaurant_waits(o)[1]
+        rows = []
+        for h in o.get("history") or []:
+            if h.get("what") == "released" and h.get("rider_id"):
+                w = waits.get(h["rider_id"])
+                waited = w[0] if w else None
+                rows.append((o["id"], h["rider_id"], day, h.get("at"), waited, 1 if (waited is not None and waited >= self.wait_restaurant_min) else 0,
+                             city, self.fleet_map.get(h["rider_id"], "")))
+        with self.lock:
+            self.db.execute("DELETE FROM handbacks WHERE order_id=?", (o["id"],))
+            self.db.executemany("INSERT OR REPLACE INTO handbacks (order_id, rider_id, day, at, waited, excused, city, fleet) VALUES (?,?,?,?,?,?,?,?)", rows)
+            self.db.commit()
+
+    def backfill_handbacks(self, now: datetime, days: int = 90) -> int:
+        """Once after the 6.3 update: hand-backs of the orders already stored (their history lives in the raw JSON)."""
+        if self.get_settings().get("handbacks_backfilled"):
+            return 0
+        n = 0
+        for r in self._rows("SELECT * FROM orders WHERE raw LIKE '%\"released\"%' AND day >= ?", (day_key(now - timedelta(days=days)),)):
+            o = self._hydrate(r)
+            self._write_handbacks(o, r.get("day"), r.get("city") or "")
+            n += 1
+        self.set_settings({"handbacks_backfilled": iso(now)})
+        return n
 
     def set_reason(self, oid: str, reason: str, note: str, now: datetime) -> bool:
         """The manager's explanation for a late / problematic order (shown in Orders, Insights, daily report)."""
@@ -897,6 +947,460 @@ class Store:
             for h in pl["hours"]:
                 w.writerow([city or "all", d, pl["weekday"], f"{h['hour']:02d}:00", h["avg_orders"], h["max_orders"], h["plan"], h["riders_peak"], pl["basis"]])
         return buf.getvalue()
+
+    # ================================================================ 6.3 — shift sheet
+    SHIFT_COLS = {"rider": ("rider", "name", "driver", "fahrer", "courier", "rider_name", "driver_name", "fahrername", "mitarbeiter"),
+                  "id": ("rider_id", "driver_id", "id", "user_id", "motiontools_id"),
+                  "day": ("date", "day", "datum", "tag", "shift_date"),
+                  "start": ("start", "from", "von", "shift_start", "beginn", "start_time"),
+                  "end": ("end", "to", "bis", "shift_end", "ende", "end_time"),
+                  "city": ("city", "stadt", "area", "service_area"),
+                  "fleet": ("fleet", "organization", "organisation", "org", "flotte", "partner")}
+
+    @staticmethod
+    def _norm_name(s: str) -> str:
+        return " ".join(str(s or "").replace(",", " ").lower().split())
+
+    def _name_index(self, extra: dict = None) -> dict:
+        """normalised full name -> rider id (riders table + the live riders the app knows)."""
+        idx = {}
+        for r in self._rows("SELECT id, name FROM riders WHERE name IS NOT NULL AND name != ''"):
+            idx[self._norm_name(r["name"])] = r["id"]
+        for rid, name in (extra or {}).items():
+            if name:
+                idx[self._norm_name(name)] = rid
+        swapped = {" ".join(reversed(k.split())): v for k, v in idx.items() if len(k.split()) == 2}   # "Last First"
+        for k, v in swapped.items():
+            idx.setdefault(k, v)
+        return idx
+
+    def shifts_import(self, text: str, now: datetime, known_names: dict = None) -> dict:
+        """Shift sheet as CSV (comma or semicolon; Excel 'Save as CSV' works): one row per rider and day with
+        rider (name or MotionTools id), date, start, end — optional city and fleet. Names are matched to the riders
+        seen on orders; a name not seen yet is kept as the name and linked as soon as that rider delivers."""
+        text = text.lstrip("﻿")
+        try:
+            dialect = csv.Sniffer().sniff(text[:4000], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        rows = list(csv.reader(io.StringIO(text), dialect))
+        if not rows:
+            return {"ok": False, "error": "empty file"}
+        head = [self._norm_name(h).replace(" ", "_") for h in rows[0]]
+        col = {}
+        for key, names in self.SHIFT_COLS.items():
+            for i, h in enumerate(head):
+                if h in names and key not in col:
+                    col[key] = i
+        if "day" not in col or ("rider" not in col and "id" not in col):
+            return {"ok": False, "error": f"need columns rider (or rider_id), date, start, end — found: {', '.join(rows[0])}"}
+        names = self._name_index(known_names)
+        out, unmatched, bad = [], set(), 0
+        for r in rows[1:]:
+            if not any(x.strip() for x in r):
+                continue
+            def cell(k):
+                i = col.get(k)
+                return r[i].strip() if i is not None and i < len(r) else ""
+            day = cell("day")
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M"):
+                try:
+                    day = datetime.strptime(day, fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            else:
+                bad += 1
+                continue
+            def hhmm(v):
+                v = v.strip()
+                for fmt in ("%H:%M", "%H:%M:%S", "%H.%M", "%H"):
+                    try:
+                        return datetime.strptime(v, fmt).strftime("%H:%M")
+                    except ValueError:
+                        continue
+                return v[:5]
+            rid = cell("id")
+            name = cell("rider")
+            if not rid:
+                rid = names.get(self._norm_name(name), "")
+                if not rid:
+                    rid = "?" + self._norm_name(name)
+                    unmatched.add(name)
+            out.append((rid, name or rid, day, hhmm(cell("start")), hhmm(cell("end")), cell("city"), cell("fleet") or self.fleet_map.get(rid, ""), iso(now)))
+        with self.lock:
+            self.db.executemany("INSERT INTO shifts (rider_id, rider, day, start, end, city, fleet, imported_at) VALUES (?,?,?,?,?,?,?,?) "
+                                "ON CONFLICT(rider_id, day) DO UPDATE SET rider=excluded.rider, start=MIN(shifts.start, excluded.start), "
+                                "end=MAX(shifts.end, excluded.end), city=CASE WHEN excluded.city!='' THEN excluded.city ELSE shifts.city END, "
+                                "fleet=CASE WHEN excluded.fleet!='' THEN excluded.fleet ELSE shifts.fleet END, imported_at=excluded.imported_at", out)
+            self.db.commit()
+        days = sorted({x[2] for x in out})
+        self.log("info", f"shift sheet imported: {len(out)} rider-days, {len(days)} days, {len(unmatched)} names not seen on orders yet")
+        return {"ok": True, "rows": len(out), "days": days[:1] + days[-1:] if days else [], "unmatched": sorted(unmatched)[:50], "unmatched_n": len(unmatched), "skipped": bad}
+
+    def shifts_relink(self, known_names: dict = None) -> int:
+        """Shift rows that only had a name get the rider id once that rider shows up on an order."""
+        names = self._name_index(known_names)
+        n = 0
+        for r in self._rows("SELECT DISTINCT rider_id, rider FROM shifts WHERE rider_id LIKE '?%'"):
+            rid = names.get(self._norm_name(r["rider"]))
+            if rid:
+                with self.lock:
+                    self.db.execute("DELETE FROM shifts WHERE rider_id=? AND day IN (SELECT day FROM shifts WHERE rider_id=?)", (r["rider_id"], rid))
+                    self.db.execute("UPDATE shifts SET rider_id=? WHERE rider_id=?", (rid, r["rider_id"]))
+                    self.db.commit()
+                n += 1
+        return n
+
+    def shifts_status(self) -> dict:
+        r = self._rows("SELECT COUNT(*) AS n, COUNT(DISTINCT day) AS days, MIN(day) AS first, MAX(day) AS last, MAX(imported_at) AS imported, "
+                       "SUM(rider_id LIKE '?%') AS unmatched FROM shifts")[0]
+        return {"rows": r["n"] or 0, "days": r["days"] or 0, "first": r["first"], "last": r["last"], "imported_at": r["imported"], "unmatched": r["unmatched"] or 0,
+                "has_data": bool(r["n"])}
+
+    def shifts_clear(self) -> int:
+        return self._exec("DELETE FROM shifts").rowcount
+
+    def shifts_between(self, d1: str, d2: str, city: str = "", fleet: str = "") -> list:
+        where, args = "day >= ? AND day <= ?", [d1, d2]
+        if city:
+            where += " AND (city=? OR city='' OR city IS NULL)"; args.append(city)
+        if fleet:
+            where += " AND fleet=?"; args.append(fleet)
+        return self._rows(f"SELECT * FROM shifts WHERE {where}", args)
+
+    # ================================================================ 6.3 — rider performance (from orders + the sheet)
+    @staticmethod
+    def rider_score(r: dict, avg_per_h: float, rules) -> dict | None:
+        """0–100, explainable. Customer 40: on time 25 · PTOD 10 · handover 5. Productivity 30: deliveries per working hour
+        vs the average rider of the same period/city. Reliability 30: acceptance 12 · hand-backs 10 · shift sheet 8
+        (planned days without an order, first order late). Needs 3 deliveries; a rider planned with no order at all = 0."""
+        d = r.get("delivered") or 0
+        if d < 3:
+            if r.get("planned_days") and not d and not r.get("live"):
+                return {"score": 0, "customer": 0, "productivity": 0, "reliability": 0}
+            return None
+        tgt = rules.ptod_target_min
+        ot = r.get("on_time_pct")
+        c_ot = 25 * (ot / 100) if ot is not None else 20
+        p = r.get("avg_ptod")
+        c_ptod = 10 if p is None or p <= tgt else max(0.0, 10 - (p - tgt) * (10 / 15))
+        h = r.get("avg_handover")
+        c_hand = 5 if h is None or h <= 3 else max(0.0, 5 - (h - 3))
+        per_h = r.get("per_hour") or 0
+        base = max(0.5, avg_per_h or rules.riders_capacity_per_hour or 1.5)
+        prod = 30 * min(1.0, per_h / base)
+        a = r.get("avg_accept")
+        r_acc = 12 if a is None or a <= 2 else max(0.0, 12 - (a - 2) * 2)
+        r_hb = max(0.0, 10 - 4 * (r.get("handbacks_bad") or 0))
+        planned, worked = r.get("planned_days") or 0, r.get("planned_days_worked") or 0
+        r_sheet = 8.0
+        if planned:
+            r_sheet = 8 * (worked / planned)
+            if r.get("first_late_days"):
+                r_sheet = max(0.0, r_sheet - 2 * r["first_late_days"])
+        cust, prodv, rel = round(c_ot + c_ptod + c_hand), round(prod), round(r_acc + r_hb + r_sheet)
+        return {"score": max(0, min(100, cust + prodv + rel)), "customer": cust, "productivity": prodv, "reliability": rel}
+
+    def rider_stats(self, period: str, now: datetime, rules, city: str = "", fleet: str = "") -> dict:
+        """Every rider with orders in the period (SQL-aggregated: never touches rows one by one):
+        deliveries, usual (avg per worked day in the 4 weeks before), working hours (first accept → last delivery, per day),
+        per working hour, on time, PTOD, accept, hand-backs (excused ones excluded), doubles, late for the customer,
+        shift-sheet fulfilment, and the 0–100 score."""
+        start, end = period_range(period, now)
+        d1, d2 = day_key(start), day_key(min(end, now) - timedelta(seconds=1)) if end <= now else day_key(now)
+        where, args = "day >= ? AND day <= ? AND rider_id IS NOT NULL AND rider_id != '' AND phase != 'closed'", [d1, d2]
+        if city:
+            where += " AND city=?"; args.append(city)
+        if fleet:
+            where += " AND fleet=?"; args.append(fleet)
+        per_day = self._rows(
+            "SELECT rider_id, MAX(rider) AS rider, MAX(city) AS city, MAX(fleet) AS fleet, day, "
+            "SUM(phase='delivered') AS delivered, SUM(phase='cancelled') AS cancelled, SUM(closed=0 AND phase!='on_hold') AS live, "
+            "MIN(COALESCE(accepted_at, dispatched_at)) AS first_at, MAX(COALESCE(delivered_at, cancelled_at)) AS last_at, "
+            "MAX(updated_at) AS updated, "
+            "SUM(CASE WHEN phase='delivered' THEN ptod_min END) AS ptod_sum, SUM(phase='delivered' AND ptod_min IS NOT NULL) AS ptod_n, "
+            "SUM(phase='delivered' AND ptod_min <= ?) AS within, "
+            "SUM(on_time=1) AS ot, SUM(on_time IS NOT NULL) AS otn, SUM(on_time=0) AS late, "
+            "SUM(accept_min) AS acc_sum, SUM(accept_min IS NOT NULL) AS acc_n, SUM(stacked) AS dbl, "
+            "SUM(CASE WHEN phase='delivered' AND at_customer_at IS NOT NULL THEN (julianday(delivered_at)-julianday(at_customer_at))*1440 END) AS hand_sum, "
+            "SUM(phase='delivered' AND at_customer_at IS NOT NULL) AS hand_n, "
+            "SUM(CASE WHEN phase='delivered' AND at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL THEN (julianday(picked_up_at)-julianday(at_restaurant_at))*1440 END) AS wait_sum, "
+            "SUM(phase='delivered' AND at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL) AS wait_n "
+            f"FROM orders WHERE {where} GROUP BY rider_id, day", [rules.ptod_target_min] + args)
+        hb = {}
+        hwhere, hargs = "day >= ? AND day <= ?", [d1, d2]
+        if city:
+            hwhere += " AND city=?"; hargs.append(city)
+        for r in self._rows(f"SELECT rider_id, SUM(excused) AS exc, COUNT(*) AS n FROM handbacks WHERE {hwhere} GROUP BY rider_id", hargs):
+            hb[r["rider_id"]] = (r["n"] or 0, r["exc"] or 0)
+        # usual = deliveries per worked day in the 28 days before the period
+        u1, u2 = day_key(start - timedelta(days=28)), day_key(start - timedelta(days=1))
+        usual = {r["rider_id"]: round(r["n"] / r["days"], 1) for r in self._rows(
+            "SELECT rider_id, COUNT(*) AS n, COUNT(DISTINCT day) AS days FROM orders WHERE phase='delivered' AND day >= ? AND day <= ? "
+            "AND rider_id IS NOT NULL AND rider_id != '' GROUP BY rider_id", (u1, u2)) if r["days"]}
+        shifts = {}
+        for s in self.shifts_between(d1, d2, city=city, fleet=fleet):
+            shifts.setdefault(s["rider_id"], {})[s["day"]] = s
+        riders = {}
+        today = day_key(now)
+        for r in per_day:
+            x = riders.setdefault(r["rider_id"], {"rider_id": r["rider_id"], "rider": r["rider"] or "Rider", "city": r["city"] or "", "fleet": r["fleet"] or "",
+                                                   "delivered": 0, "cancelled": 0, "live": 0, "days": 0, "hours": 0.0, "ptod_sum": 0.0, "ptod_n": 0, "within": 0,
+                                                   "ot": 0, "otn": 0, "late": 0, "acc_sum": 0.0, "acc_n": 0, "double": 0, "hand_sum": 0.0, "hand_n": 0,
+                                                   "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {}})
+            x["delivered"] += r["delivered"] or 0; x["cancelled"] += r["cancelled"] or 0; x["live"] += r["live"] or 0
+            cc = x.setdefault("cities", {}); cc[r["city"] or ""] = cc.get(r["city"] or "", 0) + (r["delivered"] or 0) + (r["live"] or 0) + (r["cancelled"] or 0)
+            x["city"] = max(cc.items(), key=lambda kv: kv[1])[0]
+            if r["fleet"]:
+                x["fleet"] = r["fleet"]
+            if r["delivered"] or r["live"]:
+                x["days"] += 1
+            f, l = ts(r["first_at"]), ts(r["last_at"])
+            if r["live"] and r["day"] == today:
+                l = max([t for t in (l, now) if t]) if l else now
+            if f and l:
+                x["hours"] += max(1.0, (l - f).total_seconds() / 3600 + 0.5)
+            elif r["delivered"] or r["live"]:
+                x["hours"] += 1.0
+            for k in ("ptod_sum", "ptod_n", "within", "ot", "otn", "late", "acc_sum", "acc_n", "hand_sum", "hand_n", "wait_sum", "wait_n"):
+                x[k] += r[k] or 0
+            x["double"] += r["dbl"] or 0
+            x["day_rows"][r["day"]] = {"delivered": r["delivered"] or 0, "first": f, "last": l}
+            if f and (x["first_at"] is None or f < x["first_at"]):
+                x["first_at"] = f
+            if l and (x["last_at"] is None or l > x["last_at"]):
+                x["last_at"] = l
+            sh = shifts.get(r["rider_id"], {}).get(r["day"])
+            if sh and (r["delivered"] or r["live"]):
+                x["planned_days_worked"] += 1
+                if f and sh.get("start"):
+                    try:
+                        st = datetime.strptime(f"{r['day']} {sh['start']}", "%Y-%m-%d %H:%M").replace(tzinfo=BERLIN)
+                        if (f - st).total_seconds() > 45 * 60:
+                            x["first_late_days"] += 1
+                    except ValueError:
+                        pass
+        # riders in the sheet who had no order at all in the period
+        for rid, days in shifts.items():
+            if rid not in riders:
+                s0 = next(iter(days.values()))
+                riders[rid] = {"rider_id": rid, "rider": s0["rider"] or "Rider", "city": s0.get("city") or city or "", "fleet": s0.get("fleet") or "",
+                               "delivered": 0, "cancelled": 0, "live": 0, "days": 0, "hours": 0.0, "ptod_sum": 0.0, "ptod_n": 0, "within": 0,
+                               "ot": 0, "otn": 0, "late": 0, "acc_sum": 0.0, "acc_n": 0, "double": 0, "hand_sum": 0.0, "hand_n": 0,
+                               "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {}}
+        out = []
+        for rid, x in riders.items():
+            n, exc = hb.get(rid, (0, 0))
+            sh = shifts.get(rid, {})
+            today_shift = sh.get(today) or (sh.get(d2) if d1 == d2 else None)
+            o = {"rider_id": rid, "rider": x["rider"], "city": x["city"], "fleet": x["fleet"] or self.fleet_map.get(rid, ""),
+                 "delivered": x["delivered"], "cancelled": x["cancelled"], "live": x["live"], "days": x["days"],
+                 "hours": round(x["hours"], 1), "per_hour": round(x["delivered"] / x["hours"], 1) if x["hours"] else None,
+                 "usual": usual.get(rid), "within_pct": _pct(x["within"], x["ptod_n"]), "on_time_pct": _pct(x["ot"], x["otn"]), "late": x["late"],
+                 "avg_ptod": round(x["ptod_sum"] / x["ptod_n"], 1) if x["ptod_n"] else None,
+                 "avg_accept": round(x["acc_sum"] / x["acc_n"], 1) if x["acc_n"] else None,
+                 "avg_handover": round(x["hand_sum"] / x["hand_n"], 1) if x["hand_n"] else None,
+                 "avg_wait": round(x["wait_sum"] / x["wait_n"], 1) if x["wait_n"] else None,
+                 "double": x["double"], "handbacks": n, "handbacks_excused": exc, "handbacks_bad": max(0, n - exc),
+                 "first_at": iso(x["first_at"]), "last_at": iso(x["last_at"]),
+                 "planned_days": len(sh), "planned_days_worked": x["planned_days_worked"], "first_late_days": x["first_late_days"],
+                 "shift": f"{today_shift['start']}–{today_shift['end']}" if today_shift and today_shift.get("start") else ("" if not sh else "planned"),
+                 "shift_start": today_shift.get("start") if today_shift else None, "shift_end": today_shift.get("end") if today_shift else None,
+                 "in_sheet": bool(sh), "no_order_planned_days": max(0, len(sh) - x["planned_days_worked"])}
+            o["usual_pct"] = round(100 * x["delivered"] / (usual[rid] * max(1, x["days"] or 1))) if usual.get(rid) and (x["delivered"] or x["days"]) else None
+            out.append(o)
+        scored = [r for r in out if (r["delivered"] or 0) >= 3 and r["per_hour"]]
+        avg_per_h = (sum(r["per_hour"] for r in scored) / len(scored)) if scored else None
+        for r in out:
+            s = self.rider_score(r, avg_per_h, rules)
+            r["score"] = s["score"] if s else None
+            r["score_parts"] = s
+        out.sort(key=lambda r: (-(r["score"] if r["score"] is not None else -1), -r["delivered"], r["rider"]))
+        return {"period": period, "city": city, "fleet": fleet, "from": d1, "to": d2, "riders": out, "avg_per_hour": round(avg_per_h, 2) if avg_per_h else None,
+                "sheet": bool(shifts)}
+
+    def rider_week_grid(self, now: datetime, city: str = "", fleet: str = "", days: int = 7, limit: int = 40) -> dict:
+        """Deliveries per rider per day for the last `days` days — who works less at a glance."""
+        d1 = day_key(now - timedelta(days=days - 1))
+        where, args = "phase='delivered' AND day >= ? AND rider_id IS NOT NULL AND rider_id != ''", [d1]
+        if city:
+            where += " AND city=?"; args.append(city)
+        if fleet:
+            where += " AND fleet=?"; args.append(fleet)
+        rows = self._rows(f"SELECT rider_id, MAX(rider) AS rider, MAX(city) AS city, day, COUNT(*) AS n FROM orders WHERE {where} GROUP BY rider_id, day", args)
+        grid = {}
+        for r in rows:
+            g = grid.setdefault(r["rider_id"], {"rider_id": r["rider_id"], "rider": r["rider"], "city": r["city"], "days": {}, "total": 0})
+            g["days"][r["day"]] = r["n"]; g["total"] += r["n"]
+        keys = [day_key(now - timedelta(days=i)) for i in range(days - 1, -1, -1)]
+        out = sorted(grid.values(), key=lambda g: -g["total"])[:limit]
+        for g in out:
+            g["cells"] = [g["days"].get(k, 0) for k in keys]
+            g["worked"] = sum(1 for v in g["cells"] if v)
+            del g["days"]
+        return {"days": keys, "riders": out}
+
+    def reliability_by_city(self, period: str, now: datetime) -> list:
+        """Shift sheet vs orders per city: rider-days planned, with orders, fulfilment, first order late."""
+        start, end = period_range(period, now)
+        d1, d2 = day_key(start), day_key(min(end, now) - timedelta(seconds=1)) if end <= now else day_key(now)
+        planned = self._rows("SELECT city, COUNT(*) AS n FROM shifts WHERE day >= ? AND day <= ? GROUP BY city", (d1, d2))
+        if not planned:
+            return []
+        worked_any = {(r["rider_id"], r["day"]) for r in self._rows(
+            "SELECT DISTINCT rider_id, day FROM orders WHERE day >= ? AND day <= ? AND rider_id IS NOT NULL AND rider_id != '' AND phase != 'closed'", (d1, d2))}
+        deliv = {r["city"]: (r["n"], r["riders"]) for r in self._rows(
+            "SELECT city, COUNT(*) AS n, COUNT(DISTINCT rider_id || day) AS riders FROM orders WHERE phase='delivered' AND day >= ? AND day <= ? GROUP BY city", (d1, d2))}
+        out = []
+        for p in planned:
+            cityname = p["city"] or ""
+            rows = self._rows("SELECT rider_id, day, start FROM shifts WHERE day >= ? AND day <= ? AND city=?", (d1, d2, cityname))
+            with_orders = sum(1 for s in rows if (s["rider_id"], s["day"]) in worked_any)
+            out.append({"city": cityname or "(no city in sheet)", "planned": p["n"], "with_orders": with_orders, "fulfilment_pct": _pct(with_orders, p["n"]),
+                        "no_order": p["n"] - with_orders, "deliveries_per_rider_day": round(deliv.get(cityname, (0, 0))[0] / deliv[cityname][1], 1) if deliv.get(cityname, (0, 0))[1] else None})
+        out.sort(key=lambda x: -x["planned"])
+        return out
+
+    def hourly_forecast(self, now: datetime, city: str = "", weeks: int = 4) -> dict:
+        """Orders per hour today vs the average of the last `weeks` same weekdays (the forecast)."""
+        today = day_key(now)
+        local = day_start(now).astimezone(BERLIN).date()
+        same = [(local - timedelta(days=7 * i)).isoformat() for i in range(1, weeks + 1)]
+        where, args = "day IN (%s) AND hour IS NOT NULL AND phase != 'closed'" % ",".join("?" * (len(same) + 1)), same + [today]
+        if city:
+            where += " AND city=?"; args.append(city)
+        rows = self._rows(f"SELECT day, hour, COUNT(*) AS n FROM orders WHERE {where} GROUP BY day, hour", args)
+        fc, act, basis = [0.0] * 24, [0] * 24, set()
+        for r in rows:
+            if r["day"] == today:
+                act[r["hour"]] = r["n"]
+            else:
+                fc[r["hour"]] += r["n"]; basis.add(r["day"])
+        nb = max(1, len(basis))
+        h_now = now.astimezone(BERLIN).hour
+        last = same[0]
+        last_rows = {r["hour"]: r["n"] for r in rows if r["day"] == last}
+        order = lambda h: (h - DAY_STARTS_AT) % 24
+        return {"hours": list(range(24)), "forecast": [round(v / nb, 1) for v in fc], "actual": act, "basis_days": len(basis),
+                "weekday": local.strftime("%A"), "today_total": sum(act), "forecast_total": round(sum(fc) / nb), "hour_now": h_now,
+                "last_same_day": last, "last_same_day_total": sum(last_rows.values()),
+                "last_same_day_until_now": sum(n for h, n in last_rows.items() if order(h) <= order(h_now))}
+
+    def delivered_on(self, day: str, city: str = "") -> int:
+        where, args = "day=? AND phase='delivered'", [day]
+        if city:
+            where += " AND city=?"; args.append(city)
+        return self._rows(f"SELECT COUNT(*) AS n FROM orders WHERE {where}", args)[0]["n"] or 0
+
+    def cancelled_today(self, now: datetime, city: str = "") -> int:
+        where, args = "day=? AND phase='cancelled'", [day_key(now)]
+        if city:
+            where += " AND city=?"; args.append(city)
+        return self._rows(f"SELECT COUNT(*) AS n FROM orders WHERE {where}", args)[0]["n"] or 0
+
+    # ================================================================ 6.3 — fleets
+    def fleet_report(self, period: str, now: datetime, rules, city: str = "") -> dict:
+        """Every fleet (MotionTools organization) on the same order-based metrics, plus a 14-day on-time trend and
+        the phase minutes of each fleet vs the whole network."""
+        rs = self.rider_stats(period, now, rules, city=city)
+        riders = rs["riders"]
+        start, end = period_range(period, now)
+        d1, d2 = rs["from"], rs["to"]
+        where, args = "day >= ? AND day <= ? AND phase='delivered'", [d1, d2]
+        if city:
+            where += " AND city=?"; args.append(city)
+        phases_sql = ("AVG(accept_min) AS to_accept, "
+                      "AVG(CASE WHEN at_restaurant_at IS NOT NULL THEN (julianday(at_restaurant_at)-julianday(COALESCE(accepted_at, dispatched_at)))*1440 END) AS to_restaurant, "
+                      "AVG(CASE WHEN at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL THEN (julianday(picked_up_at)-julianday(at_restaurant_at))*1440 END) AS at_restaurant, "
+                      "AVG(CASE WHEN picked_up_at IS NOT NULL AND at_customer_at IS NOT NULL THEN (julianday(at_customer_at)-julianday(picked_up_at))*1440 END) AS to_customer, "
+                      "AVG(CASE WHEN at_customer_at IS NOT NULL THEN (julianday(delivered_at)-julianday(at_customer_at))*1440 END) AS handover")
+        net = self._rows(f"SELECT COUNT(*) AS n, AVG(ptod_min) AS ptod, SUM(on_time=1) AS ot, SUM(on_time IS NOT NULL) AS otn, {phases_sql}, "
+                         f"COUNT(DISTINCT rider_id || day) AS rider_days FROM orders WHERE {where}", args)[0]
+        by_fleet = {r["fleet"] or "": r for r in self._rows(
+            f"SELECT fleet, COUNT(*) AS n, AVG(ptod_min) AS ptod, SUM(on_time=1) AS ot, SUM(on_time IS NOT NULL) AS otn, {phases_sql}, "
+            f"COUNT(DISTINCT rider_id || day) AS rider_days, COUNT(DISTINCT rider_id) AS riders_active, GROUP_CONCAT(DISTINCT city) AS cities "
+            f"FROM orders WHERE {where} GROUP BY fleet", args)}
+        trend_rows = self._rows("SELECT fleet, day, SUM(on_time=1) AS ot, SUM(on_time IS NOT NULL) AS otn, COUNT(*) AS n FROM orders WHERE phase='delivered' AND day >= ? AND day <= ?"
+                                + (" AND city=?" if city else "") + " GROUP BY fleet, day", [day_key(now - timedelta(days=13)), day_key(now)] + ([city] if city else []))
+        days14 = [day_key(now - timedelta(days=i)) for i in range(13, -1, -1)]
+        trend = {}
+        for r in trend_rows:
+            trend.setdefault(r["fleet"] or "", {})[r["day"]] = _pct(r["ot"] or 0, r["otn"] or 0)
+        net_trend = {}
+        for dk in days14:
+            ot = sum((r["ot"] or 0) for r in trend_rows if r["day"] == dk); otn = sum((r["otn"] or 0) for r in trend_rows if r["day"] == dk)
+            net_trend[dk] = _pct(ot, otn)
+        total_riders = {}
+        for r in self._rows("SELECT fleet, COUNT(*) AS n FROM riders WHERE fleet IS NOT NULL AND fleet != '' GROUP BY fleet"):
+            total_riders[r["fleet"]] = r["n"]
+        hb = {r["fleet"] or "": (r["n"] or 0, r["exc"] or 0) for r in self._rows(
+            "SELECT fleet, COUNT(*) AS n, SUM(excused) AS exc FROM handbacks WHERE day >= ? AND day <= ?" + (" AND city=?" if city else "") + " GROUP BY fleet", [d1, d2] + ([city] if city else []))}
+        prev = None
+        if period == "week":
+            prev = {r["rider_id"]: r["score"] for r in self.rider_stats("lastweek", now, rules, city=city)["riders"]}
+        fleets = []
+        for name, agg in by_fleet.items():
+            if not name:
+                continue
+            frs = [r for r in riders if r["fleet"] == name]
+            scores = [r["score"] for r in frs if r["score"] is not None]
+            planned = sum(r["planned_days"] for r in frs); worked = sum(r["planned_days_worked"] for r in frs)
+            n, exc = hb.get(name, (0, 0))
+            fleets.append({"fleet": name, "cities": sorted((agg["cities"] or "").split(",")) if agg["cities"] else [],
+                           "riders_active": agg["riders_active"] or 0, "riders_total": max(total_riders.get(name, 0), agg["riders_active"] or 0, len(frs)),
+                           "delivered": agg["n"] or 0, "per_rider_day": round(agg["n"] / agg["rider_days"], 1) if agg["rider_days"] else None,
+                           "on_time_pct": _pct(agg["ot"] or 0, agg["otn"] or 0), "avg_ptod": round(agg["ptod"], 1) if agg["ptod"] is not None else None,
+                           "avg_accept": round(agg["to_accept"], 1) if agg["to_accept"] is not None else None,
+                           "handbacks": n, "handbacks_excused": exc, "handback_pct": round(100 * n / agg["n"], 1) if agg["n"] else None,
+                           "no_order_days_pct": _pct(planned - worked, planned) if planned else None, "planned_days": planned,
+                           "score": round(sum(scores) / len(scores)) if scores else None,
+                           "phases": {k: (round(agg[k], 1) if agg[k] is not None else None) for k in ("to_accept", "to_restaurant", "at_restaurant", "to_customer", "handover")},
+                           "trend": [trend.get(name, {}).get(dk) for dk in days14],
+                           "bands": {"90": sum(1 for s in scores if s >= 90), "80": sum(1 for s in scores if 80 <= s < 90), "70": sum(1 for s in scores if 70 <= s < 80),
+                                     "60": sum(1 for s in scores if 60 <= s < 70), "low": sum(1 for s in scores if s < 60), "none": sum(1 for r in frs if r["score"] is None)},
+                           "riders": [{**r, "prev_score": prev.get(r["rider_id"]) if prev else None} for r in frs]})
+        fleets.sort(key=lambda f: -(f["score"] if f["score"] is not None else -1))
+        unassigned = [r for r in riders if not r["fleet"]]
+        return {"period": period, "city": city, "from": d1, "to": d2, "days": days14, "fleets": fleets,
+                "network": {"delivered": net["n"] or 0, "on_time_pct": _pct(net["ot"] or 0, net["otn"] or 0),
+                            "avg_ptod": round(net["ptod"], 1) if net["ptod"] is not None else None,
+                            "per_rider_day": round(net["n"] / net["rider_days"], 1) if net["rider_days"] else None,
+                            "phases": {k: (round(net[k], 1) if net[k] is not None else None) for k in ("to_accept", "to_restaurant", "at_restaurant", "to_customer", "handover")},
+                            "trend": [net_trend.get(dk) for dk in days14], "avg_score": round(sum(r["score"] for r in riders if r["score"] is not None) / max(1, sum(1 for r in riders if r["score"] is not None))) if any(r["score"] is not None for r in riders) else None},
+                "unassigned_riders": len(unassigned), "unassigned_delivered": sum(r["delivered"] for r in unassigned), "sheet": rs["sheet"]}
+
+    # ================================================================ 6.3 — automation log (Intercom rules)
+    def auto_log(self, now: datetime, rule: str, rider_id: str, rider: str, order_id: str, order_ref: str, text: str, mode: str, error: str = "") -> int:
+        cur = self._exec("INSERT INTO auto_msgs (at, day, rule, rider_id, rider, order_id, order_ref, text, mode, error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (iso(now), day_key(now), rule, rider_id, rider, order_id or "", order_ref or "", text, mode, error))
+        return cur.lastrowid
+
+    def auto_update(self, aid: int, mode: str, error: str = ""):
+        self._exec("UPDATE auto_msgs SET mode=?, error=? WHERE id=?", (mode, error, aid))
+
+    def auto_recent(self, limit: int = 40, rider_id: str = "", order_id: str = "") -> list:
+        where, args = "1=1", []
+        if rider_id:
+            where += " AND rider_id=?"; args.append(rider_id)
+        if order_id:
+            where += " AND order_id=?"; args.append(order_id)
+        return self._rows(f"SELECT * FROM auto_msgs WHERE {where} ORDER BY id DESC LIMIT ?", args + [limit])
+
+    def auto_today(self, now: datetime) -> dict:
+        """rider id -> messages today (scorecard excluded) — the daily cap."""
+        return {r["rider_id"]: r["n"] for r in self._rows("SELECT rider_id, COUNT(*) AS n FROM auto_msgs WHERE day=? AND rule != 'scorecard' GROUP BY rider_id", (day_key(now),))}
+
+    def auto_keys_since(self, since: datetime) -> set:
+        return {(r["rule"], r["rider_id"], r["order_id"] or "") for r in self._rows("SELECT rule, rider_id, order_id FROM auto_msgs WHERE at >= ?", (iso(since),))}
+
+    def auto_counts(self, now: datetime) -> dict:
+        return {r["rule"]: {"today": r["n"], "sent": r["sent"]} for r in self._rows(
+            "SELECT rule, COUNT(*) AS n, SUM(mode='sent') AS sent FROM auto_msgs WHERE day=? GROUP BY rule", (day_key(now),))}
+
+    def delivered_by_rider(self, day: str) -> dict:
+        return {r["rider_id"]: {"n": r["n"], "last": r["last"], "name": r["rider"]} for r in self._rows(
+            "SELECT rider_id, MAX(rider) AS rider, COUNT(*) AS n, MAX(delivered_at) AS last FROM orders WHERE day=? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != '' GROUP BY rider_id", (day,))}
 
     # ================================================================ daily snapshot
     def save_daily(self, day: str, data: dict, city: str = ""):

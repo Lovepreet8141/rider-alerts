@@ -178,13 +178,14 @@ def booking_json(bid: str) -> dict:
     if "in_progress" in seen:
         events.append({"name": "en_route", "status": "en_route", "timestamp": seen["in_progress"]})
     return {"id": bid, "external_id": i["ref"], "status": "done" if done else ("en_route" if rid else ("pickable" if disp else "to_be_dispatched")),
-            "created_at": seen.get("created") or m(-30), "service_area": {"id": AREA, "name": "München"},
+            "created_at": seen.get("created") or m(-30),
+            "service_area": {"id": AREA_HH, "name": "Hamburg"} if bid.startswith("b-hh") else {"id": AREA, "name": "München"},
             "driver": {"id": rid, "profile": {"first_name": prof[0], "last_name": prof[1]}} if rid and prof else None,
             "driver_location": {"lat": 48.1501, "lng": 11.5702} if rid and not done else None,
-            "stops": [{"id": f"{bid}-p", "type": "pickup", "lat": plat, "lng": plng, "place_id": i["place"], "place": {"name": name},
+            "stops": [{"id": f"{bid}-p", "type": "pickup", "lat": plat + (5.4 if bid.startswith("b-hh") else 0), "lng": plng - (1.6 if bid.startswith("b-hh") else 0), "place_id": i["place"], "place": {"name": name},
                        "phone_number": pphone, "street": street.rsplit(" ", 1)[0], "number": street.rsplit(" ", 1)[1], "city": "München",
                        "zip_code": "81249", "status": "scheduled"},
-                      {"id": f"{bid}-d", "type": "dropoff", "lat": plat + 0.01, "lng": plng + 0.02, "street": "Leopoldstr.", "number": "12",
+                      {"id": f"{bid}-d", "type": "dropoff", "lat": plat + 0.01 + (5.4 if bid.startswith("b-hh") else 0), "lng": plng + 0.02 - (1.6 if bid.startswith("b-hh") else 0), "street": "Leopoldstr.", "number": "12",
                        "city": "München", "zip_code": "80802", "phone_number": "+49 170 0000000", "status": "scheduled"}],
             "events": [e for e in events if e["timestamp"]], "total_estimated_distance_meters": 3400}
 
