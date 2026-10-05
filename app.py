@@ -1984,6 +1984,12 @@ async def api_intercom_match_riders():
         if c:
             out["matched"] += 1
             _remember_intercom(x["rider_id"], c)
+            t = intercom.ic.thread(x["rider_id"], x["name"], x["phone"])
+            if t.get("contact_id") != c.get("id"):
+                t["contact_id"], t["conversation_id"] = c.get("id"), ""
+            link = str((c.get("custom_attributes") or {}).get((intercom.ic._link_attr or "").split(".", 1)[-1], "") or "")
+            t["contact_src"] = "link" if x["rider_id"] in link else "other"
+            intercom.ic._save()
         else:
             out["missing"].append(x["name"] or x["rider_id"])
     store.log("info", f"Intercom matching: {out['matched']} of {out['total']} riders found, {len(out['missing'])} not found")

@@ -221,12 +221,13 @@ class Intercom:
                     await self.call("PUT", f"/contacts/{found['id']}", {"external_id": ext})
                 except HTTPException:
                     pass
-            return found["id"]
+            link = str((found.get("custom_attributes") or {}).get((self._link_attr or "").split(".", 1)[-1], "") or "")
+            return found["id"], ("hint" if hint else "link" if (rider_id and rider_id in link) else "other")
         body = {"role": "user", "external_id": ext, "name": name or "Rider"}
         pv = self.phone_variants(phone)
         if pv:
             body["phone"] = pv[0]
-        return (await self.call("POST", "/contacts", body))["id"]
+        return (await self.call("POST", "/contacts", body))["id"], "created"
 
     def relink(self, rider_id: str):
         """The Intercom contact of a rider changed (Settings): forget the cached contact / conversation."""
@@ -315,8 +316,13 @@ class Intercom:
         try:
             if not await self.resolve_admin():
                 raise HTTPException(503, "no teammate to send as — set INTERCOM_ADMIN_ID in Railway")
-            if not t.get("contact_id"):
-                t["contact_id"] = await self.contact_for(rider_id, name, phone, hint)
+            # a contact cached from an older build may be a duplicate: re-check until it is the profile-link or
+            # email-verified one (one search per message until then — cheap)
+            if not t.get("contact_id") or t.get("contact_src") not in ("link", "hint"):
+                cid, src = await self.contact_for(rider_id, name, phone, hint)
+                if cid != t.get("contact_id"):
+                    t["conversation_id"] = ""
+                t["contact_id"], t["contact_src"] = cid, src
             if not t.get("conversation_id"):
                 t["conversation_id"] = await self.latest_conversation(t["contact_id"])   # continue the rider's existing chat
             if t.get("conversation_id"):
@@ -442,6 +448,13 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
             return {"ok": False, "error": str(e.detail)}
         if c and ic.on_match:
             ic.on_match(rider_id, c)
+        if c:
+            t = ic.thread(rider_id, known.get("name") or "", known.get("phone") or "")
+            if t.get("contact_id") != c.get("id"):
+                t["contact_id"], t["conversation_id"] = c.get("id"), ""
+            link = str((c.get("custom_attributes") or {}).get((ic._link_attr or "").split(".", 1)[-1], "") or "")
+            t["contact_src"] = "hint" if hint else ("link" if rider_id in link else "other")
+            ic._save()
         if not c:
             return {"ok": True, "found": False, "phone": known.get("phone") or "", "message": "no existing contact matches this rider's MotionTools link, phone or name — a message would create a new one; type the contact's email in Settings"}
         link = str((c.get("custom_attributes") or {}).get((ic._link_attr or "").split(".", 1)[-1], "") or "")
