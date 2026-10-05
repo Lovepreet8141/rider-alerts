@@ -9,7 +9,7 @@ Railway variables:
     INTERCOM_TOKEN      Access token of your Intercom app (Developer Hub → your app → Authentication)
     INTERCOM_ADMIN_ID   optional — the teammate (admin) id messages are sent as; without it the token's own teammate
                         (GET /me) sends, or the first teammate of the workspace
-    INTERCOM_REGION     us | eu | au   (default eu — the workspace's data hosting region)
+    INTERCOM_REGION     us | eu | au   (optional — detected automatically; set it only to pin a region)
 
 Intercom webhook (Developer Hub → your app → Webhooks), so rider replies show up in the dashboard:
     URL     https://<railway-url>/intercom/<WEBHOOK_PATH_SECRET>
@@ -49,10 +49,11 @@ def _html(t: str) -> str:
 
 class Intercom:
     def __init__(self, data_dir: Path):
-        self.token = os.environ.get("INTERCOM_TOKEN", "").strip()
+        self.token = os.environ.get("INTERCOM_TOKEN", "").strip().strip('"').strip("'")
         self.admin = os.environ.get("INTERCOM_ADMIN_ID", "").strip()
-        self.region = (os.environ.get("INTERCOM_REGION", "eu").strip().lower() or "eu")
-        self.base = HOSTS.get(self.region, HOSTS["eu"])
+        self.region_fixed = bool(os.environ.get("INTERCOM_REGION", "").strip())
+        self.region = (os.environ.get("INTERCOM_REGION", "us").strip().lower() or "us")
+        self.base = HOSTS.get(self.region, HOSTS["us"])
         self.path = Path(data_dir) / "intercom_threads.json"
         self.lock = threading.Lock()
         self.threads: dict = self._load()
@@ -111,8 +112,11 @@ class Intercom:
     async def call(self, method: str, path: str, body: dict = None) -> dict:
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json",
                    "Content-Type": "application/json", "Intercom-Version": API_VERSION}
-        async with httpx.AsyncClient(base_url=self.base, timeout=15, headers=headers) as c:
-            r = await c.request(method, path, json=body)
+        try:
+            async with httpx.AsyncClient(base_url=self.base, timeout=15, headers=headers) as c:
+                r = await c.request(method, path, json=body)
+        except httpx.HTTPError as e:                      # DNS, proxy, timeout — never a crash, always a readable status
+            raise HTTPException(502, f"Intercom unreachable ({self.base}): {str(e)[:120]}")
         if r.status_code >= 400:
             try:
                 errs = r.json().get("errors") or []
@@ -129,14 +133,36 @@ class Intercom:
         if not force and time.time() - self.status["checked"] < 600:
             return self.status
         try:
-            me = await self.call("GET", "/me")
+            me = await self._me_any_region()
             admin = await self.resolve_admin()
             self.status.update(ok=bool(admin), admin_name=self.status.get("admin_name") or me.get("name") or "",
                                error="" if admin else "no teammate found to send as — set INTERCOM_ADMIN_ID")
         except HTTPException as e:
             self.status.update(ok=False, error=str(e.detail))
-        self.status["checked"] = time.time()
+        self.status.update(checked=time.time(), region=self.region, host=self.base, token_len=len(self.token), token_hint=self.token[:4] + "…" if self.token else "")
         return self.status
+
+    async def _me_any_region(self) -> dict:
+        """GET /me on the configured region; on 401 try the other regions (a token only works on its workspace's
+        data-hosting region) and keep the one that answers, unless INTERCOM_REGION pins it."""
+        try:
+            return await self.call("GET", "/me")
+        except HTTPException as e:
+            if self.region_fixed or "401" not in str(e.detail):
+                raise
+            first = e
+        for reg, host in HOSTS.items():
+            if host == self.base:
+                continue
+            self.base = host
+            try:
+                me = await self.call("GET", "/me")
+                self.region = reg
+                return me
+            except HTTPException:
+                continue
+        self.base = HOSTS.get(self.region, HOSTS["us"])
+        raise HTTPException(502, f"{first.detail} (tried us, eu and au — the token is not valid on any Intercom region: copy the Access token again from Configure → Authentication)")
 
     async def contact_for(self, rider_id: str, name: str, phone: str) -> str:
         ext = f"rider:{rider_id}"
@@ -232,7 +258,8 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
     @r.get("/api/intercom/status", dependencies=login)
     async def status(force: int = 0):
         s = await ic.check(bool(force))
-        return {"enabled": ic.enabled, "ok": s["ok"], "admin_name": s["admin_name"], "error": s["error"], "region": ic.region,
+        return {"enabled": ic.enabled, "ok": s["ok"], "admin_name": s["admin_name"], "error": s["error"], "region": ic.region, "host": ic.base,
+                "token_len": len(ic.token), "token_hint": ic.token[:4] + "…" if ic.token else "", "admin_id": ic.admin,
                 "unread": sum(int(t.get("unread") or 0) for t in ic.threads.values())}
 
     @r.get("/api/intercom/threads", dependencies=login)

@@ -1403,13 +1403,20 @@ def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
 
 
 @app.get("/api/automations", dependencies=[Depends(require_login)])
-def api_automations_get():
+async def api_automations_get(recheck: int = 0):
     settings = store.get_settings()
     now = datetime.now(UTC)
     counts = store.auto_counts(now)
+    st = intercom.ic.status
+    if intercom.ic.enabled and (recheck or not st.get("checked") or st.get("error")):
+        try:
+            await intercom.ic.check(force=True)                 # an error is re-checked on every visit, so a fix shows at once
+        except Exception as e:
+            log.warning("intercom check failed: %s", e)
     return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
                        **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
-            "intercom": {"enabled": intercom.ic.enabled, "ok": intercom.ic.status.get("ok"), "admin": intercom.ic.status.get("admin_name"), "error": intercom.ic.status.get("error")},
+            "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
+                         "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin},
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "23:30–09:00", "daily_cap": AUTO_DAILY_CAP}
 
 
