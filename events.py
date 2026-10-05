@@ -42,6 +42,7 @@ class Projector:
         self.tours: dict = {}          # tour_id -> [booking_id]
         self.busy_at: dict = {}        # driver_id -> time the driver last became busy (≈ accepted an order)
         self.places: dict = {}         # place_id -> restaurant name (editable in Settings / filled from the API)
+        self.place_ll: dict = {}       # place_id -> (lat, lng): from the place API, a booking detail, or where a rider arrived
         self.phones: dict = {}         # rider_id -> phone number typed in Settings (used when MotionTools sends none)
         self.counts: dict = {}
         self._load()
@@ -51,10 +52,25 @@ class Projector:
         for k, v in self.store.get_settings().items():
             if k.startswith("place:"):
                 self.places[k[6:]] = v
+            elif k.startswith("placell:"):
+                try:
+                    la, ln = v.split(",")
+                    self.place_ll[k[8:]] = (float(la), float(ln))
+                except ValueError:
+                    pass
             elif k.startswith("tour:"):
                 self.tours[k[5:]] = v.split(",")
             elif k.startswith("phone:"):
                 self.phones[k[6:]] = v
+
+    def set_place_ll(self, pid: str, lat, lng):
+        if not pid or lat is None or lng is None or pid in self.place_ll:
+            return
+        self.place_ll[pid] = (float(lat), float(lng))
+        self.store.set_settings({f"placell:{pid}": f"{float(lat):.6f},{float(lng):.6f}"})
+        for o in self.state["orders"].values():
+            if o.get("place_id") == pid and o.get("pick_lat") is None:
+                o["pick_lat"], o["pick_lng"] = self.place_ll[pid]
 
     def set_place(self, pid: str, name: str):
         self.places[pid] = name
@@ -179,6 +195,8 @@ class Projector:
         for k in ("pick_lat", "pick_lng", "drop_lat", "drop_lng", "est_distance_m", "eta_restaurant", "eta_customer"):
             if p.get(k) is not None:
                 o[k] = p[k]
+        if p.get("pick_lat") is not None and (o.get("place_id") or p.get("place_id")):
+            self.set_place_ll(o.get("place_id") or p.get("place_id"), p["pick_lat"], p.get("pick_lng"))
         if p.get("restaurant") and p["restaurant"] != "Restaurant":
             o["restaurant"] = p["restaurant"]
             if o.get("place_id") and not self.places.get(o["place_id"]):
@@ -308,6 +326,8 @@ class Projector:
                 if pids:
                     o["place_id"] = pids[0]
                     o["restaurant"] = self.restaurant_name(pids[0])
+                    if o.get("pick_lat") is None and pids[0] in self.place_ll:
+                        o["pick_lat"], o["pick_lng"] = self.place_ll[pids[0]]
                 o["area"] = area or o["area"]
                 self.state["orders"][bid] = o
                 self.finish(o, now)
@@ -372,6 +392,16 @@ class Projector:
                 elif ev == "stop_arrived":
                     key = "at_restaurant_at" if kind == "pickup" else "at_customer_at"
                     o[key] = o[key] or now
+                    loc = d.get("driver_location") or {}
+                    fix = self.tracker.last_fix(o.get("rider_id")) if o.get("rider_id") else None
+                    lat, lng = (loc.get("lat"), loc.get("lng")) if loc.get("lat") is not None else ((fix[1], fix[2]) if fix and (now - fix[0]).total_seconds() < 600 else (None, None))
+                    if lat is not None:                       # where the rider stood when he arrived = the stop's position
+                        if kind == "pickup":
+                            if o.get("pick_lat") is None:
+                                o["pick_lat"], o["pick_lng"] = lat, lng
+                            self.set_place_ll(o.get("place_id"), lat, lng)
+                        elif o.get("drop_lat") is None:
+                            o["drop_lat"], o["drop_lng"] = lat, lng
                     self.note(o, now, "arrived_restaurant" if kind == "pickup" else "arrived_customer", o.get("rider_id"), who)
                 elif ev == "stop_completed":
                     if kind == "pickup":

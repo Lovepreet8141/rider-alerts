@@ -62,6 +62,11 @@ hand-backs of the last 90 days are indexed in the background.
   *date*, *start*, *end*, optional *city*, *fleet*; German or English headers; one row per rider and day.
   Names are matched to the riders seen on orders ("Last First" works too); unmatched names are kept and linked
   when the rider appears. Re-uploading the same days replaces them.
+- **Tour of the selected order** (City page): the side panel shows 🏍 rider (last position, moving or not) → 🏪 restaurant
+  → 🏠 customer with the times; a step turns green when the rider has reached it. The map shows the same three points
+  with a dashed line and dims everything else. Restaurant positions come from the place API when it is open and are
+  otherwise **learned the first time a rider arrives there** (his GPS position at the arrival event, kept per
+  restaurant); customer positions from the booking detail or the rider's position at arrival.
 - **Any single day**: Orders, Riders, Insights and Fleets have a date picker next to Today / Yesterday / Week — pick a day and
   every number on the tab is for that day (the daily report has its own date arrows).
 - **Light / dark**: the ◐ button in the header; dark is the default.

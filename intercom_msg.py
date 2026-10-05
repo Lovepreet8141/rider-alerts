@@ -58,6 +58,7 @@ class Intercom:
         self.lock = threading.Lock()
         self.threads: dict = self._load()
         self.status = {"checked": 0, "ok": False, "admin_name": "", "error": ""}
+        self.hint_lookup = None          # rider id -> Intercom email / contact id typed in Settings
 
     @property
     def enabled(self) -> bool:
@@ -164,28 +165,102 @@ class Intercom:
         self.base = HOSTS.get(self.region, HOSTS["us"])
         raise HTTPException(502, f"{first.detail} (tried us, eu and au — the token is not valid on any Intercom region: copy the Access token again from Configure → Authentication)")
 
-    async def contact_for(self, rider_id: str, name: str, phone: str) -> str:
+    @staticmethod
+    def phone_variants(phone: str) -> list:
+        """+49 151 2000001 · 0049151… · 0151… all mean the same rider; Intercom matches phones exactly."""
+        raw = (phone or "").strip()
+        digits = re.sub(r"\D", "", raw)
+        if not digits:
+            return []
+        if digits.startswith("00"):
+            e164 = "+" + digits[2:]
+        elif digits.startswith("0"):
+            e164 = "+49" + digits[1:]
+        else:
+            e164 = "+" + digits
+        out = [e164, raw, digits, "00" + e164[1:]]
+        if e164.startswith("+49"):
+            out.append("0" + e164[3:])
+        return list(dict.fromkeys(v for v in out if v))
+
+    async def contact_for(self, rider_id: str, name: str, phone: str, hint: str = "") -> str:
+        """The rider's Intercom contact: (1) the email / contact id typed in Settings, (2) external_id rider:<id>,
+        (3) the phone number in any format — and only if nothing matches, a new contact. A match found by phone or
+        email gets the external_id so the next lookup is direct."""
+        ext = f"rider:{rider_id}"
+        hint = (hint or "").strip()
+        found = None
+        if hint:
+            if "@" in hint:
+                res = await self.call("POST", "/contacts/search", {"query": {"field": "email", "operator": "=", "value": hint.lower()}})
+                found = (res.get("data") or [None])[0]
+            else:
+                try:
+                    found = await self.call("GET", f"/contacts/{hint}")
+                except HTTPException:
+                    found = None
+            if not found:
+                raise HTTPException(404, f"Intercom contact '{hint}' not found — check the email / id in Settings → Rider phone numbers")
+        if not found:
+            found = await self.find_contact(rider_id, name, phone)
+        if found:
+            if found.get("external_id") != ext:
+                try:
+                    await self.call("PUT", f"/contacts/{found['id']}", {"external_id": ext})
+                except HTTPException:
+                    pass
+            return found["id"]
+        body = {"role": "user", "external_id": ext, "name": name or "Rider"}
+        pv = self.phone_variants(phone)
+        if pv:
+            body["phone"] = pv[0]
+        return (await self.call("POST", "/contacts", body))["id"]
+
+    def relink(self, rider_id: str):
+        """The Intercom contact of a rider changed (Settings): forget the cached contact / conversation."""
+        t = self.threads.get(rider_id)
+        if t:
+            t["contact_id"], t["conversation_id"] = "", ""
+            self._save()
+
+    async def find_contact(self, rider_id: str, name: str, phone: str):
+        """Existing contact for a rider: external_id rider:<id>, any phone format, then the exact name (one match only)."""
         ext = f"rider:{rider_id}"
         cond = [{"field": "external_id", "operator": "=", "value": ext}]
-        if phone:
-            cond.append({"field": "phone", "operator": "=", "value": phone})
+        for v in self.phone_variants(phone):
+            cond.append({"field": "phone", "operator": "=", "value": v})
         res = await self.call("POST", "/contacts/search", {"query": {"operator": "OR", "value": cond}})
-        if res.get("data"):
-            return res["data"][0]["id"]
-        body = {"role": "user", "external_id": ext, "name": name or "Rider"}
-        if phone:
-            body["phone"] = phone
-        return (await self.call("POST", "/contacts", body))["id"]
+        rows = res.get("data") or []
+        rows.sort(key=lambda c: (c.get("external_id") != ext, c.get("role") != "user"))   # exact id first, then users before leads
+        if rows:
+            return rows[0]
+        nm = " ".join((name or "").split())
+        if len(nm) >= 3:
+            res = await self.call("POST", "/contacts/search", {"query": {"field": "name", "operator": "~", "value": nm}})
+            cands = [c for c in (res.get("data") or []) if " ".join((c.get("name") or "").split()).lower() == nm.lower()]
+            if len(cands) == 1:
+                return cands[0]
+            # "Lena W." in MotionTools vs "Lena Wagner" in Intercom: first name + initial of the last name, one match only
+            parts = nm.split()
+            if len(parts) >= 2 and parts[-1].endswith("."):
+                first, ini = parts[0].lower(), parts[-1][0].lower()
+                cands = [c for c in (res.get("data") or []) if (c.get("name") or "").lower().startswith(first + " ") and (c.get("name") or "").lower().split()[-1][:1] == ini]
+                if len(cands) == 1:
+                    return cands[0]
+        return None
 
     async def send(self, rider_id: str, name: str, phone: str, text: str, order_ref: str = "") -> dict:
         t = self.thread(rider_id, name, phone)
+        hint = self.hint_lookup(rider_id) if self.hint_lookup else ""
+        if hint != (t.get("hint") or ""):
+            t["contact_id"], t["conversation_id"], t["hint"] = "", "", hint
         msg = {"id": f"ops-{time.time_ns()}", "from": "ops", "body": text, "at": int(time.time()), "status": "sending", "order_ref": order_ref}
         self._push(t, msg)
         try:
             if not await self.resolve_admin():
                 raise HTTPException(503, "no teammate to send as — set INTERCOM_ADMIN_ID in Railway")
             if not t.get("contact_id"):
-                t["contact_id"] = await self.contact_for(rider_id, name, phone)
+                t["contact_id"] = await self.contact_for(rider_id, name, phone, hint)
             if t.get("conversation_id"):
                 await self.call("POST", f"/conversations/{t['conversation_id']}/reply",
                                 {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
@@ -245,6 +320,7 @@ class Intercom:
 
 def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda rid: {}) -> APIRouter:
     ic = Intercom(data_dir)
+    ic.hint_lookup = lambda rid: str((rider_lookup(rid) or {}).get("intercom") or "")
     r = APIRouter()
     login = [Depends(require_login)]
 
@@ -265,6 +341,32 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
     @r.get("/api/intercom/threads", dependencies=login)
     def threads():
         return {"threads": ic.summary()}
+
+    @r.get("/api/intercom/match/{rider_id}", dependencies=login)
+    async def match(rider_id: str):
+        """Settings: which Intercom contact a rider's messages would go to (without sending anything)."""
+        if not ic.enabled:
+            return {"ok": False, "error": "Intercom not configured"}
+        known = rider_lookup(rider_id) or {}
+        hint = str(known.get("intercom") or "")
+        try:
+            if hint:
+                c = (await ic.call("POST", "/contacts/search", {"query": {"field": "email", "operator": "=", "value": hint.lower()}})).get("data") if "@" in hint else [await ic.call("GET", f"/contacts/{hint}")]
+                c = (c or [None])[0]
+                how = "email typed in Settings"
+            else:
+                c = await ic.find_contact(rider_id, known.get("name") or "", known.get("phone") or "")
+                how = "phone / name"
+        except HTTPException as e:
+            return {"ok": False, "error": str(e.detail)}
+        if not c:
+            return {"ok": True, "found": False, "phone": known.get("phone") or "", "message": "no existing contact matches this rider's phone or name — a message would create a new one; type the contact's email in Settings"}
+        return {"ok": True, "found": True, "how": how, "contact": {"id": c.get("id"), "name": c.get("name"), "email": c.get("email"), "phone": c.get("phone"), "role": c.get("role"), "external_id": c.get("external_id")}}
+
+    @r.delete("/api/intercom/thread/{rider_id}", dependencies=login)
+    def thread_relink(rider_id: str):
+        ic.relink(rider_id)
+        return {"ok": True}
 
     @r.get("/api/intercom/thread/{rider_id}", dependencies=login)
     def thread(rider_id: str, read: int = 1):

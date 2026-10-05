@@ -517,6 +517,10 @@ async def enrich_place(pid: str) -> bool:
     if not p:
         return False
     name = p.get("name") or p.get("title") or ""
+    loc = p.get("location") if isinstance(p.get("location"), dict) else {}
+    lat, lng = p.get("lat", loc.get("lat")), p.get("lng", loc.get("lng"))
+    if lat is not None and lng is not None:
+        projector.set_place_ll(pid, lat, lng)
     addr = p.get("formatted_address") or p.get("address") or ""
     if isinstance(addr, dict):
         addr = " ".join(str(x) for x in [addr.get("street"), addr.get("house_number"), addr.get("zip_code"), addr.get("city")] if x)
@@ -1078,6 +1082,9 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
     sevs = [STATE["sev"].get((o["id"], k)) for k in kinds]
     heads = [STATE["heads"].get((o["id"], k), "") for k in kinds]
     lat, lng = (r.get("lat"), r.get("lng")) if r.get("lat") is not None else (o.get("rider_lat"), o.get("rider_lng"))
+    fix = tracker.last_fix(o["rider_id"]) if o.get("rider_id") else None
+    if o.get("pick_lat") is None and o.get("place_id") in projector.place_ll:
+        o["pick_lat"], o["pick_lng"] = projector.place_ll[o["place_id"]]
     # stops: MotionTools counts pickup + dropoff(s); the events tell us which ones are done
     stops_total = o.get("stops") or max(2, len(o.get("stop_types") or {}))
     stops_done = (1 if o.get("picked_up_at") else 0) + (1 if o.get("delivered_at") else 0)
@@ -1087,6 +1094,8 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
             "dispatched_iso": iso(o.get("dispatched_at")), "stops_total": int(stops_total), "stops_done": stops_done, "to_last_stop_min": int(round(to_last)) if to_last is not None else None,
             "rider_lat": lat if live else None, "rider_lng": lng if live else None, "pick_lat": o.get("pick_lat"), "pick_lng": o.get("pick_lng"),
             "drop_lat": o.get("drop_lat"), "drop_lng": o.get("drop_lng"), "km": round(o["est_distance_m"] / 1000, 1) if isinstance(o.get("est_distance_m"), (int, float)) else None,
+            "rider_fix_min": (int((now - fix[0]).total_seconds() // 60) if fix else None),
+            "rider_moving": tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m) if (o.get("rider_id") and live) else None,
             "phone": r.get("phone") or "", "restaurant": o["restaurant"], "restaurant_phone": o.get("restaurant_phone", ""),
             "customer_addr": o["customer_addr"], "customer_zip": o.get("customer_zip", ""), "phase": o["phase"],
             "phase_label": PHASE_LABEL.get(o["phase"], o["phase"]), "elapsed": int(elapsed) if elapsed is not None else None,
@@ -1281,7 +1290,7 @@ def api_riders():
     for rid, r in rows.items():
         live = STATE["riders"].get(rid, {})
         mt_phone = live.get("mt_phone") or ""
-        out.append({"id": rid, "name": live.get("name") or r.get("name") or "Rider", "mt_phone": mt_phone,
+        out.append({"id": rid, "name": live.get("name") or r.get("name") or "Rider", "mt_phone": mt_phone, "intercom": manual.get(f"intercom:{rid}", ""),
                     "phone": projector.phones.get(rid, ""), "fleet": store.fleet_map.get(rid, ""), "city": r.get("city") or "",
                     "fleet_source": "typed" if manual.get(f"fleet_manual:{rid}") else ("MotionTools" if store.fleet_map.get(rid) else "")})
     out.sort(key=lambda x: (x["city"], x["name"]))
@@ -1293,6 +1302,11 @@ async def api_riders_set(request: Request):
     body = await request.json()
     for rid, val in (body or {}).items():
         if rid and isinstance(val, dict):
+            if isinstance(val.get("intercom"), str):
+                cur = store.get_settings().get(f"intercom:{rid}", "")
+                if val["intercom"].strip() != cur:
+                    store.set_settings({f"intercom:{rid}": val["intercom"].strip()})
+                    intercom.ic.relink(rid)                       # next message looks the contact up again
             if isinstance(val.get("fleet"), str) and val["fleet"].strip() != store.fleet_map.get(rid, ""):
                 store.set_fleet(rid, val["fleet"].strip())
                 store.set_settings({f"fleet_manual:{rid}": "1" if val["fleet"].strip() else ""})   # typed by hand: never overwritten by the API
@@ -1929,7 +1943,13 @@ def export_events(n: int = 300):
 
 
 from intercom_msg import make_router as _intercom_router  # noqa: E402
-intercom = _intercom_router(require_login, DATA_DIR, PATH_SECRET, lambda rid: STATE["riders"].get(rid) or {})
+def _rider_for_intercom(rid: str) -> dict:
+    r = dict(STATE["riders"].get(rid) or {})
+    r["intercom"] = store.get_settings().get(f"intercom:{rid}", "")     # email / contact id typed in Settings
+    return r
+
+
+intercom = _intercom_router(require_login, DATA_DIR, PATH_SECRET, _rider_for_intercom)
 app.include_router(intercom)
 
 
