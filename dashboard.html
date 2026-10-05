@@ -140,7 +140,7 @@
 
   <!-- ================= RIDERS ================= -->
   <section id="riders">
-    <div class="lh" style="margin:4px 0 10px"><h2 style="margin:0">Riders</h2><span class="seg" data-periods="riders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span><span class="sp"></span><button id="sheetBtn">⬆ Shift sheet</button></div>
+    <div class="lh" style="margin:4px 0 10px"><h2 style="margin:0">Riders</h2><span class="seg" data-periods="riders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span><input type="date" data-day="riders" title="any single day" style="padding:5px 8px"><span class="sp"></span><button id="sheetBtn">⬆ Shift sheet</button></div>
     <div class="pulse" id="rTiles"></div>
     <div class="grid2" style="margin-top:12px">
       <div class="panel" style="margin-top:0"><h3>Rider score — how it is built <span class="muted">0–100 · drives the ranking and the coaching list</span></h3>
@@ -156,7 +156,7 @@
 
   <!-- ================= FLEETS ================= -->
   <section id="fleets">
-    <div class="lh" style="margin:4px 0 6px"><h2 style="margin:0">Fleets</h2><span class="seg" data-periods="fleets"><button data-p="today">Today</button><button data-p="week" class="active">This week</button><button data-p="lastweek">Last week</button><button data-p="month">Month</button></span><span class="sp"></span><button id="printCard" class="primary">🖨 Weekly scorecard (print / PDF)</button></div>
+    <div class="lh" style="margin:4px 0 6px"><h2 style="margin:0">Fleets</h2><span class="seg" data-periods="fleets"><button data-p="today">Today</button><button data-p="week" class="active">This week</button><button data-p="lastweek">Last week</button><button data-p="month">Month</button></span><input type="date" data-day="fleets" title="any single day" style="padding:5px 8px"><span class="sp"></span><button id="printCard" class="primary">🖨 Weekly scorecard (print / PDF)</button></div>
     <div class="ftabs" id="fTabs"></div>
     <div class="pulse" id="fTiles"></div>
     <div class="grid3" style="margin-top:12px">
@@ -175,7 +175,7 @@
   <section id="orders">
     <h2>All orders <span class="sp"></span>
       <input id="q" placeholder="search order, rider, restaurant, address" style="min-width:260px">
-      <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button></span>
+      <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button></span><input type="date" data-day="orders" title="any single day" style="padding:5px 8px">
       <a class="btn" id="csvOrders" href="/export.csv?period=today">⬇ CSV</a></h2>
     <div class="chips" id="orderChips" style="margin:0 0 10px"></div>
     <div class="panel" style="margin-top:0"><div id="ordersTable"></div></div>
@@ -183,7 +183,7 @@
 
   <!-- ================= INSIGHTS ================= -->
   <section id="insights">
-    <h2>Where the time goes <span class="sp"></span><span class="seg" data-periods="insights"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span></h2>
+    <h2>Where the time goes <span class="sp"></span><span class="seg" data-periods="insights"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span><input type="date" data-day="insights" title="any single day" style="padding:5px 8px"></h2>
     <div class="pulse" id="kpis"></div>
     <div id="phasePanel" class="panel"></div>
     <h2>Focus — what to fix first</h2>
@@ -488,7 +488,7 @@ async function loadRidersPage(){ try{ const d=await api(`/api/riders-page?period
     const filters=[["","All",rs.length],["noorder","No order yet",rs.filter(r=>r.in_sheet&&r.tone==="red").length],["late","First order late",rs.filter(r=>r.first_late_days).length],["less","Working less",rs.filter(r=>r.working_less).length],["low","Score < 60",rs.filter(r=>r.score!=null&&r.score<60).length],["nosheet","Not in sheet",rs.filter(r=>!r.in_sheet&&t.sheet).length]];
     document.getElementById("rFilters").innerHTML=filters.filter(f=>!f[0]||f[2]).map(([k,l,n])=>`<button data-rf="${k}" class="${RFILTER===k?"on":""}">${l} <span class="count">${n}</span></button>`).join(""); document.querySelectorAll("[data-rf]").forEach(b=>b.onclick=()=>{RFILTER=b.dataset.rf; loadRidersPage();});
     const f={noorder:r=>r.in_sheet&&r.tone==="red",late:r=>r.first_late_days,less:r=>r.working_less,low:r=>r.score!=null&&r.score<60,nosheet:r=>!r.in_sheet}[RFILTER]; const rows=f?rs.filter(f):rs;
-    document.getElementById("rTitle").firstChild.textContent=`Riders ${P.riders} · ${CITY||"all cities"} · sorted by score · tap a rider for the full story `;
+    document.getElementById("rTitle").firstChild.textContent=`Riders ${P.riders.length===10?dhm(P.riders+"T12:00:00").split(",")[0]+" "+P.riders.slice(8)+"."+P.riders.slice(5,7)+".":P.riders} · ${CITY||"all cities"} · sorted by score · tap a rider for the full story `;
     document.getElementById("ridersTable").innerHTML=rows.length?`<table>${riderHead({noCity:!!CITY,fleet:true})}${riderRows(rows,{period:P.riders})}</table>`:`<div class="muted">No riders in this period.</div>`;
     document.getElementById("rWeek").innerHTML=heat(d.week);
     document.getElementById("rByCity").innerHTML=(d.by_city||[]).length?`<table><tr><th>City</th><th class="n">Rider-days in sheet</th><th class="n">With orders</th><th class="n">Fulfilment</th><th class="n">No order</th><th class="n">Deliveries / rider-day</th></tr>${d.by_city.map(c=>`<tr><td><b>${esc(c.city)}</b></td><td class="n">${c.planned}</td><td class="n">${c.with_orders}</td><td class="n ${c.fulfilment_pct>=90?"ok":c.fulfilment_pct>=80?"warn":"bad"}">${pc(c.fulfilment_pct)}</td><td class="n ${c.no_order?"bad":""}">${c.no_order}</td><td class="n">${c.deliveries_per_rider_day==null?"–":f1(c.deliveries_per_rider_day)}</td></tr>`).join("")}</table><p class="muted" style="margin:6px 0 0">Fulfilment = rider-days with at least one order ÷ rider-days in the shift sheet. Below 90 % the city cannot hit its on-time target whatever dispatch does.</p>`:`<div class="empty">Needs the shift sheet — upload it in Settings (CSV with rider, date, start, end, city). Then no-shows, first-order-late and fulfilment per city appear here.</div>`;
@@ -601,7 +601,7 @@ document.addEventListener("click",async e=>{ if(e.target.closest("a[href^='tel']
   if(m){ if(m.disabled) return; e.stopPropagation(); const rr=(LAST?LAST.riders.find(x=>x.id===m.dataset.msg):null)||{}; if(document.getElementById("dlg").open) document.getElementById("dlg").close(); openThread(m.dataset.msg, rr.name||m.dataset.name||"", rr.phone||"", m.dataset.ref||""); return; }
   if(ra){ e.stopPropagation(); showFreeRiders(ra.dataset.reassign); return; }
   if(pipe){ STAGE_FILTER=STAGE_FILTER===pipe.dataset.stage?"":pipe.dataset.stage; if(LAST) renderLiveOrders(LAST); return; }
-  if(p){ const g=p.closest("[data-periods]"); P[g.dataset.periods]=p.dataset.p; g.querySelectorAll("button").forEach(x=>x.classList.toggle("active",x===p)); ({orders:loadOrders,riders:loadRidersPage,insights:loadInsights,fleets:loadFleets})[g.dataset.periods](); return; }
+  if(p){ const g=p.closest("[data-periods]"); P[g.dataset.periods]=p.dataset.p; g.querySelectorAll("button").forEach(x=>x.classList.toggle("active",x===p)); const di=document.querySelector(`[data-day="${g.dataset.periods}"]`); if(di) di.value=""; ({orders:loadOrders,riders:loadRidersPage,insights:loadInsights,fleets:loadFleets})[g.dataset.periods](); return; }
   if(st){ e.stopPropagation(); showOrder(st.dataset.story); return; }
   const rr=e.target.closest("[data-rest]"); if(rr && !o){ showRestaurant(rr.dataset.rest, rr.dataset.place, rr.dataset.period); return; }
   if(o && !e.target.closest("button")){ selectOrder(o.dataset.order); return; }
@@ -610,6 +610,7 @@ document.addEventListener("keydown",e=>{ if(e.target.matches("input,textarea,sel
   if(k==="j"||k==="arrowdown"){ moveSel(1); e.preventDefault(); } else if(k==="k"||k==="arrowup"){ moveSel(-1); e.preventDefault(); }
   else if(k==="escape"){ closeDrawer(); if(SEL){ SEL=null; document.querySelectorAll(".r2").forEach(x=>x.classList.remove("cur")); renderSide(null); } }
   else if(SEL){ const o=LAST_ORDERS.find(x=>x.id===SEL); if(!o) return; if(k==="m"&&o.rider_id) openThread(o.rider_id,o.rider,o.phone,o.ref); else if(k==="h"){ const b=document.querySelector(`[data-dismissall="${SEL}"]`); if(b) b.click(); } else if(k==="s"){ const b=document.querySelector(`#liveList [data-order="${SEL}"] [data-snooze]`); if(b) b.click(); } } });
+document.querySelectorAll("[data-day]").forEach(inp=>{ inp.max=new Date().toLocaleDateString("sv-SE",{timeZone:"Europe/Berlin"}); inp.onchange=()=>{ const g=inp.dataset.day; if(!inp.value) return; P[g]=inp.value; document.querySelectorAll(`[data-periods="${g}"] button`).forEach(b=>b.classList.remove("active")); ({orders:loadOrders,riders:loadRidersPage,insights:loadInsights,fleets:loadFleets})[g](); }; });
 document.getElementById("q").addEventListener("input",()=>{clearTimeout(window._qt); window._qt=setTimeout(loadOrders,300);});
 document.getElementById("liveQ").addEventListener("input",()=>{ if(LAST) renderLiveOrders(LAST); });
 document.querySelectorAll("#liveView button").forEach(b=>b.onclick=()=>{ LIVE_VIEW=b.dataset.v; try{localStorage.setItem("liveView",LIVE_VIEW);}catch(e){} if(LAST) renderLiveOrders(LAST); });
