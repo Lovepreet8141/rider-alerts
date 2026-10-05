@@ -422,6 +422,8 @@ class Intercom:
             conv = t.get("auto_conversation_id") if t.get("auto_day") == today else ""
             if conv:
                 await self.call("POST", f"/conversations/{conv}/reply", {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
+                if team:   # a reply re-assigns the conversation to the replying teammate — push it back to the team every time
+                    msg["routing"] = await self.route_to_team(conv, team)
             else:
                 r = await self.call("POST", "/messages", {"message_type": "inapp", "body": _html(text), "from": {"type": "admin", "id": self.admin},
                                                          "to": {"type": "user", "id": t["contact_id"]}, "create_conversation_without_contact_reply": True})
