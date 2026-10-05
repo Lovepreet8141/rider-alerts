@@ -211,6 +211,8 @@ class Intercom:
         if not found:
             found = await self.find_contact(rider_id, name, phone)
         if found:
+            email = (found.get("email") or "").strip()
+            self.thread(rider_id)["user"] = email.split("@")[0] if email else (found.get("name") or "")
             if self.on_match:
                 try:
                     self.on_match(rider_id, found)
@@ -376,7 +378,7 @@ class Intercom:
         out = []
         for t in self.threads.values():
             last = t["messages"][-1] if t["messages"] else None
-            out.append({"rider_id": t["rider_id"], "name": t.get("name") or "Rider", "phone": t.get("phone") or "",
+            out.append({"rider_id": t["rider_id"], "name": t.get("name") or "Rider", "phone": t.get("phone") or "", "user": t.get("user") or "",
                         "unread": t.get("unread") or 0, "last": last})
         out.sort(key=lambda x: -(x["last"] or {}).get("at", 0))
         return out
