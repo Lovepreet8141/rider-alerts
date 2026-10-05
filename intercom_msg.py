@@ -398,6 +398,9 @@ class Intercom:
                 t["auto_conversation_id"], t["auto_day"] = conv, today
                 if conv and team:
                     try:
+                        # a message sent by a teammate leaves the conversation in that teammate's own inbox too —
+                        # take it away from the teammate first, then hand it to the automation team only
+                        await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": "0"})
                         await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team})
                     except HTTPException as e:
                         msg["note"] = f"could not assign to the automation inbox: {e.detail}"[:160]
