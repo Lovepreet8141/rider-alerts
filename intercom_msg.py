@@ -249,6 +249,20 @@ class Intercom:
                     return cands[0]
         return None
 
+    async def latest_conversation(self, contact_id: str) -> str:
+        """The rider's most recent Intercom conversation (open first), so our message lands in the chat he already
+        has with the team instead of opening a new one."""
+        try:
+            res = await self.call("POST", "/conversations/search", {"query": {"field": "contact_ids", "operator": "=", "value": contact_id},
+                                                                    "pagination": {"per_page": 10}})
+        except HTTPException:
+            return ""
+        convs = res.get("conversations") or []
+        if not convs:
+            return ""
+        convs.sort(key=lambda c: (c.get("state") != "open", -(c.get("updated_at") or 0)))
+        return str(convs[0].get("id") or "")
+
     async def send(self, rider_id: str, name: str, phone: str, text: str, order_ref: str = "") -> dict:
         t = self.thread(rider_id, name, phone)
         hint = self.hint_lookup(rider_id) if self.hint_lookup else ""
@@ -261,6 +275,8 @@ class Intercom:
                 raise HTTPException(503, "no teammate to send as — set INTERCOM_ADMIN_ID in Railway")
             if not t.get("contact_id"):
                 t["contact_id"] = await self.contact_for(rider_id, name, phone, hint)
+            if not t.get("conversation_id"):
+                t["conversation_id"] = await self.latest_conversation(t["contact_id"])   # continue the rider's existing chat
             if t.get("conversation_id"):
                 await self.call("POST", f"/conversations/{t['conversation_id']}/reply",
                                 {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
