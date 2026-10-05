@@ -1505,8 +1505,8 @@ async def api_automations_test(request: Request):
     r = STATE["riders"].get(rid, {})
     if not intercom.ic.enabled:
         return {"ok": False, "dry": True, "text": text, "error": "Intercom not configured — would have sent this"}
-    m = await intercom.ic.send(rid, r.get("name") or "Rider", r.get("phone") or "", "[TEST] " + text, "TEST01")
-    return {"ok": m["status"] == "sent", "text": text, "error": m.get("error", "")}
+    m = await intercom.ic.send(rid, r.get("name") or "Rider", r.get("phone") or "", "[TEST] " + text, "TEST01", auto=True)   # same path as the rules -> automation inbox
+    return {"ok": m["status"] == "sent", "text": text, "error": m.get("error", "") or m.get("note", "")}
 
 
 class SafeDict(dict):

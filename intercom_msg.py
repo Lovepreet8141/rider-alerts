@@ -401,12 +401,7 @@ class Intercom:
                         await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team})
                     except HTTPException as e:
                         msg["note"] = f"could not assign to the automation inbox: {e.detail}"[:160]
-            if conv:
-                try:
-                    await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "close", "type": "admin", "admin_id": self.admin})
-                except HTTPException:
-                    pass
-            msg["status"] = "sent"
+            msg["status"] = "sent"                         # stays open in the automation inbox so it is visible there
         except HTTPException as e:
             msg["status"], msg["error"] = "failed", str(e.detail)
         except Exception as e:
