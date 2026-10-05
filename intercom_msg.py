@@ -373,6 +373,37 @@ class Intercom:
         self._save()
         return msg
 
+    async def assignees(self, conv: str) -> dict:
+        c = await self.call("GET", f"/conversations/{conv}")
+        return {"admin": str(c.get("admin_assignee_id") or ""), "team": str(c.get("team_assignee_id") or ""), "state": c.get("state") or ""}
+
+    async def route_to_team(self, conv: str, team: str) -> str:
+        """Put a conversation into the automation team inbox only. Intercom keeps the sending teammate as
+        assignee, so we assign the team, read the conversation back, drop the teammate if still set and
+        re-assign the team if the unassign cleared it. Returns a short human-readable result."""
+        part = lambda typ, who: self.call("POST", f"/conversations/{conv}/parts",
+                                          {"message_type": "assignment", "type": typ, "admin_id": self.admin, "assignee_id": who})
+        try:
+            st = await self.assignees(conv)
+            for _ in range(3):
+                if st["team"] != str(team):
+                    await part("team", str(team)); st = await self.assignees(conv)
+                if st["admin"]:
+                    await part("admin", "0"); st = await self.assignees(conv)
+                if st["team"] == str(team) and not st["admin"]:
+                    break
+            if st["state"] == "closed":
+                await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "open", "admin_id": self.admin})
+            if st["team"] == str(team) and not st["admin"]:
+                return "automation inbox only"
+            if st["team"] == str(team):
+                return "automation inbox, but Intercom keeps the teammate assigned — turn off automatic assignment in the Automation team inbox settings"
+            return f"NOT in automation inbox (team={st['team'] or '-'}, teammate={st['admin'] or '-'})"
+        except HTTPException as e:
+            return f"could not route: {e.detail}"[:160]
+        except Exception as e:
+            return f"could not route: {e}"[:160]
+
     async def _send_auto(self, rider_id: str, name: str, phone: str, text: str, order_ref: str) -> dict:
         t = self.thread(rider_id, name, phone)
         hint = self.hint_lookup(rider_id) if self.hint_lookup else ""
@@ -397,13 +428,7 @@ class Intercom:
                 conv = str(r.get("conversation_id") or "")
                 t["auto_conversation_id"], t["auto_day"] = conv, today
                 if conv and team:
-                    try:
-                        # a message sent by a teammate leaves the conversation in that teammate's own inbox too —
-                        # take it away from the teammate first, then hand it to the automation team only
-                        await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": "0"})
-                        await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team})
-                    except HTTPException as e:
-                        msg["note"] = f"could not assign to the automation inbox: {e.detail}"[:160]
+                    msg["routing"] = await self.route_to_team(conv, team)
             msg["status"] = "sent"                         # stays open in the automation inbox so it is visible there
         except HTTPException as e:
             msg["status"], msg["error"] = "failed", str(e.detail)
