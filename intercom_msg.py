@@ -7,7 +7,8 @@ Mount in app.py (after `app = FastAPI()` and `require_login` are defined — e.g
 
 Railway variables:
     INTERCOM_TOKEN      Access token of your Intercom app (Developer Hub → your app → Authentication)
-    INTERCOM_ADMIN_ID   The teammate (admin) id that messages are sent as (GET https://api.intercom.io/admins)
+    INTERCOM_ADMIN_ID   optional — the teammate (admin) id messages are sent as; without it the token's own teammate
+                        (GET /me) sends, or the first teammate of the workspace
     INTERCOM_REGION     us | eu | au   (default eu — the workspace's data hosting region)
 
 Intercom webhook (Developer Hub → your app → Webhooks), so rider replies show up in the dashboard:
@@ -59,7 +60,26 @@ class Intercom:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.token and self.admin)
+        return bool(self.token)          # the admin id is optional: without it the token's own teammate sends
+
+    async def resolve_admin(self) -> str:
+        """INTERCOM_ADMIN_ID not set: messages go out as the teammate who owns the token (GET /me); if that gives no
+        admin, the first teammate of the workspace (GET /admins)."""
+        if self.admin:
+            return self.admin
+        try:
+            me = await self.call("GET", "/me")
+            if me.get("type") == "admin" and me.get("id"):
+                self.admin = str(me["id"])
+                self.status["admin_name"] = me.get("name") or ""
+        except HTTPException:
+            pass
+        if not self.admin:
+            admins = (await self.call("GET", "/admins")).get("admins") or []
+            if admins:
+                self.admin = str(admins[0]["id"])
+                self.status["admin_name"] = admins[0].get("name") or ""
+        return self.admin
 
     # ------------------------------------------------------------------ storage
     def _load(self) -> dict:
@@ -104,13 +124,15 @@ class Intercom:
 
     async def check(self, force: bool = False) -> dict:
         if not self.enabled:
-            self.status.update(ok=False, error="INTERCOM_TOKEN / INTERCOM_ADMIN_ID not set")
+            self.status.update(ok=False, error="INTERCOM_TOKEN not set")
             return self.status
         if not force and time.time() - self.status["checked"] < 600:
             return self.status
         try:
             me = await self.call("GET", "/me")
-            self.status.update(ok=True, admin_name=me.get("name") or "", error="")
+            admin = await self.resolve_admin()
+            self.status.update(ok=bool(admin), admin_name=self.status.get("admin_name") or me.get("name") or "",
+                               error="" if admin else "no teammate found to send as — set INTERCOM_ADMIN_ID")
         except HTTPException as e:
             self.status.update(ok=False, error=str(e.detail))
         self.status["checked"] = time.time()
@@ -134,6 +156,8 @@ class Intercom:
         msg = {"id": f"ops-{time.time_ns()}", "from": "ops", "body": text, "at": int(time.time()), "status": "sending", "order_ref": order_ref}
         self._push(t, msg)
         try:
+            if not await self.resolve_admin():
+                raise HTTPException(503, "no teammate to send as — set INTERCOM_ADMIN_ID in Railway")
             if not t.get("contact_id"):
                 t["contact_id"] = await self.contact_for(rider_id, name, phone)
             if t.get("conversation_id"):
@@ -232,7 +256,7 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
         if not text:
             raise HTTPException(400, "empty message")
         if not ic.enabled:
-            raise HTTPException(503, "Intercom is not configured (INTERCOM_TOKEN / INTERCOM_ADMIN_ID)")
+            raise HTTPException(503, "Intercom is not configured (INTERCOM_TOKEN missing in Railway)")
         rid, name, phone = who(body)
         return await ic.send(rid, name, phone, text, str(body.get("order_ref") or ""))
 
@@ -244,7 +268,7 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
         if not text or not riders:
             raise HTTPException(400, "message and riders required")
         if not ic.enabled:
-            raise HTTPException(503, "Intercom is not configured (INTERCOM_TOKEN / INTERCOM_ADMIN_ID)")
+            raise HTTPException(503, "Intercom is not configured (INTERCOM_TOKEN missing in Railway)")
         results = []
         for x in riders[:200]:
             rid, name, phone = who(x)

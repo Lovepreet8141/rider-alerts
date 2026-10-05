@@ -72,8 +72,9 @@ hand-backs of the last 90 days are indexed in the background.
 message that opens a conversation, later ones are replies in it; rider replies arrive through the Intercom webhook
 and show in the **Messages** drawer (header button, unread badge). Threads are kept in `DATA_DIR/intercom_threads.json`.
 
-Railway variables: `INTERCOM_TOKEN` (Developer Hub → your app → Authentication), `INTERCOM_ADMIN_ID`
-(`GET https://api.intercom.io/admins` with the token lists them), `INTERCOM_REGION` (`eu` default, `us`, `au`).
+Railway variables: `INTERCOM_TOKEN` (Developer Hub → your app → Authentication) is enough — messages then go out as the
+teammate who created the app. Optional: `INTERCOM_ADMIN_ID` to send as another teammate (`GET https://api.intercom.io/admins`
+lists them), `INTERCOM_REGION` (`eu` default, `us`, `au`).
 Intercom webhook for replies: `https://<railway-url>/intercom/<WEBHOOK_PATH_SECRET>`, topics
 `conversation.user.replied` and `conversation.user.created`. Without the token everything still works — the Msg
 buttons report "Intercom not configured" and the rules run in **dry-run**.
@@ -214,7 +215,7 @@ hourly (old files, old points, VACUUM when there is room); Settings → System s
 ## Railway variables
 `MT_API_TOKEN`, `DASHBOARD_PASSWORD`, `WEBHOOK_PATH_SECRET`, `DATA_DIR=/data`,
 `MUNICH_SERVICE_AREA_ID` (optional: comma-separated area ids to keep; **empty = all cities**). Optional: `SYNC_SECONDS` (30), `CITY_NAME`,
-`INTERCOM_TOKEN`, `INTERCOM_ADMIN_ID`, `INTERCOM_REGION` (see Intercom above).
+`INTERCOM_TOKEN` (optional `INTERCOM_ADMIN_ID`, `INTERCOM_REGION` — see Intercom above).
 
 ## MotionTools webhooks (required in webhook mode)
 Endpoint `https://<railway-url>/mt/<WEBHOOK_PATH_SECRET>`.
