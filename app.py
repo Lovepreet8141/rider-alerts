@@ -1156,7 +1156,7 @@ def api_state(city: str = "", done: int = 0):
         last_min = int((now - last).total_seconds() // 60) if last else None
         status = "on_order" if n else ("free" if last_min is not None and last_min <= 30 else "done")
         fix = tracker.last_fix(rid)
-        riders.append({"id": rid, "name": r["name"] or "Rider", "phone": r["phone"], "online": r.get("online"), "orders": n, "lat": r.get("lat"), "lng": r.get("lng"),
+        riders.append({"id": rid, "name": r["name"] or "Rider", "user": INTERCOM_USER.get(rid, ""), "phone": r["phone"], "online": r.get("online"), "orders": n, "lat": r.get("lat"), "lng": r.get("lng"),
                        "fleet": store.fleet_map.get(rid, ""), "done_today": pc["done_by"].get(rid, 0), "last_min": last_min, "status": status,
                        "stale": bool(n and last_min is not None and last_min >= 60),
                        "map_url": f"https://maps.google.com/?q={r['lat']:.5f},{r['lng']:.5f}" if r.get("lat") is not None and n else "",
@@ -1290,7 +1290,7 @@ def api_riders():
     for rid, r in rows.items():
         live = STATE["riders"].get(rid, {})
         mt_phone = live.get("mt_phone") or ""
-        out.append({"id": rid, "name": live.get("name") or r.get("name") or "Rider", "mt_phone": mt_phone, "intercom": manual.get(f"intercom:{rid}", ""),
+        out.append({"id": rid, "name": live.get("name") or r.get("name") or "Rider", "mt_phone": mt_phone, "intercom": manual.get(f"intercom:{rid}", ""), "intercom_user": INTERCOM_USER.get(rid, ""),
                     "phone": projector.phones.get(rid, ""), "fleet": store.fleet_map.get(rid, ""), "city": r.get("city") or "",
                     "fleet_source": "typed" if manual.get(f"fleet_manual:{rid}") else ("MotionTools" if store.fleet_map.get(rid) else "")})
     out.sort(key=lambda x: (x["city"], x["name"]))
@@ -1395,6 +1395,7 @@ def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
         r["status"], r["tone"] = rider_status_now(r, r["live"] if is_today else 0, now, is_today)
         st = STATE["riders"].get(r["rider_id"], {})
         r["phone"] = st.get("phone") or projector.phones.get(r["rider_id"], "")
+        r["user"] = INTERCOM_USER.get(r["rider_id"], "")
         last = ts(r.get("last_at"))
         r["last_min"] = int((now - last).total_seconds() // 60) if last else None
         r["first"] = hm(ts(r.get("first_at"))); r["last"] = hm(last)
@@ -1430,7 +1431,7 @@ async def api_automations_get(recheck: int = 0):
     return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
                        **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
-                         "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin},
+                         "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or ""},
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "23:30–09:00", "daily_cap": AUTO_DAILY_CAP}
 
 
@@ -1951,6 +1952,42 @@ def _rider_for_intercom(rid: str) -> dict:
 
 intercom = _intercom_router(require_login, DATA_DIR, PATH_SECRET, _rider_for_intercom)
 app.include_router(intercom)
+INTERCOM_USER: dict = {k[14:]: v for k, v in store.get_settings().items() if k.startswith("intercom_user:")}
+
+
+def _remember_intercom(rid: str, c: dict):
+    """The rider's Intercom username — what Intercom shows as the name: the part of the email before @."""
+    email = (c.get("email") or "").strip()
+    user = email.split("@")[0] if email else (c.get("name") or "")
+    if user and INTERCOM_USER.get(rid) != user:
+        INTERCOM_USER[rid] = user
+        store.set_settings({f"intercom_user:{rid}": user})
+
+
+intercom.ic.on_match = _remember_intercom
+
+
+@app.post("/api/intercom/match-riders", dependencies=[Depends(require_login)])
+async def api_intercom_match_riders():
+    """Settings: match every known rider with Intercom once (profile link → phone → name) and keep the usernames."""
+    riders = [{"rider_id": rid, "name": r.get("name") or "", "phone": r.get("phone") or ""} for rid, r in STATE["riders"].items()]
+    for r in store.riders():
+        if r["id"] not in STATE["riders"]:
+            riders.append({"rider_id": r["id"], "name": r.get("name") or "", "phone": r.get("phone") or ""})
+    out = {"matched": 0, "missing": [], "errors": 0, "total": len(riders)}
+    for x in riders:
+        try:
+            c = await intercom.ic.find_contact(x["rider_id"], x["name"], x["phone"])
+        except Exception:
+            out["errors"] += 1
+            continue
+        if c:
+            out["matched"] += 1
+            _remember_intercom(x["rider_id"], c)
+        else:
+            out["missing"].append(x["name"] or x["rider_id"])
+    store.log("info", f"Intercom matching: {out['matched']} of {out['total']} riders found, {len(out['missing'])} not found")
+    return out
 
 
 @app.get("/health")

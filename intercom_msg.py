@@ -59,6 +59,8 @@ class Intercom:
         self.threads: dict = self._load()
         self.status = {"checked": 0, "ok": False, "admin_name": "", "error": ""}
         self.hint_lookup = None          # rider id -> Intercom email / contact id typed in Settings
+        self._link_attr = None           # resolved lazily: the "Worker dashboard profile link" attribute
+        self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
 
     @property
     def enabled(self) -> bool:
@@ -140,7 +142,12 @@ class Intercom:
                                error="" if admin else "no teammate found to send as — set INTERCOM_ADMIN_ID")
         except HTTPException as e:
             self.status.update(ok=False, error=str(e.detail))
-        self.status.update(checked=time.time(), region=self.region, host=self.base, token_len=len(self.token), token_hint=self.token[:4] + "…" if self.token else "")
+        try:
+            await self.link_attribute()
+        except Exception:
+            pass
+        self.status.update(checked=time.time(), region=self.region, host=self.base, token_len=len(self.token), token_hint=self.token[:4] + "…" if self.token else "",
+                           link_attr=self._link_attr or "")
         return self.status
 
     async def _me_any_region(self) -> dict:
@@ -204,7 +211,12 @@ class Intercom:
         if not found:
             found = await self.find_contact(rider_id, name, phone)
         if found:
-            if found.get("external_id") != ext:
+            if self.on_match:
+                try:
+                    self.on_match(rider_id, found)
+                except Exception:
+                    pass
+            if not found.get("external_id"):            # never touch an id the rider app already uses for its messenger
                 try:
                     await self.call("PUT", f"/contacts/{found['id']}", {"external_id": ext})
                 except HTTPException:
@@ -223,15 +235,45 @@ class Intercom:
             t["contact_id"], t["conversation_id"] = "", ""
             self._save()
 
+    async def link_attribute(self) -> str:
+        """The contact attribute MotionTools fills with the driver's profile link ('Worker dashboard profile link',
+        https://<tenant>.motiontools.io/drivers/<MotionTools id>): found once in the workspace's data attributes."""
+        if self._link_attr is not None:
+            return self._link_attr
+        self._link_attr = ""
+        try:
+            res = await self.call("GET", "/data_attributes?model=contact&include_archived=false")
+            for a in res.get("data") or []:
+                nm = (a.get("name") or "").lower()
+                if "motiontools" in nm or ("worker" in nm and "link" in nm) or ("profile" in nm and "link" in nm and "dashboard" in nm):
+                    self._link_attr = a.get("full_name") or f"custom_attributes.{a.get('name')}"
+                    break
+        except HTTPException:
+            pass
+        return self._link_attr
+
     async def find_contact(self, rider_id: str, name: str, phone: str):
-        """Existing contact for a rider: external_id rider:<id>, any phone format, then the exact name (one match only)."""
+        """Existing contact for a rider: the MotionTools profile link attribute (…/drivers/<id>) — the contact the
+        rider app's messenger belongs to —, then external_id, any phone format, then the exact name (one match)."""
         ext = f"rider:{rider_id}"
-        cond = [{"field": "external_id", "operator": "=", "value": ext}]
+        attr = await self.link_attribute()
+        if attr and rider_id:
+            try:
+                res = await self.call("POST", "/contacts/search", {"query": {"field": attr, "operator": "~", "value": rider_id}})
+                rows = [c for c in (res.get("data") or []) if rider_id in str((c.get("custom_attributes") or {}).get(attr.split(".", 1)[-1], "") or "") or True]
+                if rows:
+                    rows.sort(key=lambda c: c.get("role") != "user")
+                    return rows[0]
+            except HTTPException:
+                pass
+        # the MotionTools rider app logs the rider into Intercom's messenger with MotionTools' own user id -> that contact
+        # (external_id = the bare id) is the one that receives in-app messages; try it first
+        cond = [{"field": "external_id", "operator": "=", "value": rider_id}, {"field": "external_id", "operator": "=", "value": ext}]
         for v in self.phone_variants(phone):
             cond.append({"field": "phone", "operator": "=", "value": v})
         res = await self.call("POST", "/contacts/search", {"query": {"operator": "OR", "value": cond}})
         rows = res.get("data") or []
-        rows.sort(key=lambda c: (c.get("external_id") != ext, c.get("role") != "user"))   # exact id first, then users before leads
+        rows.sort(key=lambda c: (c.get("external_id") not in (rider_id, ext), not c.get("external_id"), c.get("role") != "user"))
         if rows:
             return rows[0]
         nm = " ".join((name or "").split())
@@ -358,6 +400,29 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
     def threads():
         return {"threads": ic.summary()}
 
+    @r.post("/api/intercom/match-all", dependencies=login)
+    async def match_all(request: Request):
+        """Settings button: look every known rider up in Intercom once and remember the username (the part before @)."""
+        body = await request.json()
+        riders = body.get("riders") or []
+        out = {"matched": 0, "missing": [], "errors": 0}
+        for x in riders[:1000]:
+            rid = str(x.get("rider_id") or "")
+            if not rid:
+                continue
+            try:
+                c = await ic.find_contact(rid, x.get("name") or "", x.get("phone") or "")
+            except HTTPException:
+                out["errors"] += 1
+                continue
+            if c:
+                out["matched"] += 1
+                if ic.on_match:
+                    ic.on_match(rid, c)
+            else:
+                out["missing"].append(x.get("name") or rid)
+        return out
+
     @r.get("/api/intercom/match/{rider_id}", dependencies=login)
     async def match(rider_id: str):
         """Settings: which Intercom contact a rider's messages would go to (without sending anything)."""
@@ -375,9 +440,14 @@ def make_router(require_login, data_dir, path_secret: str, rider_lookup=lambda r
                 how = "phone / name"
         except HTTPException as e:
             return {"ok": False, "error": str(e.detail)}
+        if c and ic.on_match:
+            ic.on_match(rider_id, c)
         if not c:
-            return {"ok": True, "found": False, "phone": known.get("phone") or "", "message": "no existing contact matches this rider's phone or name — a message would create a new one; type the contact's email in Settings"}
-        return {"ok": True, "found": True, "how": how, "contact": {"id": c.get("id"), "name": c.get("name"), "email": c.get("email"), "phone": c.get("phone"), "role": c.get("role"), "external_id": c.get("external_id")}}
+            return {"ok": True, "found": False, "phone": known.get("phone") or "", "message": "no existing contact matches this rider's MotionTools link, phone or name — a message would create a new one; type the contact's email in Settings"}
+        link = str((c.get("custom_attributes") or {}).get((ic._link_attr or "").split(".", 1)[-1], "") or "")
+        if link and rider_id in link:
+            how = "MotionTools profile link"
+        return {"ok": True, "found": True, "how": how, "contact": {"id": c.get("id"), "name": c.get("name"), "email": c.get("email"), "phone": c.get("phone"), "role": c.get("role"), "external_id": c.get("external_id"), "link": link}}
 
     @r.delete("/api/intercom/thread/{rider_id}", dependencies=login)
     def thread_relink(rider_id: str):
