@@ -1398,6 +1398,26 @@ class Store:
         return {r["rule"]: {"today": r["n"], "sent": r["sent"]} for r in self._rows(
             "SELECT rule, COUNT(*) AS n, SUM(mode='sent') AS sent FROM auto_msgs WHERE day=? GROUP BY rule", (day_key(now),))}
 
+    def handbacks_today(self, now: datetime) -> list:
+        return self._rows("SELECT order_id, rider_id, waited, excused, at FROM handbacks WHERE day=?", (day_key(now),))
+
+    def restaurant_of(self, oid: str) -> str:
+        r = self._rows("SELECT restaurant FROM orders WHERE id=?", (oid,))
+        return (r[0]["restaurant"] or "") if r else ""
+
+    def on_time_streaks(self, now: datetime) -> dict:
+        """rider id -> current run of on-time deliveries today (ends at the last delivery)."""
+        out = {}
+        for r in self._rows("SELECT rider_id, on_time FROM orders WHERE day=? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != '' ORDER BY rider_id, delivered_at", (day_key(now),)):
+            if r["on_time"] is None:
+                continue
+            out[r["rider_id"]] = out.get(r["rider_id"], 0) + 1 if r["on_time"] else 0
+        return out
+
+    def ref_of(self, oid: str) -> str:
+        r = self._rows("SELECT ref FROM orders WHERE id=?", (oid,))
+        return (r[0]["ref"] or "") if r else ""
+
     def delivered_by_rider(self, day: str) -> dict:
         return {r["rider_id"]: {"n": r["n"], "last": r["last"], "name": r["rider"]} for r in self._rows(
             "SELECT rider_id, MAX(rider) AS rider, COUNT(*) AS n, MAX(delivered_at) AS last FROM orders WHERE day=? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != '' GROUP BY rider_id", (day,))}

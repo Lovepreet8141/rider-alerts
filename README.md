@@ -1,4 +1,4 @@
-# Quickzi — fleet ops platform, all cities (v6.3)
+# Quickzi — fleet ops platform, all cities (v6.4)
 
 A 24/7 control room for Quickzi's delivery operation in every city — one server, one webhook stream, one database. Everything is written to SQLite on the Railway
 volume, so nothing depends on anyone watching: while you sleep it keeps recording, and a few minutes after midnight
@@ -22,6 +22,22 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   answers in ~10 ms, the network overview in ~2 ms (cached 10 s), alert evaluation of 1 000 orders in ~30 ms.
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
+
+## 6.4 — more rider automation, answers to rider replies, month filter
+- **Rules added**: at the restaurant by GPS but not marked arrived · left the customer without marking delivered ·
+  no GPS for 10′ on an order · order waiting near a free rider (≤ 1.5 km, nearest two) · riding to a restaurant where
+  others already wait 15′+ · 10 on-time deliveries in a row · thanks after a hand-back the kitchen caused · end of day
+  (60′ after the last delivery, from 20:00) · handed back without going to the restaurant · took over an order that is
+  already late · double order in the wrong sequence · waiting 15′ at the restaurant · 10′ at the customer.
+  "Behind the planned time" is skipped when the kitchen was slow or the rider reported the restaurant late.
+- **Replies from riders** (needs the Intercom webhook): "customer not answering / number?" → the dashboard answers in
+  the same conversation with the customer's phone and address (fetched from MotionTools once if unknown);
+  "restaurant late / not ready" → the wait is counted as the kitchen's and the rider gets a thank-you. Both are rules
+  with their own switch and text.
+- **Automation inbox**: Settings → Intercom automation texts → "Inbox for automatic messages" = an Intercom team name;
+  rule messages then go into one conversation per rider and day in that team inbox, closed, re-opened by a reply.
+  Manual messages stay in the rider's normal chat.
+- **Orders tab**: Month period. All default texts are German + English.
 
 ## 6.3 — the designed screens, on real data
 **One new file this time: `intercom_msg.py`** (GitHub → *Add file → Upload files*). The other 11 are replaced as usual.
@@ -93,6 +109,7 @@ buttons report "Intercom not configured" and the rules run in **dry-run**.
 | Accepted, not started | accepted ≥ start limit (3′) ago, no tour started | once per order |
 | Idle while orders wait | no live order, last delivery ≥ 45′ ago, shift not over, an order in the city waited ≥ 3′ for a rider | once per 45′ |
 | Morning scorecard | 10:00–12:00, every rider who delivered yesterday | once a day |
+| Alert → message | any open board alert of that kind on an order with a rider: not moving, behind ETA to the restaurant, waiting at the restaurant, wrong direction, at the customer without handover, PTOD at risk (thresholds = Settings → Alert thresholds); nothing when the dispatcher marked it handled | once per order and kind |
 
 Guardrails: quiet hours 23:30–09:00 (only the two live-order rules may send), max 3 messages per rider per day
 (scorecard excluded), nothing while MotionTools is silent, every message logged on the order story and the Riders page.

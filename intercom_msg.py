@@ -61,6 +61,9 @@ class Intercom:
         self.hint_lookup = None          # rider id -> Intercom email / contact id typed in Settings
         self._link_attr = None           # resolved lazily: the "Worker dashboard profile link" attribute
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
+        self.on_incoming = None          # (rider_id, text, conversation_id) -> the app answers common questions
+        self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
+        self._auto_team = None           # resolved team id
 
     @property
     def enabled(self) -> bool:
@@ -146,8 +149,13 @@ class Intercom:
             await self.link_attribute()
         except Exception:
             pass
+        team = ""
+        try:
+            team = await self.auto_team()
+        except Exception:
+            pass
         self.status.update(checked=time.time(), region=self.region, host=self.base, token_len=len(self.token), token_hint=self.token[:4] + "…" if self.token else "",
-                           link_attr=self._link_attr or "")
+                           link_attr=self._link_attr or "", auto_team=team, auto_team_name=self.auto_team_name)
         return self.status
 
     async def _me_any_region(self) -> dict:
@@ -308,7 +316,28 @@ class Intercom:
         convs.sort(key=lambda c: (c.get("state") != "open", -(c.get("updated_at") or 0)))
         return str(convs[0].get("id") or "")
 
-    async def send(self, rider_id: str, name: str, phone: str, text: str, order_ref: str = "") -> dict:
+    async def auto_team(self) -> str:
+        """Team inbox for the automatic messages: found by name once (GET /teams); empty = not used."""
+        name = (self.auto_team_name or "").strip().lower()
+        if not name:
+            self._auto_team = None
+            return ""
+        if self._auto_team and self._auto_team[0] == name:
+            return self._auto_team[1]
+        try:
+            teams = (await self.call("GET", "/teams")).get("teams") or []
+        except HTTPException:
+            return ""
+        tid = next((str(t["id"]) for t in teams if (t.get("name") or "").strip().lower() == name), "")
+        self._auto_team = (name, tid)
+        return tid
+
+    async def send(self, rider_id: str, name: str, phone: str, text: str, order_ref: str = "", auto: bool = False) -> dict:
+        """auto=True (rules): the message goes into the rider's *automation* conversation — one per rider and day,
+        assigned to the automation team inbox and closed right away, so it stays out of the main inbox until the
+        rider answers (his answer re-opens it in that inbox). Manual messages use the rider's normal chat."""
+        if auto and (self.auto_team_name or "").strip():
+            return await self._send_auto(rider_id, name, phone, text, order_ref)
         t = self.thread(rider_id, name, phone)
         hint = self.hint_lookup(rider_id) if self.hint_lookup else ""
         if hint != (t.get("hint") or ""):
@@ -344,6 +373,47 @@ class Intercom:
         self._save()
         return msg
 
+    async def _send_auto(self, rider_id: str, name: str, phone: str, text: str, order_ref: str) -> dict:
+        t = self.thread(rider_id, name, phone)
+        hint = self.hint_lookup(rider_id) if self.hint_lookup else ""
+        msg = {"id": f"ops-{time.time_ns()}", "from": "ops", "body": text, "at": int(time.time()), "status": "sending", "order_ref": order_ref, "auto": True}
+        self._push(t, msg)
+        today = time.strftime("%Y-%m-%d")
+        try:
+            if not t.get("contact_id") or t.get("contact_src") not in ("link", "hint"):
+                cid, src = await self.contact_for(rider_id, name, phone, hint)
+                if cid != t.get("contact_id"):
+                    t["conversation_id"] = ""
+                t["contact_id"], t["contact_src"] = cid, src
+            if not await self.resolve_admin():
+                raise HTTPException(503, "no teammate to send as — set INTERCOM_ADMIN_ID in Railway")
+            team = await self.auto_team()
+            conv = t.get("auto_conversation_id") if t.get("auto_day") == today else ""
+            if conv:
+                await self.call("POST", f"/conversations/{conv}/reply", {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
+            else:
+                r = await self.call("POST", "/messages", {"message_type": "inapp", "body": _html(text), "from": {"type": "admin", "id": self.admin},
+                                                         "to": {"type": "user", "id": t["contact_id"]}, "create_conversation_without_contact_reply": True})
+                conv = str(r.get("conversation_id") or "")
+                t["auto_conversation_id"], t["auto_day"] = conv, today
+                if conv and team:
+                    try:
+                        await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team})
+                    except HTTPException as e:
+                        msg["note"] = f"could not assign to the automation inbox: {e.detail}"[:160]
+            if conv:
+                try:
+                    await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "close", "type": "admin", "admin_id": self.admin})
+                except HTTPException:
+                    pass
+            msg["status"] = "sent"
+        except HTTPException as e:
+            msg["status"], msg["error"] = "failed", str(e.detail)
+        except Exception as e:
+            msg["status"], msg["error"] = "failed", str(e)[:200]
+        self._save()
+        return msg
+
     def incoming(self, payload: dict) -> bool:
         """Intercom webhook: a rider replied (or started a conversation)."""
         topic = payload.get("topic") or ""
@@ -361,7 +431,7 @@ class Intercom:
         else:
             src = item.get("source") or {}
             body, author, at = src.get("body"), src.get("author") or {}, item.get("created_at")
-        t = next((x for x in self.threads.values() if conv_id and x.get("conversation_id") == conv_id), None) \
+        t = next((x for x in self.threads.values() if conv_id and conv_id in (x.get("conversation_id"), x.get("auto_conversation_id"))), None) \
             or next((x for x in self.threads.values() if cid and x.get("contact_id") == cid), None)
         if t is None:
             rid = ext[6:] if ext.startswith("rider:") else f"contact:{cid}"
@@ -372,7 +442,48 @@ class Intercom:
         self._push(t, {"id": f"in-{time.time_ns()}", "from": "rider", "body": _text(body or ""), "at": int(at or time.time()), "status": "received"})
         t["unread"] = int(t.get("unread") or 0) + 1
         self._save()
+        if self.on_incoming and not str(t["rider_id"]).startswith("contact:"):
+            try:
+                self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"))
+            except Exception:
+                pass
         return True
+
+    async def escalate(self, conversation_id: str, note: str, team_id: str = "") -> bool:
+        """A rider's reply needs a human: hand the conversation to the main inbox (a team if given, otherwise the
+        sending teammate's own inbox), re-open it and leave an internal note so the dispatcher sees why."""
+        if not conversation_id or not self.enabled:
+            return False
+        try:
+            if not await self.resolve_admin():
+                return False
+            if team_id:
+                await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team_id})
+            else:
+                await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": self.admin})
+            await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "open", "type": "admin", "admin_id": self.admin})
+            if note:
+                await self.call("POST", f"/conversations/{conversation_id}/reply", {"message_type": "note", "type": "admin", "admin_id": self.admin, "body": _html(note)})
+            return True
+        except HTTPException:
+            return False
+
+    async def reply_in(self, conversation_id: str, rider_id: str, name: str, text: str) -> dict:
+        """Answer inside the conversation the rider just wrote in."""
+        t = self.thread(rider_id, name)
+        msg = {"id": f"ops-{time.time_ns()}", "from": "ops", "body": text, "at": int(time.time()), "status": "sending", "auto": True}
+        self._push(t, msg)
+        try:
+            if not await self.resolve_admin():
+                raise HTTPException(503, "no teammate to send as")
+            await self.call("POST", f"/conversations/{conversation_id}/reply", {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
+            msg["status"] = "sent"
+        except HTTPException as e:
+            msg["status"], msg["error"] = "failed", str(e.detail)
+        except Exception as e:
+            msg["status"], msg["error"] = "failed", str(e)[:200]
+        self._save()
+        return msg
 
     def summary(self) -> list:
         out = []
