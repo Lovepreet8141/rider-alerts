@@ -1466,6 +1466,57 @@ async def api_automations_get(recheck: int = 0):
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "23:30–09:00", "daily_cap": AUTO_DAILY_CAP}
 
 
+@app.get("/api/automations/diag", dependencies=[Depends(require_login)])
+def api_automations_diag():
+    """'Why was nothing sent?' — the facts every rule needs, per live order, plus plain-language findings."""
+    now = datetime.now(UTC)
+    settings = store.get_settings()
+    on = {k: settings.get(f"auto:{k}") == "1" for k, _, _ in AUTOMATIONS}
+    riders = STATE["riders"]
+    rows, findings = [], []
+    live = [o for o in STATE["orders"].values() if o["phase"] not in ("on_hold", "unassigned", "delivered", "cancelled", "closed") and o.get("rider_id")]
+    feed = {rid: tracker.has_feed(rid, now) for rid in {o["rider_id"] for o in live}}
+    for o in live:
+        rid = o["rider_id"]
+        fix = tracker.last_fix(rid)
+        gps_age = round((now - fix[0]).total_seconds() / 60) if fix else None
+        alerts = [k for (oid, k) in STATE["sev"] if oid == o["id"]]
+        rows.append({"ref": o.get("ref"), "rider": o.get("rider") or riders.get(rid, {}).get("name"), "phase": o.get("phase_label") or o["phase"],
+                     "accepted_min": round((now - o["accepted_at"]).total_seconds() / 60) if o.get("accepted_at") else None,
+                     "started": bool(o.get("started_at")), "gps_age": gps_age, "gps_feed": feed.get(rid, False),
+                     "still_min": tracker.stationary_minutes(rid, now, rules.stationary_radius_m) if feed.get(rid) else None,
+                     "alerts": alerts, "intercom": INTERCOM_USER.get(rid) or ("link" if settings.get(f"intercom:{rid}") else ""),
+                     "msgs_today": store.auto_today(now).get(rid, 0)})
+    n_r = len(feed)
+    with_feed = sum(1 for v in feed.values() if v)
+    tick = STATE.get("auto_last_tick")
+    tick_age = round((now - datetime.fromisoformat(tick)).total_seconds()) if tick else None
+    if tick_age is None or tick_age > 180:
+        findings.append(("red", "The rule loop has not run" + (f" for {tick_age // 60} min" if tick_age else " yet (starts 90 s after deploy)") + "."))
+    else:
+        findings.append(("ok", f"Rule loop ran {tick_age} s ago."))
+    if STATE["sync"].get("webhook_silent"):
+        findings.append(("red", "MotionTools webhook is silent — rules never message on stale data. Check the webhook in MotionTools."))
+    if n_r and with_feed == 0:
+        findings.append(("red", f"No GPS feed: 0 of {n_r} riders on the road send positions. 'Not moving', 'no GPS' and 'wrong direction' can never fire. In MotionTools → Webhooks tick booking.driver_location_updated and tour.driver_location_updated."))
+    elif n_r and with_feed < n_r:
+        findings.append(("amber", f"GPS feed for {with_feed} of {n_r} riders on the road — the others get no movement rules."))
+    unmatched = sorted({r["rider"] for r in rows if not r["intercom"] and r["rider"]})
+    if unmatched:
+        findings.append(("red", f"{len(unmatched)} rider(s) on the road are not matched with Intercom — their messages fail: {', '.join(unmatched[:6])}. Settings → Riders → Match all."))
+    if not intercom.ic.enabled:
+        findings.append(("red", "Intercom not connected — everything is dry-run."))
+    if not any(on.values()):
+        findings.append(("amber", "No rule is switched on."))
+    if not live:
+        findings.append(("amber", "No live order with a rider right now — nothing to evaluate."))
+    if o_acc := [r for r in rows if r["accepted_min"] is not None and not r["started"] and r["accepted_min"] >= rules.start_limit_min]:
+        findings.append(("amber", f"{len(o_acc)} order(s) accepted ≥ {rules.start_limit_min} min and not started — 'Accepted, not started' should fire on the next loop unless already sent/capped."))
+    elif rows and all(r["started"] for r in rows):
+        findings.append(("ok", "Every live order already has a 'started' event — 'Accepted, not started' has nothing to catch (MotionTools starts most tours together with the accept)."))
+    return {"findings": findings, "orders": rows, "loop_age_s": tick_age, "webhook_silent": STATE["sync"].get("webhook_silent"), "last_webhook": STATE["sync"].get("last_webhook")}
+
+
 @app.post("/api/automations", dependencies=[Depends(require_login)])
 async def api_automations_set(request: Request):
     body = await request.json() or {}
@@ -1773,6 +1824,7 @@ async def automation_loop():
     while True:
         try:
             now = datetime.now(UTC)
+            STATE["auto_last_tick"] = iso(now)
             todo = await asyncio.get_event_loop().run_in_executor(None, automation_tick, now)
             for aid, rid, name, text, ref in todo:
                 r = STATE["riders"].get(rid, {})
