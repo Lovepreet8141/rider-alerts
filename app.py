@@ -151,7 +151,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.4.2"
+VERSION = "6.4.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1466,7 +1466,7 @@ async def api_automations_get(recheck: int = 0):
     return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
                        **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
-                         "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name},
+                         "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name, "auto_close": intercom.ic.auto_close},
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "", "daily_cap": 0}
 
 
@@ -1541,6 +1541,9 @@ async def api_automations_set(request: Request):
     for k, v in (body.get("text") or {}).items():
         if k in keys and isinstance(v, str):
             vals[f"auto_text:{k}"] = v.strip()[:500]
+    if "close" in body:
+        vals["intercom_auto_close"] = "1" if body.get("close") else ""
+        intercom.ic.auto_close = bool(body.get("close"))
     if isinstance(body.get("inbox"), str):
         vals["intercom_auto_team"] = body["inbox"].strip()[:80]
         intercom.ic.auto_team_name = vals["intercom_auto_team"]
@@ -2228,6 +2231,7 @@ def _remember_intercom(rid: str, c: dict):
 intercom.ic.on_match = _remember_intercom
 intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto))
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
+intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
 
 
 @app.post("/api/intercom/match-riders", dependencies=[Depends(require_login)])

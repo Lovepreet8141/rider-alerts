@@ -63,6 +63,7 @@ class Intercom:
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
         self.on_incoming = None          # (rider_id, text, conversation_id) -> the app answers common questions
         self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
+        self.auto_close = False          # close automatic conversations after sending (Settings; off = stay open until a rider replies)
         self._auto_team = None           # resolved team id
 
     @property
@@ -155,7 +156,7 @@ class Intercom:
         except Exception:
             pass
         self.status.update(checked=time.time(), region=self.region, host=self.base, token_len=len(self.token), token_hint=self.token[:4] + "…" if self.token else "",
-                           link_attr=self._link_attr or "", auto_team=team, auto_team_name=self.auto_team_name)
+                           link_attr=self._link_attr or "", auto_team=team, auto_team_name=self.auto_team_name, auto_close=self.auto_close)
         return self.status
 
     async def _me_any_region(self) -> dict:
@@ -374,8 +375,18 @@ class Intercom:
         return msg
 
     async def close(self, conv: str) -> bool:
-        """Close a conversation (an automatic message needs no human; a rider reply re-opens it automatically)."""
+        """Close a conversation after an automatic message (only when switched on in Settings) — and never over
+        a rider's unanswered message: if the last thing in the conversation came from the rider, it stays open."""
+        if not self.auto_close:
+            return False
         try:
+            c = await self.call("GET", f"/conversations/{conv}")
+            parts = ((c.get("conversation_parts") or {}).get("conversation_parts")) or []
+            said = [p for p in parts if p.get("part_type") in ("comment", "open", "assignment", "close", "note")]
+            last = next((p for p in reversed(said) if p.get("part_type") == "comment"), None)
+            author = ((last or {}).get("author") or {}).get("type") or ((c.get("source") or {}).get("author") or {}).get("type")
+            if author in ("user", "lead", "contact"):
+                return False                                   # the rider is waiting for an answer — leave it open
             await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "close", "type": "admin", "admin_id": self.admin})
             return True
         except Exception:
