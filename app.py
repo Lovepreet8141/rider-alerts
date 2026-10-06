@@ -31,7 +31,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from events import DISPATCHED, Projector
 from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
-from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
+from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, leg_stillness, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
 import store as store_mod
 from store import Store, day_key, day_start
 
@@ -151,7 +151,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.4"
+VERSION = "6.4.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1365,7 +1365,7 @@ def rider_status_now(r: dict, live: int, now: datetime, is_today: bool) -> tuple
 AUTOMATIONS = [
     # order rules (from the live events — no shift sheet needed)
     ("not_started", "Accepted, not started 3′", "{ref} ist angenommen, aber die Tour läuft noch nicht – bitte jetzt starten. / {ref} is accepted but not started – please start now."),
-    ("alert:stationary", "Not moving while on an order", "{ref}: seit {min} Min. keine Bewegung – alles ok? Bitte weiter zum {next}. / No movement for {min} min – all good? Please continue to the {next}."),
+    ("alert:stationary", "Not moving after pickup (on the way to the customer)", "{ref}: seit {min} Min. keine Bewegung – alles ok? Bitte weiter zum {next_de}. / No movement for {min} min – all good? Please continue to the {next}."),
     ("alert:late_restaurant", "Behind the ETA to the restaurant", "{ref}: du liegst hinter der Zeit – bitte direkt zu {restaurant}. / You are behind schedule – please head straight to {restaurant}."),
     ("handback_quick", "Handed back without going to the restaurant", "{name}, du hast {ref} zurückgegeben, ohne beim Restaurant zu sein. Bitte nur annehmen, was du auch lieferst. / You handed back {ref} without going to the restaurant – please only accept what you will deliver."),
     ("redispatch_late", "Took over an order that is already late", "{ref} ist schon {min} Min. alt – bitte zuerst zu {restaurant} und diese Bestellung direkt ausliefern. Danke! / {ref} is already {min} min old – please go to {restaurant} first and deliver this one straight away."),
@@ -1373,7 +1373,7 @@ AUTOMATIONS = [
     ("alert:wait_restaurant", "Waiting at the restaurant (threshold)", "Wartest du noch bei {restaurant} auf {ref}? Frag bitte nach einer Zeit. / Still waiting at {restaurant} for {ref}? Please ask the staff for a time."),
     ("wait_restaurant_15", "Waiting at the restaurant 15′", "{ref}: über 15 Min. Wartezeit – wenn es länger als 10 Min. dauert, schreib uns, dann entscheiden wir. / Over 15 min waiting – if it takes more than 10 more min, tell us and we decide."),
     ("late_plan", "Behind the planned delivery time (not when the kitchen was late)", "{ref}: der Kunde erwartet die Lieferung bis {plan}, ETA ist {eta} – bitte direkt fahren. / Customer expects {ref} by {plan}, ETA is {eta} – please go direct."),
-    ("alert:off_route", "Moving away from the next stop", "{ref}: du entfernst dich vom {next} – bitte Adresse in der App prüfen. / You are moving away from the {next} – please check the address in the app."),
+    ("alert:off_route", "Moving away from the customer after pickup", "{ref}: du entfernst dich vom {next_de} – bitte Adresse in der App prüfen. / You are moving away from the {next} – please check the address in the app."),
     ("alert:ptod", "PTOD at risk / breached", "{ref} muss innerhalb von {target} Min. geliefert sein – bitte ohne Umweg zum Kunden. / {ref} must be delivered within {target} min – no detours please."),
     ("alert:wait_customer", "At the customer, no handover (threshold)", "{ref}: Übergabe dauert – bitte den Kunden anrufen (Nummer in der App). / Handover is taking long – please call the customer (number in the app)."),
     ("wait_customer_10", "At the customer 10′", "{ref}: Kunde nicht erreichbar? Einmal anrufen, dann uns schreiben – nicht länger warten. / Customer not reachable? Call once, then message us – don't wait longer."),
@@ -1382,7 +1382,7 @@ AUTOMATIONS = [
     # app-data hygiene (GPS vs what the rider pressed in the app)
     ("gps_arrived", "At the restaurant by GPS, not marked arrived", "{ref}: du bist laut GPS bei {restaurant} – bitte 'Angekommen' in der App drücken. / You are at {restaurant} by GPS – please mark arrived in the app."),
     ("gps_left", "Left the customer without marking delivered", "{ref}: bitte als geliefert markieren, die Bestellung ist noch offen. / Please mark {ref} as delivered – it is still open in the app."),
-    ("no_gps", "No GPS position for 10′ while on an order", "{ref}: wir sehen keinen Standort von dir – bitte GPS/Standort in der App prüfen. / We see no position from you – please check GPS/location in the app."),
+    ("no_gps", "No GPS position for 10′ after pickup", "{ref}: wir sehen keinen Standort von dir – bitte GPS/Standort in der App prüfen. / We see no position from you – please check GPS/location in the app."),
     # taking orders
     ("nearby_offer", "Order waiting near a free rider (≤ 1.5 km)", "Bei {restaurant} wartet eine Bestellung, {km} km von dir – nimmst du sie? / An order is waiting at {restaurant}, {km} km from you – can you take it?"),
     ("slow_restaurant", "Riding to a restaurant where others wait 15′+", "Bei {restaurant} gibt es gerade Wartezeit – bitte trotzdem hinfahren, wir beobachten es. / {restaurant} is slow right now – please still go, we are watching it."),
@@ -1398,6 +1398,10 @@ AUTOMATIONS = [
     ("no_start", "Shift sheet: no order 30′ after shift start", "Hallo {name}, deine Schicht hat um {start} begonnen – bist du unterwegs? / Hi {name}, your shift started at {start} – are you on the road?"),
 ]
 ALERT_NEXT = {"to_restaurant": "restaurant", "at_restaurant": "restaurant", "to_customer": "customer", "at_customer": "customer", "accepted": "restaurant"}
+ALERT_NEXT_DE = {"restaurant": "Restaurant", "customer": "Kunden"}
+# movement rules message the rider only once the food is on board — before the pickup a rider may be parking,
+# looking for the entrance or waiting outside; the board still shows those alerts for the dispatcher
+AFTER_PICKUP_ONLY = {"alert:stationary", "alert:off_route", "no_gps"}
 PAGE_CACHE: dict = {}
 
 
@@ -1484,7 +1488,7 @@ def api_automations_diag():
         rows.append({"ref": o.get("ref"), "rider": o.get("rider") or riders.get(rid, {}).get("name"), "phase": o.get("phase_label") or o["phase"],
                      "accepted_min": round((now - o["accepted_at"]).total_seconds() / 60) if o.get("accepted_at") else None,
                      "started": bool(o.get("started_at")), "gps_age": gps_age, "gps_feed": feed.get(rid, False),
-                     "still_min": tracker.stationary_minutes(rid, now, rules.stationary_radius_m) if feed.get(rid) else None,
+                     "still_min": leg_stillness(o, tracker, now, rules)[0] if feed.get(rid) else None,
                      "alerts": alerts, "intercom": INTERCOM_USER.get(rid) or ("link" if settings.get(f"intercom:{rid}") else ""),
                      "msgs_today": store.auto_today(now).get(rid, 0)})
     n_r = len(feed)
@@ -1514,7 +1518,16 @@ def api_automations_diag():
         findings.append(("amber", f"{len(o_acc)} order(s) accepted ≥ {rules.start_limit_min} min and not started — 'Accepted, not started' should fire on the next loop unless already sent/capped."))
     elif rows and all(r["started"] for r in rows):
         findings.append(("ok", "Every live order already has a 'started' event — 'Accepted, not started' has nothing to catch (MotionTools starts most tours together with the accept)."))
-    return {"findings": findings, "orders": rows, "loop_age_s": tick_age, "webhook_silent": STATE["sync"].get("webhook_silent"), "last_webhook": STATE["sync"].get("last_webhook")}
+    if STATE.get("auto_last_error"):
+        findings.insert(0, ("red", f"The rule loop crashes every minute — nothing can be sent: {STATE['auto_last_error']}"))
+    trace = []
+    try:
+        automation_tick(now, trace=trace)
+    except Exception as e:
+        findings.insert(0, ("red", f"Rule evaluation crashes: {type(e).__name__}: {e}"[:300]))
+    if not trace and live:
+        findings.append(("amber", "No rule condition is met on any live order right now."))
+    return {"findings": findings, "orders": rows, "trace": trace, "loop_age_s": tick_age, "webhook_silent": STATE["sync"].get("webhook_silent"), "last_webhook": STATE["sync"].get("last_webhook")}
 
 
 @app.post("/api/automations", dependencies=[Depends(require_login)])
@@ -1568,8 +1581,9 @@ class SafeDict(dict):
 AUTO_DAILY_CAP = 3
 
 
-def automation_tick(now: datetime) -> list:
-    """Evaluate the five rider rules once. Returns the messages to send (already logged as dry-run or pending)."""
+def automation_tick(now: datetime, trace: list = None) -> list:
+    """Evaluate the rider rules once. Returns the messages to send (already logged as dry-run or pending).
+    With trace=[] nothing is logged or sent: every decision is appended to the list instead (the diagnostics button)."""
     settings = store.get_settings()
     on = {k: settings.get(f"auto:{k}") == "1" for k, _, _ in AUTOMATIONS}
     text_of = {k: (settings.get(f"auto_text:{k}") or m) for k, _, m in AUTOMATIONS}
@@ -1585,11 +1599,21 @@ def automation_tick(now: datetime) -> list:
     out = []
 
     def fire(rule: str, rid: str, name: str, oid: str, ref: str, **vals):
+        why = ""
         if (rule, rid, oid) in sent_keys:
+            why = "already sent for this order in the last 26 h"
+        elif rule != "scorecard" and cap.get(rid, 0) >= AUTO_DAILY_CAP:
+            why = f"rider already got {AUTO_DAILY_CAP} messages today"
+        elif quiet and rule not in ("late_plan", "not_started"):
+            why = "quiet hours"
+        elif not on.get(rule):
+            why = "rule switched off"
+        elif not live_mode:
+            why = "Intercom not connected"
+        if trace is not None:
+            trace.append({"rule": rule, "rider": name, "ref": ref, "result": why or "WOULD SEND NOW"})
             return
-        if rule != "scorecard" and cap.get(rid, 0) >= AUTO_DAILY_CAP:
-            return
-        if quiet and rule not in ("late_plan", "not_started"):
+        if why and why not in ("rule switched off", "Intercom not connected"):
             return
         text = text_of[rule].format_map(SafeDict(name=name, ref=ref, **vals))
         mode = "pending" if (live_mode and on.get(rule)) else ("dry" if not on.get(rule) else "dry-nointercom")
@@ -1644,9 +1668,11 @@ def automation_tick(now: datetime) -> list:
         hidden = STATE["hidden"].get(STATE["open_alerts"].get((oid, kind)))
         if hidden is True:
             continue                                            # the dispatcher marked it handled — no message
-        still = tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m) if kind == "stationary" else None
+        if rule in AFTER_PICKUP_ONLY and not o.get("picked_up_at"):
+            continue                                            # before the pickup: alert on the board only
+        still = leg_stillness(o, tracker, now, rules)[0] if kind == "stationary" else None
         fire(rule, o["rider_id"], o.get("rider") or riders.get(o["rider_id"], {}).get("name") or "Rider", oid, o.get("ref") or "",
-             restaurant=o.get("restaurant") or "the restaurant", next=ALERT_NEXT.get(o["phase"], "next stop"), min=int(still) if still else "a few",
+             restaurant=o.get("restaurant") or "the restaurant", next=ALERT_NEXT.get(o["phase"], "next stop"), next_de=ALERT_NEXT_DE.get(ALERT_NEXT.get(o["phase"], ""), "nächsten Stopp"), min=int(still) if still else "a few",
              target=rules.ptod_target_min, plan=hm(planned_at(o)) or "", eta=hm(o.get("eta_customer")) or "")
     # GPS hygiene · nearby offers · slow restaurants
     from orders import haversine_m
@@ -1665,7 +1691,7 @@ def automation_tick(now: datetime) -> list:
         if o["phase"] == "at_customer" and fix and age_fix < 5 and o.get("drop_lat") is not None and o.get("at_customer_at") and (now - o["at_customer_at"]).total_seconds() >= 5 * 60 \
                 and haversine_m(fix[1], fix[2], o["drop_lat"], o["drop_lng"]) > 300:
             fire("gps_left", rid, name, o["id"], ref)
-        if o.get("accepted_at") and (now - o["accepted_at"]).total_seconds() >= 10 * 60 and (fix is None or age_fix >= 10):
+        if o.get("picked_up_at") and (now - o["picked_up_at"]).total_seconds() >= 10 * 60 and (fix is None or age_fix >= 10):
             fire("no_gps", rid, name, o["id"], ref)
         if o["phase"] in ("accepted", "to_restaurant") and (o.get("place_id") or o.get("restaurant")) in slow_rests:
             fire("slow_restaurant", rid, name, o["id"], ref, restaurant=o.get("restaurant") or "the restaurant")
@@ -1803,7 +1829,7 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
         mode = "pending" if (intercom.ic.enabled and settings.get("auto:reply:customer") == "1") else "dry"
         aid = store.auto_log(now, "reply:customer", rid, name, o["id"], o.get("ref") or "", txt, mode)
         if mode == "pending":
-            m = await intercom.ic.reply_in(conversation_id, rid, name, txt)
+            m = await intercom.ic.reply_in(conversation_id, rid, name, txt, close=in_auto)
             store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
     elif reports_rest:
         if not o:
@@ -1815,7 +1841,7 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
         mode = "pending" if (intercom.ic.enabled and settings.get("auto:reply:restaurant") == "1") else "dry"
         aid = store.auto_log(now, "reply:restaurant", rid, name, o["id"], o.get("ref") or "", txt, mode)
         if mode == "pending":
-            m = await intercom.ic.reply_in(conversation_id, rid, name, txt)
+            m = await intercom.ic.reply_in(conversation_id, rid, name, txt, close=in_auto)
             store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
 
 
@@ -1830,8 +1856,10 @@ async def automation_loop():
                 r = STATE["riders"].get(rid, {})
                 m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref, auto=True)
                 store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", "") or m.get("note", ""))
+            STATE["auto_last_error"] = ""
         except Exception as e:
             log.exception("automation failed: %s", e)
+            STATE["auto_last_error"] = f"{type(e).__name__}: {e}"[:300]
         await asyncio.sleep(60)
 
 

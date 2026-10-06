@@ -74,6 +74,27 @@ def iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.astimezone(UTC).isoformat(timespec="seconds") if dt else None
 
 
+def leg_start(o: dict):
+    """When the current riding leg began: pickup departure for the way to the customer, tour start before that."""
+    if o.get("phase") == "to_customer":
+        return o.get("picked_up_at") or o.get("at_restaurant_at") or o.get("started_at") or o.get("accepted_at") or o.get("dispatched_at")
+    return o.get("started_at") or o.get("accepted_at") or o.get("dispatched_at")
+
+
+def leg_stillness(o: dict, tracker, now: datetime, rules) -> tuple:
+    """(minutes standing still, minutes since the last fix) — both counted only from the start of the current leg,
+    so the minutes a rider spent waiting inside the restaurant never count as 'not moving to the customer'."""
+    still = tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m)
+    fix = tracker.last_fix(o["rider_id"])
+    age = (now - fix[0]).total_seconds() / 60 if fix else None
+    start = leg_start(o)
+    if start:
+        leg = max(0.0, (now - start).total_seconds() / 60)
+        still = None if still is None else min(still, leg)
+        age = None if age is None else min(age, leg)
+    return still, age
+
+
 def mins(a: Optional[datetime], b: Optional[datetime]) -> Optional[float]:
     if a is None or b is None:
         return None
@@ -415,10 +436,8 @@ def evaluate(o: dict, now: datetime, rules: Rules, tracker: Optional[RiderTracke
                         "headline": f"Late to {target} — {late} min behind ETA",
                         "action": "Call the rider, check where they are"})
         if tracker and o["rider_id"] and tracker.has_feed(o["rider_id"], now):
-            still = tracker.stationary_minutes(o["rider_id"], now, rules.stationary_radius_m)
-            fix = tracker.last_fix(o["rider_id"])
-            age = (now - fix[0]).total_seconds() / 60 if fix else None
-            if still is not None and still >= rules.stationary_min and (mins(o["started_at"] or o["accepted_at"] or o["dispatched_at"], now) or 0) >= rules.stationary_min:
+            still, age = leg_stillness(o, tracker, now, rules)
+            if still is not None and still >= rules.stationary_min:
                 if age is not None and age >= rules.stale_gps_min:
                     out.append({"kind": "stationary", "severity": "amber" if age < rules.stale_gps_min * 3 else "red",
                                 "headline": f"No GPS update for {int(age)} min while riding to the {target} (app closed / phone off?)",

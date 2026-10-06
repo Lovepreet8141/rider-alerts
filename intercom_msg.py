@@ -373,6 +373,14 @@ class Intercom:
         self._save()
         return msg
 
+    async def close(self, conv: str) -> bool:
+        """Close a conversation (an automatic message needs no human; a rider reply re-opens it automatically)."""
+        try:
+            await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "close", "type": "admin", "admin_id": self.admin})
+            return True
+        except Exception:
+            return False
+
     async def assignees(self, conv: str) -> dict:
         c = await self.call("GET", f"/conversations/{conv}")
         return {"admin": str(c.get("admin_assignee_id") or ""), "team": str(c.get("team_assignee_id") or ""), "state": c.get("state") or ""}
@@ -392,8 +400,6 @@ class Intercom:
                     await part("admin", "0"); st = await self.assignees(conv)
                 if st["team"] == str(team) and not st["admin"]:
                     break
-            if st["state"] == "closed":
-                await self.call("POST", f"/conversations/{conv}/parts", {"message_type": "open", "admin_id": self.admin})
             if st["team"] == str(team) and not st["admin"]:
                 return "automation inbox only"
             if st["team"] == str(team):
@@ -424,6 +430,7 @@ class Intercom:
                 await self.call("POST", f"/conversations/{conv}/reply", {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
                 if team:   # a reply re-assigns the conversation to the replying teammate — push it back to the team every time
                     msg["routing"] = await self.route_to_team(conv, team)
+                await self.close(conv)
             else:
                 r = await self.call("POST", "/messages", {"message_type": "inapp", "body": _html(text), "from": {"type": "admin", "id": self.admin},
                                                          "to": {"type": "user", "id": t["contact_id"]}, "create_conversation_without_contact_reply": True})
@@ -431,6 +438,8 @@ class Intercom:
                 t["auto_conversation_id"], t["auto_day"] = conv, today
                 if conv and team:
                     msg["routing"] = await self.route_to_team(conv, team)
+                if conv:
+                    await self.close(conv)           # closed = nothing to read; a rider reply re-opens it in the same inbox
             msg["status"] = "sent"                         # stays open in the automation inbox so it is visible there
         except HTTPException as e:
             msg["status"], msg["error"] = "failed", str(e.detail)
@@ -485,6 +494,8 @@ class Intercom:
             if team_id:
                 await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team_id})
             else:
+                # "0" clears teammate AND team (leaves the automation inbox), then the sending teammate takes it
+                await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": "0"})
                 await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": self.admin})
             await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "open", "type": "admin", "admin_id": self.admin})
             if note:
@@ -493,8 +504,8 @@ class Intercom:
         except HTTPException:
             return False
 
-    async def reply_in(self, conversation_id: str, rider_id: str, name: str, text: str) -> dict:
-        """Answer inside the conversation the rider just wrote in."""
+    async def reply_in(self, conversation_id: str, rider_id: str, name: str, text: str, close: bool = False) -> dict:
+        """Answer inside the conversation the rider just wrote in (close=True: the answer settles it)."""
         t = self.thread(rider_id, name)
         msg = {"id": f"ops-{time.time_ns()}", "from": "ops", "body": text, "at": int(time.time()), "status": "sending", "auto": True}
         self._push(t, msg)
@@ -503,6 +514,8 @@ class Intercom:
                 raise HTTPException(503, "no teammate to send as")
             await self.call("POST", f"/conversations/{conversation_id}/reply", {"message_type": "comment", "type": "admin", "admin_id": self.admin, "body": _html(text)})
             msg["status"] = "sent"
+            if close:
+                await self.close(conversation_id)
         except HTTPException as e:
             msg["status"], msg["error"] = "failed", str(e.detail)
         except Exception as e:
