@@ -23,6 +23,16 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.6 — per-rule cities, riders matched automatically, faster with all cities
+
+- Each rule has its own 🏙 city picker on the Intercom page (empty = the default list / all cities). Rider
+  queries are answered in every city regardless.
+- A rider who writes first (never messaged by us) is recognised through his MotionTools profile link in Intercom and
+  answered; new riders on the board are matched with Intercom automatically every 10 minutes.
+- Start-up no longer blocks the pages (no housekeeping/VACUUM/backup at start, repair deferred and batched); webhook
+  events yield to page requests; `/health` lists slow requests.
+- Service areas are named automatically from their coordinates (OpenStreetMap), no more 8-character ids.
+
 ## 6.5 — the Intercom page: rider queries answered, cities, DE/EN texts
 
 **One new file: `replies.py`** (GitHub → *Add file → Upload files*). The other 12 are replaced as usual (13 files now).

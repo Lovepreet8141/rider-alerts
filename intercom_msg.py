@@ -22,6 +22,7 @@ Threads are cached in DATA_DIR/intercom_threads.json so a restart keeps the conv
 from __future__ import annotations
 
 import html
+import asyncio
 import json
 import os
 import re
@@ -61,6 +62,7 @@ class Intercom:
         self.hint_lookup = None          # rider id -> Intercom email / contact id typed in Settings
         self._link_attr = None           # resolved lazily: the "Worker dashboard profile link" attribute
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
+        self.rider_known = None          # rider_id -> bool (is this a MotionTools rider id the dashboard knows?)
         self.on_incoming = None          # (rider_id, text, conversation_id) -> the app answers common questions
         self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
         self.auto_close = False          # close automatic conversations after sending (Settings; off = stay open until a rider replies)
@@ -459,6 +461,47 @@ class Intercom:
         self._save()
         return msg
 
+    async def rider_of_contact(self, cid: str, contact: dict = None) -> str:
+        """Rider id of an Intercom contact: external_id, else the 'Worker dashboard profile link' attribute."""
+        try:
+            c = contact if contact and contact.get("custom_attributes") else await self.call("GET", f"/contacts/{cid}")
+        except Exception:
+            return ""
+        ext = str(c.get("external_id") or "")
+        if ext.startswith("rider:"):
+            return ext[6:]
+        attrs = c.get("custom_attributes") or {}
+        for k, v in attrs.items():
+            if v and ("motiontools" in str(v).lower() or "worker" in k.lower() or "profile" in k.lower()):
+                m = re.search(r"/drivers/([A-Za-z0-9-]+)", str(v))
+                if m:
+                    return m.group(1)
+        if ext and self.rider_known and self.rider_known(ext):
+            return ext
+        return ""
+
+    async def _resolve_then_dispatch(self, cid: str, contact: dict, conv_id: str, body, at, has_photo: bool):
+        rid = await self.rider_of_contact(cid, contact)
+        if not rid:
+            return
+        t = self.thread(rid, (contact or {}).get("name") or "Rider")
+        t["contact_id"], t["contact_src"] = cid, "link"
+        if conv_id:
+            t["conversation_id"] = conv_id
+        self._push(t, {"id": f"in-{time.time_ns()}", "from": "rider", "body": _text(body or "") or ("📷 photo" if has_photo else ""), "at": int(at or time.time()), "status": "received"})
+        t["unread"] = int(t.get("unread") or 0) + 1
+        self._save()
+        if self.on_match:
+            try:
+                self.on_match(rid, contact if contact and contact.get("email") else await self.call("GET", f"/contacts/{cid}"))
+            except Exception:
+                pass
+        if self.on_incoming:
+            try:
+                self.on_incoming(rid, _text(body or ""), conv_id, False, has_photo)
+            except Exception:
+                pass
+
     def incoming(self, payload: dict) -> bool:
         """Intercom webhook: a rider replied (or started a conversation)."""
         topic = payload.get("topic") or ""
@@ -483,7 +526,11 @@ class Intercom:
         t = next((x for x in self.threads.values() if conv_id and conv_id in (x.get("conversation_id"), x.get("auto_conversation_id"))), None) \
             or next((x for x in self.threads.values() if cid and x.get("contact_id") == cid), None)
         if t is None:
-            rid = ext[6:] if ext.startswith("rider:") else f"contact:{cid}"
+            rid = ext[6:] if ext.startswith("rider:") else (ext if ext and not ext.startswith("contact:") and self.rider_known and self.rider_known(ext) else f"contact:{cid}")
+            if rid.startswith("contact:") and cid:
+                # a rider we never messaged writes first: find him through his MotionTools profile link, then answer
+                asyncio.create_task(self._resolve_then_dispatch(cid, contact, conv_id, body, at, has_photo))
+                return True
             t = self.thread(rid, author.get("name") or contact.get("name") or "Rider")
             t["contact_id"] = cid
         if conv_id:

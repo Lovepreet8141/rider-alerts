@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5.6"
+VERSION = "6.6"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1024,6 +1024,7 @@ async def startup():
     asyncio.create_task(sync_loop())
     asyncio.create_task(automation_loop())
     asyncio.create_task(city_names_loop())
+    asyncio.create_task(intercom_match_loop())
 
 
 # ====================================================================== webhook (wakes the sync)
@@ -1510,7 +1511,7 @@ async def api_automations_get(recheck: int = 0):
         except Exception as e:
             log.warning("intercom check failed: %s", e)
     return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
-                       **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
+                       "cities": sorted(rule_cities_enabled(k, settings)), **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
                          "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name, "auto_close": intercom.ic.auto_close},
             "queries": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}", "1") == "1",
@@ -1613,6 +1614,9 @@ async def api_automations_set(request: Request):
             vals[f"auto_text:{k}"] = v.strip()[:900]            # "" = back to the default text
     if isinstance(body.get("cities"), list):
         vals["auto_cities"] = json.dumps([str(c)[:60] for c in body["cities"]][:60])
+    for k, v in (body.get("rule_cities") or {}).items():
+        if k in keys and isinstance(v, list):
+            vals[f"auto_cities:{k}"] = json.dumps([str(c)[:60] for c in v][:60]) if v else ""
     if "close" in body:
         vals["intercom_auto_close"] = "1" if body.get("close") else ""
         intercom.ic.auto_close = bool(body.get("close"))
@@ -1672,6 +1676,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
     sent_keys = store.auto_keys_since(now - timedelta(hours=26))
     cap = store.auto_today(now)
     cities_on = auto_cities_enabled(settings)
+    rule_cities = {k: rule_cities_enabled(k, settings) for k, _, _ in AUTOMATIONS}
     out = []
 
     def auto_city(oid: str, rid: str) -> str:
@@ -1685,8 +1690,8 @@ def automation_tick(now: datetime, trace: list = None) -> list:
         why = ""
         if (rule, rid, oid) in sent_keys:
             why = "already sent for this order"            # the only guard left: the same text never repeats on one order
-        elif cities_on and (auto_city(oid, rid) not in cities_on):
-            why = f"city not enabled ({auto_city(oid, rid) or '?'})"
+        elif (rule_cities.get(rule) or cities_on) and (auto_city(oid, rid) not in (rule_cities.get(rule) or cities_on)):
+            why = f"city not enabled for this rule ({auto_city(oid, rid) or '?'})"
         elif not on.get(rule):
             why = "rule switched off"
         elif not live_mode:
@@ -1879,6 +1884,15 @@ def auto_cities_enabled(settings: dict = None) -> set:
         return set()
 
 
+def rule_cities_enabled(key: str, settings: dict = None) -> set:
+    """Cities for one rule (Intercom page → Rules → city picker); empty = the global list / all cities."""
+    raw = (settings or store.get_settings()).get(f"auto_cities:{key}") or ""
+    try:
+        return {c for c in json.loads(raw) if c} if raw.startswith("[") else set()
+    except Exception:
+        return set()
+
+
 def _query_text(key: str, settings: dict = None) -> str:
     return (settings or store.get_settings()).get(f"auto_text:{key}") or QUERY_DEFAULT.get(key, "")
 
@@ -1966,6 +1980,36 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
     except Exception as e:
         log.exception("rider reply failed: %s", e)
         await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
+
+
+async def intercom_match_loop():
+    """New riders are matched with their Intercom profile automatically (profile link → phone → name), a few at a
+    time, so a rider who appears on the board today can be messaged today without anyone pressing 'Match all'."""
+    await asyncio.sleep(180)
+    tried: dict = {}
+    while True:
+        try:
+            if intercom.ic.enabled:
+                todo = [rid for rid in list(STATE["riders"]) if not INTERCOM_USER.get(rid) and time.time() - tried.get(rid, 0) > 6 * 3600][:20]
+                for rid in todo:
+                    tried[rid] = time.time()
+                    r = STATE["riders"].get(rid) or {}
+                    try:
+                        c = await intercom.ic.find_contact(rid, r.get("name") or "", r.get("phone") or "")
+                    except Exception:
+                        c = None
+                    if c:
+                        _remember_intercom(rid, c)
+                        t = intercom.ic.thread(rid, r.get("name") or "", r.get("phone") or "")
+                        if t.get("contact_id") != c.get("id"):
+                            t["contact_id"], t["conversation_id"] = c.get("id"), ""
+                        link = str((c.get("custom_attributes") or {}).get((intercom.ic._link_attr or "").split(".", 1)[-1], "") or "")
+                        t["contact_src"] = "link" if rid in link else "other"
+                        intercom.ic._save()
+                    await asyncio.sleep(0.6)
+        except Exception as e:
+            log.warning("intercom match loop: %s", e)
+        await asyncio.sleep(600)
 
 
 async def city_names_loop():
@@ -2390,6 +2434,7 @@ def _remember_intercom(rid: str, c: dict):
 
 
 intercom.ic.on_match = _remember_intercom
+intercom.ic.rider_known = lambda rid: rid in STATE["riders"] or bool(store.get_settings().get(f"intercom_user:{rid}"))
 intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False, has_photo=False: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto, has_photo))
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
 intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
