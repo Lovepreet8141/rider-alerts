@@ -153,7 +153,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5.1"
+VERSION = "6.5.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -998,6 +998,7 @@ async def startup():
         store.log("error", "MT_API_TOKEN not set — no data will be pulled from MotionTools")
     asyncio.create_task(sync_loop())
     asyncio.create_task(automation_loop())
+    asyncio.create_task(city_names_loop())
 
 
 # ====================================================================== webhook (wakes the sync)
@@ -1147,8 +1148,14 @@ def api_state(city: str = "", done: int = 0):
     mine = live_orders(city)
     ids = {o["id"] for o in mine}
     alerts = [a for a in store.alerts_for_ui(now) if not city or a["order_id"] in ids]
-    orders = sorted((order_view(o, now, idx) for o in mine),
-                    key=lambda v: (v["phase"] == "on_hold", -(v["elapsed"] or 0)))
+    t0 = time.monotonic()
+    views = []
+    for o in mine:
+        try:
+            views.append(order_view(o, now, idx))
+        except Exception as e:                                   # one broken order must never blank the whole board
+            log.warning("order_view failed for %s: %s", o.get("id"), e)
+    orders = sorted(views, key=lambda v: (v["phase"] == "on_hold", -(v["elapsed"] or 0)))
     PULSE_CACHE.setdefault("by_city", {})
     pc = PULSE_CACHE["by_city"].get(city)
     if pc is None or (now - pc["at"]).total_seconds() > 20:
@@ -1209,7 +1216,7 @@ def api_state(city: str = "", done: int = 0):
         disk = DISK_CACHE["rep"] = disk_report()
         DISK_CACHE["at"] = now
     return {"now": iso(now), "city": city or CITY, "selected_city": city, "cities": [c["city"] for c in network_now(now)["cities"]],
-            "pulse": pulse, "alerts": alerts, "orders": orders, "riders": riders, "reasons": REASONS,
+            "pulse": pulse, "alerts": alerts, "orders": orders, "took_ms": int((time.monotonic() - t0) * 1000), "riders": riders, "reasons": REASONS,
             "done": [order_view(o, now, idx) for o in pc["recent"][:done]] if done else [],
             "disk": {"pct": disk["pct"], "free_mb": disk["free_mb"], "total_mb": disk["total_mb"]},
             "sync": {**STATE["sync"], "stale": stale and mt.enabled, "api": mt.stats, "areas": AREAS, "started": iso(STARTED),
@@ -1944,6 +1951,42 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
         await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
 
 
+async def city_names_loop():
+    """MotionTools webhooks carry only the service-area id, and the API that would give its name is restricted —
+    so unnamed areas are named from their coordinates (OpenStreetMap reverse geocoding, once per area, cached).
+    A name typed in Settings → Cities always wins."""
+    import httpx
+    await asyncio.sleep(120)
+    while True:
+        try:
+            areas = {}
+            for o in STATE["orders"].values():
+                a = o.get("area")
+                if not a or store.city_map.get(a):
+                    continue
+                ll = next(((o.get(k1), o.get(k2)) for k1, k2 in (("pick_lat", "pick_lng"), ("drop_lat", "drop_lng"), ("rider_lat", "rider_lng")) if o.get(k1) is not None and o.get(k2) is not None), None)
+                if ll and a not in areas:
+                    areas[a] = ll
+            async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "quickzi-ops/6.5 (fleet dashboard)"}) as cli:
+                for a, (lat, lng) in list(areas.items())[:10]:
+                    try:
+                        r = await cli.get("https://nominatim.openstreetmap.org/reverse", params={"lat": lat, "lon": lng, "format": "json", "zoom": 10, "accept-language": "de"})
+                        ad = (r.json() or {}).get("address") or {}
+                        name = ad.get("city") or ad.get("town") or ad.get("municipality") or ad.get("village") or ad.get("county") or ""
+                        if name:
+                            store.set_city_name(a, name)
+                            for o in STATE["orders"].values():
+                                if o.get("area") == a:
+                                    o["city"] = name
+                            store.log("info", f"city named from the map: {a[:8]}… = {name}")
+                    except Exception as e:
+                        log.warning("city name lookup failed for %s: %s", a[:8], e)
+                    await asyncio.sleep(1.2)                      # OpenStreetMap asks for ≤ 1 request/s
+        except Exception as e:
+            log.warning("city names loop: %s", e)
+        await asyncio.sleep(120)
+
+
 async def automation_loop():
     await asyncio.sleep(90)
     while True:
@@ -2368,6 +2411,7 @@ async def api_intercom_match_riders():
 def health():
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
+            "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-5:], "automation_error": STATE.get("auto_last_error", ""),
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
