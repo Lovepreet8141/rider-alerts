@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5.5"
+VERSION = "6.5.6"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -853,10 +853,9 @@ async def post_start(now: datetime):
     """The slow parts of a start (housekeeping, DB backup, replaying the event log) run AFTER the server is already
     answering — a restart at peak must not take the dashboard down for a minute."""
     loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, housekeeping, now, True)
-    except Exception as e:
-        log.exception("housekeeping failed: %s", e)
+    # housekeeping (old files, GPS purge, vacuum) is NOT done at startup any more — the hourly run at :30 does it.
+    # the first minutes after a deploy belong to the people opening the dashboard, so the heavy repair waits too.
+    await asyncio.sleep(90)
     try:
         backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
         recent = [b for b in DATA_DIR.glob("quickzi-backup-*.db") if now.timestamp() - b.stat().st_mtime < 6 * 3600]
