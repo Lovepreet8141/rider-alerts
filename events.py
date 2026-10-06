@@ -183,7 +183,7 @@ class Projector:
             self.store.record_position(rid, lat, lng, order_id, now)
 
     TEXT_FIELDS = ("ref", "area", "area_name", "restaurant_phone", "customer_addr", "customer_phone", "customer_zip",
-                   "place_id", "cancel_reason")
+                   "customer_name", "customer_notes", "place_id", "cancel_reason")
     TIME_FIELDS = ("created_at", "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at",
                    "at_customer_at", "delivered_at")
 

@@ -203,6 +203,8 @@ def parse_booking(b: dict) -> dict:
         "rider_id": driver.get("id"), "rider": _name(driver), "restaurant": restaurant,
         "restaurant_phone": pick.get("phone_number") or "", "customer_addr": _addr(drop),
         "customer_phone": drop.get("phone_number") or "",
+        "customer_name": _name(drop.get("contact") if isinstance(drop.get("contact"), dict) else None) or drop.get("contact_name") or drop.get("name") or drop.get("recipient_name") or "",
+        "customer_notes": " ".join(str(drop.get(k)) for k in ("notes", "note", "comment", "instructions", "delivery_instructions", "address_notes", "description") if drop.get(k))[:300],
         "pick_lat": pick.get("lat"), "pick_lng": pick.get("lng"), "drop_lat": drop.get("lat"), "drop_lng": drop.get("lng"),
         "rider_lat": loc.get("lat"), "rider_lng": loc.get("lng"),
         "eta_restaurant": ts(pick.get("expected_arrival_at")), "eta_customer": ts(drop.get("expected_arrival_at")),
@@ -219,7 +221,7 @@ def new_order(oid: str, ref: str = "", area: str = None, now: Optional[datetime]
     """Empty order in the same shape parse_booking() produces (used in webhook mode)."""
     return {"id": oid, "ref": ref or oid[:8], "status": "", "phase": "unassigned", "area": area, "area_name": None,
             "rider_id": None, "rider": "", "restaurant": "", "restaurant_phone": "", "customer_addr": "",
-            "customer_phone": "", "pick_lat": None, "pick_lng": None, "drop_lat": None, "drop_lng": None,
+            "customer_phone": "", "customer_name": "", "customer_notes": "", "pick_lat": None, "pick_lng": None, "drop_lat": None, "drop_lng": None,
             "rider_lat": None, "rider_lng": None, "eta_restaurant": None, "eta_customer": None,
             "pick_status": None, "drop_status": None, "created_at": now, "dispatched_at": now, "scheduled_at": None,
             "promised_at": None, "accepted_at": None,

@@ -473,9 +473,13 @@ class Intercom:
         user_parts = [p for p in parts if (p.get("author") or {}).get("type") in ("user", "lead", "contact")]
         if user_parts:
             body, author, at = user_parts[-1].get("body"), user_parts[-1].get("author") or {}, user_parts[-1].get("created_at")
+            has_photo = bool(user_parts[-1].get("attachments"))
         else:
             src = item.get("source") or {}
             body, author, at = src.get("body"), src.get("author") or {}, item.get("created_at")
+            has_photo = bool(src.get("attachments"))
+        if not has_photo and "<img" in (body or ""):
+            has_photo = True
         t = next((x for x in self.threads.values() if conv_id and conv_id in (x.get("conversation_id"), x.get("auto_conversation_id"))), None) \
             or next((x for x in self.threads.values() if cid and x.get("contact_id") == cid), None)
         if t is None:
@@ -484,12 +488,12 @@ class Intercom:
             t["contact_id"] = cid
         if conv_id:
             t["conversation_id"] = conv_id
-        self._push(t, {"id": f"in-{time.time_ns()}", "from": "rider", "body": _text(body or ""), "at": int(at or time.time()), "status": "received"})
+        self._push(t, {"id": f"in-{time.time_ns()}", "from": "rider", "body": _text(body or "") or ("📷 photo" if has_photo else ""), "at": int(at or time.time()), "status": "received"})
         t["unread"] = int(t.get("unread") or 0) + 1
         self._save()
         if self.on_incoming and not str(t["rider_id"]).startswith("contact:"):
             try:
-                self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"))
+                self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"), has_photo)
             except Exception:
                 pass
         return True

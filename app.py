@@ -31,6 +31,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from events import DISPATCHED, Projector
 from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
+from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, classify, render_query
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, leg_stillness, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
 import store as store_mod
 from store import Store, day_key, day_start
@@ -151,7 +152,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.4.4"
+VERSION = "6.5"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1106,7 +1107,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
             "map_url": f"https://maps.google.com/?q={lat:.5f},{lng:.5f}" if lat is not None and live else "",
             "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
             "alert_heads": [h for h in heads if h], "stack": STATE["stack"].get(o["id"]) if live else None,
-            "reason": o.get("reason") or "", "note": o.get("note") or "", "warn": rules.ptod_warn_min,
+            "reason": o.get("reason") or "", "note": o.get("note") or "", "query_flag": o.get("query_flag") or "", "excuse": o.get("excuse") or "", "customer_name": o.get("customer_name") or "", "warn": rules.ptod_warn_min,
             "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "planned": hm(o.get("eta_customer") or o.get("scheduled_at")),
@@ -1391,9 +1392,6 @@ AUTOMATIONS = [
     ("thanks_excused", "Thanks after a hand-back caused by the kitchen", "Danke fürs Warten bei {restaurant}, wir haben es notiert – das zählt nicht gegen dich. / Thanks for waiting at {restaurant}, we noted it – it does not count against you."),
     ("end_of_day", "End of day: 60′ after the last delivery", "Danke für heute, {name}: {deliveries} Lieferungen, {on_time} % pünktlich. / Thanks for today: {deliveries} deliveries, {on_time}% on time."),
     # replies from riders (Intercom → dashboard): answered automatically
-    ("reply:customer", "Rider asks for the customer's number / customer not reachable", "📦 {ref}: Kunde {phone} · {address}. Einmal anrufen, dann uns schreiben. / Customer {phone} · {address}. Call once, then message us."),
-    ("reply:forwarded", "Any other reply to an automatic message → forwarded to the main inbox (always on)", "— no message to the rider; the conversation is handed to a person with a note —"),
-    ("reply:restaurant", "Rider reports the restaurant is late", "Danke, notiert: {restaurant} ist spät bei {ref} – die Wartezeit zählt nicht gegen dich. / Noted: {restaurant} is late on {ref} – the wait does not count against you."),
     # shift-sheet rules (only do something once a shift sheet is uploaded)
     ("no_start", "Shift sheet: no order 30′ after shift start", "Hallo {name}, deine Schicht hat um {start} begonnen – bist du unterwegs? / Hi {name}, your shift started at {start} – are you on the road?"),
 ]
@@ -1467,7 +1465,13 @@ async def api_automations_get(recheck: int = 0):
                        **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
                          "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name, "auto_close": intercom.ic.auto_close},
-            "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "", "daily_cap": 0}
+            "queries": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}", "1") == "1",
+                         **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in QUERIES],
+            "cities": {"all": sorted({city_of(o) for o in STATE["orders"].values() if city_of(o)} | set(store.city_map.values()) if hasattr(store, "city_map") else set()),
+                       "on": sorted(auto_cities_enabled(settings))},
+            "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
+            "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
+            "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(200), "quiet_hours": "", "daily_cap": 0}
 
 
 @app.get("/api/automations/diag", dependencies=[Depends(require_login)])
@@ -1530,17 +1534,37 @@ def api_automations_diag():
     return {"findings": findings, "orders": rows, "trace": trace, "loop_age_s": tick_age, "webhook_silent": STATE["sync"].get("webhook_silent"), "last_webhook": STATE["sync"].get("last_webhook")}
 
 
+@app.post("/api/automations/flow/{rid}/clear", dependencies=[Depends(require_login)])
+async def api_flow_clear(rid: str):
+    """Intercom page: a person takes over — the flow stops and the conversation goes to the main inbox."""
+    st = flows.state.get(rid)
+    if st and st.get("conv"):
+        await _flow_forward(rid, st["conv"], "a person took over from the dashboard", o=_rider_live_order(rid))
+    flows.clear(rid)
+    return {"ok": True}
+
+
+@app.post("/api/automations/classify", dependencies=[Depends(require_login)])
+async def api_classify(request: Request):
+    """Intercom page: 'what would the dashboard understand?' — type a rider message, see the intent."""
+    body = await request.json() or {}
+    i = classify(str(body.get("text") or ""), bool(body.get("photo")))
+    return {"intent": i, "label": INTENT_LABEL.get(i, i)}
+
+
 @app.post("/api/automations", dependencies=[Depends(require_login)])
 async def api_automations_set(request: Request):
     body = await request.json() or {}
-    keys = {a[0] for a in AUTOMATIONS}
+    keys = {a[0] for a in AUTOMATIONS} | {q[0] for q in QUERIES}
     vals = {}
     for k, v in (body.get("on") or {}).items():
         if k in keys:
             vals[f"auto:{k}"] = "1" if v else ""
     for k, v in (body.get("text") or {}).items():
         if k in keys and isinstance(v, str):
-            vals[f"auto_text:{k}"] = v.strip()[:500]
+            vals[f"auto_text:{k}"] = v.strip()[:900]            # "" = back to the default text
+    if isinstance(body.get("cities"), list):
+        vals["auto_cities"] = json.dumps([str(c)[:60] for c in body["cities"]][:60])
     if "close" in body:
         vals["intercom_auto_close"] = "1" if body.get("close") else ""
         intercom.ic.auto_close = bool(body.get("close"))
@@ -1599,12 +1623,22 @@ def automation_tick(now: datetime, trace: list = None) -> list:
     today = day_key(now)
     sent_keys = store.auto_keys_since(now - timedelta(hours=26))
     cap = store.auto_today(now)
+    cities_on = auto_cities_enabled(settings)
     out = []
+
+    def auto_city(oid: str, rid: str) -> str:
+        o = STATE["orders"].get(oid) or STATE["orders"].get(str(oid).split(":")[0]) or STATE["orders"].get(str(oid).split(":")[-1])
+        if o:
+            return city_of(o) or ""
+        live = [x for x in STATE["orders"].values() if x.get("rider_id") == rid]
+        return city_of(live[0]) if live else ""
 
     def fire(rule: str, rid: str, name: str, oid: str, ref: str, **vals):
         why = ""
         if (rule, rid, oid) in sent_keys:
             why = "already sent for this order"            # the only guard left: the same text never repeats on one order
+        elif cities_on and (auto_city(oid, rid) not in cities_on):
+            why = f"city not enabled ({auto_city(oid, rid) or '?'})"
         elif not on.get(rule):
             why = "rule switched off"
         elif not live_mode:
@@ -1788,60 +1822,102 @@ def _rider_live_order(rid: str):
     return mine[0] if mine else None
 
 
-CUSTOMER_WORDS = ("kunde", "kundin", "customer", "client")
-CUSTOMER_ASK = ("nummer", "number", "erreich", "reach", "answer", "antwort", "anruf", "call", "telefon", "phone", "geht nicht ran", "not picking", "no response", "keine antwort")
-REST_WORDS = ("restaurant", "küche", "kueche", "kitchen", "essen", "food", "order", "bestellung")
-REST_LATE = ("spät", "spaet", "late", "nicht fertig", "not ready", "wart", "wait", "dauert", "slow", "langsam")
+def auto_cities_enabled(settings: dict = None) -> set:
+    """Cities that receive automatic messages; empty = all cities (Intercom page → Cities)."""
+    raw = (settings or store.get_settings()).get("auto_cities") or ""
+    try:
+        return {c for c in json.loads(raw) if c} if raw.startswith("[") else {c.strip() for c in raw.split(",") if c.strip()}
+    except Exception:
+        return set()
 
 
-async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False):
-    """A rider wrote to us (Intercom webhook): answer the two most common questions on the spot; anything else a
-    rider answers to an *automatic* message is forwarded to the main inbox — a human must read it."""
+def _query_text(key: str, settings: dict = None) -> str:
+    return (settings or store.get_settings()).get(f"auto_text:{key}") or QUERY_DEFAULT.get(key, "")
+
+
+def _order_ctx(o) -> str:
+    if not o:
+        return "no live order"
+    at = o.get("at_restaurant_at") if o.get("phase") == "at_restaurant" else o.get("at_customer_at") if o.get("phase") == "at_customer" else None
+    since = f" since {hm(at)}" if at else ""
+    return f"Order {o.get('ref')} · {PHASE_LABEL.get(o['phase'], o['phase'])}{since} · {o.get('restaurant') or ''} → {o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip()
+
+
+def customer_card_data(o: dict) -> dict:
+    phone = (o.get("customer_phone") or "").strip()
+    notes = (o.get("customer_notes") or "").strip()
+    addr = f"{o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip() or "–"
+    link = f"https://maps.google.com/?q={o['drop_lat']},{o['drop_lng']}" if o.get("drop_lat") is not None and o.get("drop_lng") is not None else ""
+    return {"ref": o.get("ref") or "", "customer_name": f"{o['customer_name']} · " if o.get("customer_name") else "", "phone": phone or "siehe App | see the app",
+            "address": addr, "notes_line": f"📝 {notes}\n" if notes else "", "map_line": f"🗺️ {link}\n" if link else "", "phone_known": bool(phone)}
+
+
+async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, **fmt):
     settings = store.get_settings()
-    low = (text or "").lower()
+    name = STATE["riders"].get(rid, {}).get("name") or "Rider"
+    base = {"ref": (o or {}).get("ref") or "", "restaurant": (o or {}).get("restaurant") or "the restaurant", "name": name}
+    base.update(fmt)
+    text = render_query(_query_text(key, settings), **base)
+    if closer_key:
+        text = (text + "\n" + render_query(_query_text(closer_key, settings), **base)).strip()
+    now = datetime.now(UTC)
+    aid = store.auto_log(now, key, rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), text, "pending" if intercom.ic.enabled else "dry")
+    if intercom.ic.enabled:
+        m = await intercom.ic.reply_in(conv, rid, name, text)
+        store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
+
+
+async def _flow_forward(rid: str, conv: str, note: str, urgent: bool = False, o=None):
+    name = STATE["riders"].get(rid, {}).get("name") or "Rider"
+    full = f"{'🔴 ' if urgent else '⚠ '}{name}: {note}\n{_order_ctx(o)}"
+    ok = await intercom.ic.escalate(conv, full) if intercom.ic.enabled else False
+    store.auto_log(datetime.now(UTC), "reply:forwarded", rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), note[:300], "sent" if ok else "failed", "" if ok else "could not reassign")
+    store.log("warning" if urgent else "info", f"Intercom → inbox: {name}: {note[:100]}")
+
+
+def _flow_log(rid: str, o, key: str, text: str):
+    name = STATE["riders"].get(rid, {}).get("name") or "Rider"
+    store.auto_log(datetime.now(UTC), key, rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), text, "received")
+
+
+def _riders_on(o) -> list:
+    out = [(h.get("rider") or STATE["riders"].get(h.get("rider_id") or "", {}).get("name") or "?", (h.get("at") or "")[11:16]) for h in (o or {}).get("history") or [] if h.get("what") == "accepted"]
+    if not out and o and o.get("rider"):
+        out = [(o["rider"], hm(o.get("accepted_at")) or "")]
+    return out
+
+
+def _others(rid: str, o) -> str:
+    mine = [x for x in STATE["orders"].values() if x.get("rider_id") == rid and x["phase"] not in ("on_hold", "delivered", "cancelled", "closed") and x is not o]
+    return ", ".join(f"{x.get('ref')} ({PHASE_LABEL.get(x['phase'], x['phase'])})" for x in mine) or "none"
+
+
+flows = RiderFlows(store)
+flows.deps = {"order_for": _rider_live_order, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
+              "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
+
+CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
+
+
+async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False):
+    """A rider wrote to us (Intercom webhook): the flow engine answers what it can and forwards the rest with context."""
     now = datetime.now(UTC)
     o = _rider_live_order(rid)
-    name = STATE["riders"].get(rid, {}).get("name") or "Rider"
-    asks_customer = any(w in low for w in CUSTOMER_WORDS) and any(w in low for w in CUSTOMER_ASK)
-    reports_rest = any(w in low for w in REST_WORDS) and any(w in low for w in REST_LATE)
-    if in_auto and not (asks_customer or reports_rest):
-        last = next((m for m in reversed(intercom.ic.threads.get(rid, {}).get("messages", [])) if m.get("from") == "ops" and m.get("auto")), None)
-        note = f"⚠ {name} replied to an automatic message — needs a person.\nWe sent: {(last or {}).get('body', '')[:200]}\nRider: {text[:300]}" + (f"\nOrder {o.get('ref')} · {PHASE_LABEL.get(o['phase'], o['phase'])} · {o.get('restaurant')}" if o else "")
-        ok = await intercom.ic.escalate(conversation_id, note)
-        store.auto_log(now, "reply:forwarded", rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), f"rider: {text[:200]}", "sent" if ok else "failed", "" if ok else "could not reassign")
-        store.log("info", f"{name} replied to an automatic message → forwarded to the main inbox: {text[:80]}")
-        return
-    if asks_customer:
-        if not o:
-            return
-        if not o.get("customer_phone"):
-            try:
-                await enrich_order(o["id"], now)
-            except Exception:
-                pass
-        phone = o.get("customer_phone") or ""
-        if not phone:
-            store.log("info", f"{name} asked for the customer number of {o.get('ref')} — not known (booking detail restricted)")
-            return
-        tmpl = settings.get("auto_text:reply:customer") or next(m for k, _, m in AUTOMATIONS if k == "reply:customer")
-        txt = tmpl.format_map(SafeDict(ref=o.get("ref") or "", phone=phone, address=f"{o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip(), name=name))
-        mode = "pending" if (intercom.ic.enabled and settings.get("auto:reply:customer") == "1") else "dry"
-        aid = store.auto_log(now, "reply:customer", rid, name, o["id"], o.get("ref") or "", txt, mode)
-        if mode == "pending":
-            m = await intercom.ic.reply_in(conversation_id, rid, name, txt, close=in_auto)
-            store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
-    elif reports_rest:
-        if not o:
-            return
-        o["kitchen_reported"] = True                                       # the late-plan rule leaves this order alone
-        store.log("info", f"{name} reports {o.get('restaurant')} late on {o.get('ref')} — wait counted as the kitchen's")
-        tmpl = settings.get("auto_text:reply:restaurant") or next(m for k, _, m in AUTOMATIONS if k == "reply:restaurant")
-        txt = tmpl.format_map(SafeDict(ref=o.get("ref") or "", restaurant=o.get("restaurant") or "the restaurant", name=name))
-        mode = "pending" if (intercom.ic.enabled and settings.get("auto:reply:restaurant") == "1") else "dry"
-        aid = store.auto_log(now, "reply:restaurant", rid, name, o["id"], o.get("ref") or "", txt, mode)
-        if mode == "pending":
-            m = await intercom.ic.reply_in(conversation_id, rid, name, txt, close=in_auto)
-            store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
+    intent = classify(text, has_photo)
+    if o is not None and intent in CUSTOMER_INTENTS and not o.get("customer_phone"):
+        try:
+            await enrich_order(o["id"], now)
+        except Exception:
+            pass
+    msgs = intercom.ic.threads.get(rid, {}).get("messages", [])
+    last_ops = next((m for m in reversed(msgs) if m.get("from") == "ops"), None)
+    last_ops_auto = bool(last_ops and last_ops.get("auto") and now.timestamp() - (last_ops.get("at") or 0) < 3600)
+    try:
+        result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto)
+        store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {intent} → {result}")
+    except Exception as e:
+        log.exception("rider reply failed: %s", e)
+        await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
 
 
 async def automation_loop():
@@ -1855,6 +1931,7 @@ async def automation_loop():
                 r = STATE["riders"].get(rid, {})
                 m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref, auto=True)
                 store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", "") or m.get("note", ""))
+            await flows.tick(now)
             STATE["auto_last_error"] = ""
         except Exception as e:
             log.exception("automation failed: %s", e)
@@ -2229,7 +2306,7 @@ def _remember_intercom(rid: str, c: dict):
 
 
 intercom.ic.on_match = _remember_intercom
-intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto))
+intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False, has_photo=False: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto, has_photo))
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
 intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
 

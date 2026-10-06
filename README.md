@@ -23,6 +23,43 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.5 — the Intercom page: rider queries answered, cities, DE/EN texts
+
+**One new file: `replies.py`** (GitHub → *Add file → Upload files*). The other 12 are replaced as usual (13 files now).
+
+New header item **Intercom**:
+
+- **Cities** — tick the cities whose riders receive automatic messages. Nothing ticked = all cities. Rules still
+  evaluate everywhere (alerts stay on the board); only the message is held back elsewhere.
+- **Conversations in progress** — which rider the dashboard is currently handling, in which situation, what it waits
+  for (timer), and a *Take over* button that hands the conversation to your inbox.
+- **Rider queries** — what the dashboard answers itself when a rider writes (any conversation, any language the
+  Intercom workflow buttons are translated into):
+  - *order not ready* → asks the rider to stay and to name the minutes; "10" sets a timer, "ok" keeps waiting,
+    "no / can't wait" gets one persuasion message (10 more minutes?), a second no or silence goes to your inbox as
+    urgent; 20 min at the restaurant always goes to you. The wait counts as the restaurant's (PTOD excused).
+  - *restaurant closed* / *order damaged* → asks for a photo, forwards it with a flag on the order.
+  - *restaurant has no such order / another rider took it* → forwarded at once with every rider who accepted it.
+  - *can't do the delivery* → "why?" → the reason is forwarded with the rider's other orders.
+  - *customer number / can't reach / can't find* → the **customer card** (ref, name, phone, address, delivery notes,
+    map pin) with a closing line for the situation; the next message from the rider is forwarded with the time at
+    the door. No phone in MotionTools data → you get a note to look it up.
+  - *customer doesn't accept* → "what exactly?" → forwarded.
+  - *forgot to finish in the app* → deliver + handover photo → forwarded "finalize".
+  - *hello / unclear* → "How can we help?" → the next message is forwarded with the order attached.
+    The rider is **never asked for the order number** — the note to you carries ref, status, restaurant, address.
+  - *ok / arrived / on the way* as a reply to an automatic message → "Thanks!", nothing forwarded.
+  - accident / injury / police anywhere → forwarded as urgent immediately.
+  Every query has an on/off switch and a German + English text; *Reset* restores the default. "Check" shows what
+  the dashboard would understand from any message you type.
+- **Rules** — the automatic messages as before, texts now as two fields (DE / EN) with Reset and Send test.
+- **Log today** — everything sent, received from riders, forwarded or failed, filterable.
+- **Riders ↔ Intercom** — matched count, unmatched names, *Match all*.
+
+Forwarding = the conversation is taken out of the Automation team, assigned to the sending teammate, opened, and a
+note is added (what we sent, what the rider wrote, order context). Auto-close is off by default (Settings).
+Orders carry a chip in the side panel when a query flagged them (restaurant closed?, customer unreachable, …).
+
 ## 6.4 — more rider automation, answers to rider replies, month filter
 - **Rules added**: at the restaurant by GPS but not marked arrived · left the customer without marking delivered ·
   no GPS for 10′ on an order · order waiting near a free rider (≤ 1.5 km, nearest two) · riding to a restaurant where
@@ -218,7 +255,7 @@ Settings → Webhooks that the webhook is still active". It is logged in Setting
 
 ## Files
 `app.py` server · `mt.py` MotionTools client (multi-path, self-probing) · `events.py` webhook projector ·
-`orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI · `intercom_msg.py` Intercom messaging (6.3) ·
+`orders.py` phases + alert rules · `store.py` SQLite + analytics · `dashboard.html` UI · `intercom_msg.py` Intercom messaging (6.3) · `replies.py` rider-query flows (6.5) ·
 `simulate.py` API-mode evening · `simulate_webhook.py` restricted-mode evening (fake MotionTools server) ·
 `requirements.txt` · `Procfile`
 
