@@ -304,8 +304,11 @@ class RiderTracker:
         p = self.pushes.get(rider_id)
         if not p:
             return False
-        cutoff = now - timedelta(minutes=minutes)
-        return sum(1 for t in p if t >= cutoff) >= min_reports
+        # MotionTools only pushes a position when it CHANGES, so a rider standing still goes quiet —
+        # exactly the case the movement rules are for. A phone that reported recently, or several
+        # times in the last hour, counts as a working feed; silence after that is "not moving".
+        cutoff, hour = now - timedelta(minutes=minutes), now - timedelta(minutes=60)
+        return any(t >= cutoff for t in p) or sum(1 for t in p if t >= hour) >= min_reports
 
     def stationary_minutes(self, rider_id: str, now: datetime, radius_m: int) -> Optional[float]:
         """How long the rider has stayed within radius_m of the latest position (None = unknown)."""
