@@ -234,8 +234,19 @@ class Store:
     def _exec(self, sql, args=()):
         with self.lock:
             cur = self.db.execute(sql, args)
-            self.db.commit()
+            if not getattr(self, "_batch", False):
+                self.db.commit()
             return cur
+
+    def begin_batch(self):
+        """Many writes, one commit (startup repair, backfills): a commit per row on the Railway volume is what
+        held the lock for minutes."""
+        self._batch = True
+
+    def end_batch(self):
+        self._batch = False
+        with self.lock:
+            self.db.commit()
 
     # ================================================================ system
     def log(self, level: str, msg: str):
@@ -441,9 +452,13 @@ class Store:
     def backfill_columns(self, limit: int = 2000) -> int:
         """Rows written before 6.1 have no city/day/hour columns yet — fill them batch by batch (runs after startup)."""
         rows = self._rows("SELECT * FROM orders WHERE day IS NULL AND raw IS NOT NULL LIMIT ?", (limit,))
-        for r in rows:
-            o = self._hydrate(r)
-            self.upsert_order(o, ts(r.get("updated_at")) or datetime.now(UTC), stacked=bool(r.get("stacked")), force=True)
+        self.begin_batch()
+        try:
+            for r in rows:
+                o = self._hydrate(r)
+                self.upsert_order(o, ts(r.get("updated_at")) or datetime.now(UTC), stacked=bool(r.get("stacked")), force=True)
+        finally:
+            self.end_batch()
         return len(rows)
 
     def cities_on(self, day: str) -> list:

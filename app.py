@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5.3"
+VERSION = "6.5.5"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -173,8 +173,18 @@ app = FastAPI()
 async def _slow_request_log(request: Request, call_next):
     """Anything slower than 2 s is written to the system log with its path — Settings → System shows it."""
     t0 = time.monotonic()
-    resp = await call_next(request)
+    try:
+        resp = await call_next(request)
+    except Exception as e:
+        try:
+            store.log("error", f"{request.url.path} crashed: {type(e).__name__}: {e}"[:400])
+        except Exception:
+            pass
+        raise
     dt = time.monotonic() - t0
+    if resp.status_code >= 500 and request.url.path.startswith("/api/"):
+        STATE.setdefault("slow", []).append({"at": iso(datetime.now(UTC)), "path": request.url.path, "s": round(dt, 1), "error": resp.status_code})
+        del STATE["slow"][:-30]
     if dt > 2 and not request.url.path.startswith("/mt/"):
         STATE.setdefault("slow", []).append({"at": iso(datetime.now(UTC)), "path": request.url.path, "s": round(dt, 1)})
         del STATE["slow"][:-30]
@@ -218,7 +228,7 @@ def city_of(o: dict) -> str:
 
 
 def live_orders(city: str = "") -> list:
-    return [o for o in STATE["orders"].values() if not city or city_of(o) == city]
+    return [o for o in list(STATE["orders"].values()) if not city or city_of(o) == city]
 
 
 NETWORK_CACHE: dict = {}
@@ -230,7 +240,7 @@ def network_now(now: datetime) -> dict:
         return NETWORK_CACHE["data"]
     today = store.network_today(now, rules.plan_grace_min)
     cities = {}
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         c = cities.setdefault(city_of(o), {"live": 0, "waiting": 0, "on_hold": 0, "riders": set(), "red": 0, "amber": 0, "last_event": None})
         if o["phase"] == "on_hold":
             c["on_hold"] += 1
@@ -246,9 +256,9 @@ def network_now(now: datetime) -> dict:
         if le and (c["last_event"] is None or le > c["last_event"]):
             c["last_event"] = le
     sev_by_order = {}
-    for (oid, kind), sev in STATE["sev"].items():
+    for (oid, kind), sev in list(STATE["sev"].items()):
         sev_by_order.setdefault(oid, set()).add(sev)
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         sv = sev_by_order.get(o["id"])
         if sv:
             c = cities.get(city_of(o))
@@ -313,7 +323,7 @@ async def sync_riders(now: datetime):
         return
     if rows and "rider" not in STATE["raw_samples"]:
         STATE["raw_samples"]["rider"] = rows[0]
-    busy_order = {o["rider_id"]: o["id"] for o in STATE["orders"].values() if o["rider_id"]}
+    busy_order = {o["rider_id"]: o["id"] for o in list(STATE["orders"].values()) if o["rider_id"]}
     for u in rows:
         rid = u.get("id")
         if not rid:
@@ -357,7 +367,7 @@ async def sync_orders(now: datetime):
         if o["rider_id"] and o["rider_lat"] is not None:
             tracker.push(o["rider_id"], o["rider_lat"], o["rider_lng"], now)
             store.record_position(o["rider_id"], o["rider_lat"], o["rider_lng"], o["id"], now)
-    for oid in [k for k in STATE["orders"] if k not in seen]:
+    for oid in [k for k in list(STATE["orders"]) if k not in seen]:
         b = await mt.get_booking(oid)
         o = parse_booking(b) if b else None
         if o and o["id"]:
@@ -402,7 +412,7 @@ async def probe_endpoints(now: datetime, quiet: bool = False):
     """Test every MotionTools endpoint once (startup + hourly). Restricted ones are skipped until the next probe."""
     if not mt.enabled:
         return
-    sample_order = next(iter(STATE["orders"].values()), None) or next(iter(store.orders_in("week", now)), None)
+    sample_order = next(iter(list(STATE["orders"].values())), None) or next(iter(store.orders_in("week", now)), None)
     sample_place = next((o.get("place_id") for o in [sample_order] if o and o.get("place_id")), None) \
         or next(iter(projector.places), None)
     sample_rider = (sample_order or {}).get("rider_id") or next(iter(STATE["riders"]), None)
@@ -522,8 +532,8 @@ async def enrich_rider(rid: str, now: datetime = None, force: bool = False) -> b
     if "rider" not in STATE["raw_samples"]:
         STATE["raw_samples"]["rider"] = u
     store.upsert_rider(rid, r["name"] or "Rider", r["phone"], r["online"], r.get("lat"), r.get("lng"),
-                       [o["id"] for o in STATE["orders"].values() if o["rider_id"] == rid], now)
-    for o in STATE["orders"].values():
+                       [o["id"] for o in list(STATE["orders"].values()) if o["rider_id"] == rid], now)
+    for o in list(STATE["orders"].values()):
         if o["rider_id"] == rid and not o["rider"]:
             o["rider"] = r["name"]
     return True
@@ -586,7 +596,7 @@ async def sweep_rider_status(now: datetime):
     if mt.blocked(USER_PATH):
         return
     cutoff = iso(now - timedelta(minutes=30))
-    rids = sorted(rid for rid, r in STATE["riders"].items() if (r.get("last_seen") or "") < cutoff and (r.get("api_status_at") or "") < cutoff)
+    rids = sorted(rid for rid, r in list(STATE["riders"].items()) if (r.get("last_seen") or "") < cutoff and (r.get("api_status_at") or "") < cutoff)
     if not rids:
         return
     changed = False
@@ -604,7 +614,7 @@ async def recheck_offline_riders(now: datetime):
     whether that is still true, at most 6 per run. A wrong 'offline' would otherwise raise a red alert for nothing."""
     if mt.blocked(USER_PATH):
         return
-    holding = {o["rider_id"] for o in STATE["orders"].values() if o["rider_id"] and o["phase"] not in ("on_hold",)}
+    holding = {o["rider_id"] for o in list(STATE["orders"].values()) if o["rider_id"] and o["phase"] not in ("on_hold",)}
     todo = [rid for rid in holding if STATE["riders"].get(rid, {}).get("online") is False][:6]
     changed = False
     for rid in todo:
@@ -622,7 +632,7 @@ async def refresh_live_orders(now: datetime):
     if not tpl or mt.blocked(tpl):
         return
     with_alerts = {k[0] for k in STATE["open_alerts"]}
-    todo = sorted((o for o in STATE["orders"].values() if o["id"] in with_alerts and o["phase"] != "on_hold"),
+    todo = sorted((o for o in list(STATE["orders"].values()) if o["id"] in with_alerts and o["phase"] != "on_hold"),
                   key=lambda o: o.get("dispatched_at") or now)[:5]
     changed = False
     for o in todo:
@@ -688,10 +698,14 @@ def repair_from_events(now: datetime, replayed: dict = None) -> int:
     targets = {o["id"]: o for o in store.orders_in("week", now)}
     targets.update(STATE["orders"])
     n = 0
+    WATCH = tuple(COPY_TIMES) + ("history", "reassigned", "tour_id", "stop_types", "eta_restaurant", "eta_customer", "status", "rider_id", "rider",
+                                 "place_id", "restaurant", "cancelled", "cancel_reason", "phase")
+    store.begin_batch()
     for bid, o in targets.items():
         r = replayed.get(bid)
         if r is None:
             continue
+        before = repr([o.get(k) for k in WATCH])
         finished = o["phase"] in ("delivered", "cancelled", "closed")
         if r.get("partial") and not r.get("history"):
             continue                                        # we saw almost nothing of this order — leave it
@@ -711,8 +725,13 @@ def repair_from_events(now: datetime, replayed: dict = None) -> int:
             o["cancel_reason"] = o.get("cancel_reason") or r.get("cancel_reason") or ""
         if not finished or r["phase"] in ("delivered", "cancelled"):
             o["phase"] = phase_from(r) if not finished else r["phase"]
+        if repr([o.get(k) for k in WATCH]) == before:
+            continue                                        # nothing new for this order — no write
         store.upsert_order(o, now, stacked=bool(o.get("stacked")), force=True)
         n += 1
+        if n % 500 == 0:
+            store.end_batch(); time.sleep(0.05); store.begin_batch()     # commit in chunks, let readers through
+    store.end_batch()
     return n
 
 
@@ -732,7 +751,7 @@ def compute_stacks(now: datetime):
     """Double orders: the rider works one order at a time. The order whose next stop has the earliest ETA is the
     'current' one (fallback: the one further along, then the earlier dispatched); the others are queued behind it."""
     by_rider = {}
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         if o["rider_id"] and o["phase"] in PROGRESS:
             by_rider.setdefault(o["rider_id"], []).append(o)
     stack = {}
@@ -752,11 +771,11 @@ def compute_stacks(now: datetime):
 
 def evaluate_all(now: datetime):
     compute_stacks(now)
-    for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:
+    for key in [k for k in list(STATE["open_alerts"]) if k[0] not in STATE["orders"]]:
         store.resolve_alert(STATE["open_alerts"].pop(key), "order completed", now)
         STATE["sev"].pop(key, None)
         STATE["heads"].pop(key, None)
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         r = STATE["riders"].get(o["rider_id"] or "")
         queued = STATE["stack"].get(o["id"], {}).get("queued", False)
         conds = {c["kind"]: c for c in evaluate(o, now, rules, tracker, r["online"] if r else None, queued=queued)}
@@ -783,8 +802,8 @@ def webhook_watch(now: datetime):
     last = ts(s["last_webhook"]) if s["last_webhook"] else None
     ref = max(STARTED, last) if last else STARTED
     s["silent_min"] = int((now - ref).total_seconds() // 60)
-    live = sum(1 for o in STATE["orders"].values() if o["phase"] not in ("on_hold", "delivered", "cancelled", "closed"))
-    online = sum(1 for r in STATE["riders"].values() if r.get("online"))
+    live = sum(1 for o in list(STATE["orders"].values()) if o["phase"] not in ("on_hold", "delivered", "cancelled", "closed"))
+    online = sum(1 for r in list(STATE["riders"].values()) if r.get("online"))
     hour = now.astimezone(BERLIN).hour
     matters = live > 0 or (online > 0 and 11 <= hour < 23)
     s["webhook_silent"] = s["mode"] == "webhook" and s["silent_min"] >= 15 and matters
@@ -822,7 +841,9 @@ async def evaluate_loop():
         try:
             if DIRTY["events"]:
                 DIRTY["events"] = 0
+                t0 = time.monotonic()
                 evaluate_all(datetime.now(UTC))
+                STATE["eval_ms"] = int((time.monotonic() - t0) * 1000)
         except Exception as e:
             log.exception("evaluate failed: %s", e)
         await asyncio.sleep(2)
@@ -848,10 +869,10 @@ async def post_start(now: datetime):
         log.warning("backup failed: %s", e)
     try:
         replayed = await loop.run_in_executor(None, replay_events)          # pure CPU/file work, off the event loop
-        n = repair_from_events(now, replayed)
+        n = await loop.run_in_executor(None, repair_from_events, now, replayed)   # thousands of rows with all cities — never on the loop
         if n:
-            on_hold = sum(1 for o in STATE["orders"].values() if o["phase"] == "on_hold")
-            for o in [x for x in STATE["orders"].values() if x["phase"] in ("delivered", "cancelled")]:
+            on_hold = sum(1 for o in list(STATE["orders"].values()) if o["phase"] == "on_hold")
+            for o in [x for x in list(STATE["orders"].values()) if x["phase"] in ("delivered", "cancelled")]:
                 projector.finish(o, now)              # finished while we were down -> out of the live board
             store.log("info", f"rebuilt {n} orders of the last 7 days from the stored events ({on_hold} live orders on hold)")
             INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
@@ -926,7 +947,7 @@ async def sync_loop():
                     evaluate_all(now)
                 webhook_watch(now)
                 STATE["sync"]["orders_seen"] = len(STATE["orders"])
-                STATE["sync"]["riders_seen"] = len({o["rider_id"] for o in STATE["orders"].values() if o["rider_id"] and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed")})
+                STATE["sync"]["riders_seen"] = len({o["rider_id"] for o in list(STATE["orders"].values()) if o["rider_id"] and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed")})
                 STATE["sync"]["last_ok"] = iso(now)       # webhook mode is healthy as long as we run
             if mt.enabled and STATE["sync"]["mode"] == "api":
                 await sync_riders(now)
@@ -988,7 +1009,7 @@ async def startup():
                                     "mt_phone": r["phone"] if r["phone"] != projector.phones.get(r["id"]) else "",
                                     "online": bool(r["online"]), "lat": r["lat"], "lng": r["lng"], "active_ids": r["active_ids"],
                                     "persisted": True}
-    for o in STATE["orders"].values():                 # a rider holding a live order is on the road, whatever the DB says
+    for o in list(STATE["orders"].values()):                 # a rider holding a live order is on the road, whatever the DB says
         if o.get("rider_id"):
             r = projector.rider(o["rider_id"], o.get("rider") or "", now)
             if not r.get("online") and o["phase"] not in ("on_hold",):
@@ -1056,19 +1077,12 @@ def process_event(p: dict):
         WAKE.set()
 
 
-from concurrent.futures import ThreadPoolExecutor  # noqa: E402
-EVENT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="events")
-
-
 async def event_worker():
     """Processes queued webhook events one by one; a bad event is logged and skipped, never retried, never fatal."""
-    loop = asyncio.get_event_loop()
     while True:
         p = await EVENT_QUEUE.get()
         try:
-            # off the event loop: with every city streaming GPS, hundreds of events a minute would otherwise
-            # block the HTTP side (the pages felt "very slow" once the Munich filter was removed)
-            await loop.run_in_executor(EVENT_POOL, process_event, p)
+            process_event(p)                      # on the loop (every reader may iterate STATE safely) …
         except Exception as e:
             WEBHOOK_STATS["worker_errors"] += 1
             log.exception("event failed: %s", e)
@@ -1078,8 +1092,7 @@ async def event_worker():
                 pass
         finally:
             EVENT_QUEUE.task_done()
-        if EVENT_QUEUE.qsize() == 0:
-            await asyncio.sleep(0)                                # let HTTP requests through between bursts
+        await asyncio.sleep(0)                    # … but HTTP requests get a turn after EVERY event, also in a burst
 
 
 # ====================================================================== API
@@ -1283,7 +1296,7 @@ async def api_cities_set(request: Request):
     for area, name in (body or {}).items():
         if area and isinstance(name, str) and name.strip():
             store.set_city_name(area, name.strip())
-            for o in STATE["orders"].values():
+            for o in list(STATE["orders"].values()):
                 if o.get("area") == area:
                     o["city"] = name.strip()
     INSIGHTS_CACHE.clear(); PULSE_CACHE.clear(); NETWORK_CACHE.clear()
@@ -1298,7 +1311,7 @@ def api_places():
         pid = o.get("place_id")
         if pid:
             seen[pid] = seen.get(pid, 0) + 1
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         if o.get("place_id"):
             seen.setdefault(o["place_id"], 0)
     return {"places": [{"id": pid, "name": projector.places.get(pid, ""), "orders": n}
@@ -1320,7 +1333,7 @@ async def api_places_set(request: Request):
 def api_riders():
     """Known riders with their phone numbers — MotionTools' number if it sent one, otherwise the one typed in Settings."""
     rows = {r["id"]: r for r in store.riders()}
-    for rid, r in STATE["riders"].items():
+    for rid, r in list(STATE["riders"].items()):
         rows.setdefault(rid, r)
     manual = store.get_settings()
     out = []
@@ -1361,12 +1374,12 @@ async def api_riders_set(request: Request):
 
 
 def rider_names() -> dict:
-    return {rid: (r.get("name") or "") for rid, r in STATE["riders"].items()}
+    return {rid: (r.get("name") or "") for rid, r in list(STATE["riders"].items())}
 
 
 def live_by_rider(city: str = "") -> dict:
     out = {}
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         if o["rider_id"] and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed") and (not city or city_of(o) == city):
             out[o["rider_id"]] = out.get(o["rider_id"], 0) + 1
     return out
@@ -1503,7 +1516,7 @@ async def api_automations_get(recheck: int = 0):
                          "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name, "auto_close": intercom.ic.auto_close},
             "queries": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}", "1") == "1",
                          **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in QUERIES],
-            "cities": {"all": sorted({city_of(o) for o in STATE["orders"].values() if city_of(o)} | set(store.city_map.values()) if hasattr(store, "city_map") else set()),
+            "cities": {"all": sorted({city_of(o) for o in list(STATE["orders"].values()) if city_of(o)} | set(store.city_map.values()) if hasattr(store, "city_map") else set()),
                        "on": sorted(auto_cities_enabled(settings))},
             "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
             "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
@@ -1518,7 +1531,7 @@ def api_automations_diag():
     on = {k: settings.get(f"auto:{k}") == "1" for k, _, _ in AUTOMATIONS}
     riders = STATE["riders"]
     rows, findings = [], []
-    live = [o for o in STATE["orders"].values() if o["phase"] not in ("on_hold", "unassigned", "delivered", "cancelled", "closed") and o.get("rider_id")]
+    live = [o for o in list(STATE["orders"].values()) if o["phase"] not in ("on_hold", "unassigned", "delivered", "cancelled", "closed") and o.get("rider_id")]
     feed = {rid: tracker.has_feed(rid, now) for rid in {o["rider_id"] for o in live}}
     for o in live:
         rid = o["rider_id"]
@@ -1666,7 +1679,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
         o = STATE["orders"].get(oid) or STATE["orders"].get(str(oid).split(":")[0]) or STATE["orders"].get(str(oid).split(":")[-1])
         if o:
             return city_of(o) or ""
-        live = [x for x in STATE["orders"].values() if x.get("rider_id") == rid]
+        live = [x for x in list(STATE["orders"].values()) if x.get("rider_id") == rid]
         return city_of(live[0]) if live else ""
 
     def fire(rule: str, rid: str, name: str, oid: str, ref: str, **vals):
@@ -1745,7 +1758,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
              target=rules.ptod_target_min, plan=hm(planned_at(o)) or "", eta=hm(o.get("eta_customer")) or "")
     # GPS hygiene · nearby offers · slow restaurants
     from orders import haversine_m
-    slow_rests = {o.get("place_id") or o.get("restaurant") for o in STATE["orders"].values()
+    slow_rests = {o.get("place_id") or o.get("restaurant") for o in list(STATE["orders"].values())
                   if o["phase"] == "at_restaurant" and o.get("at_restaurant_at") and (now - o["at_restaurant_at"]).total_seconds() >= 15 * 60}
     for o in list(STATE["orders"].values()):
         rid = o.get("rider_id")
@@ -1771,7 +1784,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
         last = ts(d["last"]); fix = tracker.last_fix(rid)
         if last and (now - last).total_seconds() <= 30 * 60 and fix and (now - fix[0]).total_seconds() < 15 * 60:
             free.append((rid, d.get("name") or riders.get(rid, {}).get("name") or "Rider", fix))
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         if o["phase"] == "unassigned" and o.get("dispatched_at") and (now - o["dispatched_at"]).total_seconds() >= 180 and o.get("pick_lat") is not None:
             near = sorted(((haversine_m(f[1], f[2], o["pick_lat"], o["pick_lng"]), rid, nm) for rid, nm, f in free), key=lambda x: x[0])
             for dist_m, rid, nm in [x for x in near if x[0] <= 1500][:2]:
@@ -1811,7 +1824,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
             fire("no_start", rid, sh.get("rider") or riders.get(rid, {}).get("name") or "Rider", f"shift:{today}:2", "", start=sh["start"])
     # R4 idle 45′ while an order waits ≥3′ for a rider in the same city
     waiting = {}
-    for o in STATE["orders"].values():
+    for o in list(STATE["orders"].values()):
         if o["phase"] == "unassigned" and o.get("dispatched_at") and (now - o["dispatched_at"]).total_seconds() >= 180:
             waiting.setdefault(city_of(o), []).append(o)
     if waiting:
@@ -1852,7 +1865,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
 
 
 def _rider_live_order(rid: str):
-    mine = [o for o in STATE["orders"].values() if o.get("rider_id") == rid and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed")]
+    mine = [o for o in list(STATE["orders"].values()) if o.get("rider_id") == rid and o["phase"] not in ("on_hold", "delivered", "cancelled", "closed")]
     rank = {"at_customer": 0, "to_customer": 1, "at_restaurant": 2, "to_restaurant": 3, "accepted": 4}
     mine.sort(key=lambda o: rank.get(o["phase"], 9))
     return mine[0] if mine else None
@@ -1924,7 +1937,7 @@ def _riders_on(o) -> list:
 
 
 def _others(rid: str, o) -> str:
-    mine = [x for x in STATE["orders"].values() if x.get("rider_id") == rid and x["phase"] not in ("on_hold", "delivered", "cancelled", "closed") and x is not o]
+    mine = [x for x in list(STATE["orders"].values()) if x.get("rider_id") == rid and x["phase"] not in ("on_hold", "delivered", "cancelled", "closed") and x is not o]
     return ", ".join(f"{x.get('ref')} ({PHASE_LABEL.get(x['phase'], x['phase'])})" for x in mine) or "none"
 
 
@@ -1965,7 +1978,7 @@ async def city_names_loop():
     while True:
         try:
             areas = {}
-            for o in STATE["orders"].values():
+            for o in list(STATE["orders"].values()):
                 a = o.get("area")
                 if not a or store.city_map.get(a):
                     continue
@@ -1980,7 +1993,7 @@ async def city_names_loop():
                         name = ad.get("city") or ad.get("town") or ad.get("municipality") or ad.get("village") or ad.get("county") or ""
                         if name:
                             store.set_city_name(a, name)
-                            for o in STATE["orders"].values():
+                            for o in list(STATE["orders"].values()):
                                 if o.get("area") == a:
                                     o["city"] = name
                             store.log("info", f"city named from the map: {a[:8]}… = {name}")
@@ -2276,7 +2289,7 @@ async def api_delete_day(request: Request):
     res = store.delete_day(day, now, dry_run=bool(body.get("dry_run")), city=str(body.get("city") or ""))
     if res["deleted"]:
         INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
-        for key in [k for k in STATE["open_alerts"] if k[0] not in STATE["orders"]]:   # alerts of deleted orders
+        for key in [k for k in list(STATE["open_alerts"]) if k[0] not in STATE["orders"]]:   # alerts of deleted orders
             STATE["open_alerts"].pop(key, None); STATE["sev"].pop(key, None); STATE["heads"].pop(key, None)
         if STATE["sync"]["last_snapshot"] == day:
             STATE["sync"]["last_snapshot"] = None
@@ -2293,7 +2306,7 @@ def api_intercom_customer(request: Request, ref: str = "", key: str = ""):
     if not secrets.compare_digest(given, PATH_SECRET):
         raise HTTPException(404)
     ref = (ref or "").strip().upper()
-    o = next((x for x in STATE["orders"].values() if (x.get("ref") or "").upper() == ref), None) or (store.order_by_ref(ref) if ref else None)
+    o = next((x for x in list(STATE["orders"].values()) if (x.get("ref") or "").upper() == ref), None) or (store.order_by_ref(ref) if ref else None)
     if o is None:
         return {"found": False, "ref": ref, "phone": "", "address": "", "message": f"order {ref} not found"}
     return {"found": True, "ref": o["ref"], "phone": o.get("customer_phone") or "", "address": o.get("customer_addr") or "",
@@ -2309,7 +2322,7 @@ async def api_intercom_customer_fetch(request: Request, ref: str = "", key: str 
     if not secrets.compare_digest(given, PATH_SECRET):
         raise HTTPException(404)
     ref = (ref or "").strip().upper()
-    o = next((x for x in STATE["orders"].values() if (x.get("ref") or "").upper() == ref), None) or (store.order_by_ref(ref) if ref else None)
+    o = next((x for x in list(STATE["orders"].values()) if (x.get("ref") or "").upper() == ref), None) or (store.order_by_ref(ref) if ref else None)
     if o is not None and not o.get("customer_phone") and mt.enabled:
         await enrich_order(o["id"])
         store.log("info", f"customer number of {ref} looked up for the Intercom bot")
@@ -2386,7 +2399,7 @@ intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
 @app.post("/api/intercom/match-riders", dependencies=[Depends(require_login)])
 async def api_intercom_match_riders():
     """Settings: match every known rider with Intercom once (profile link → phone → name) and keep the usernames."""
-    riders = [{"rider_id": rid, "name": r.get("name") or "", "phone": r.get("phone") or ""} for rid, r in STATE["riders"].items()]
+    riders = [{"rider_id": rid, "name": r.get("name") or "", "phone": r.get("phone") or ""} for rid, r in list(STATE["riders"].items())]
     for r in store.riders():
         if r["id"] not in STATE["riders"]:
             riders.append({"rider_id": r["id"], "name": r.get("name") or "", "phone": r.get("phone") or ""})
