@@ -146,14 +146,16 @@ def housekeeping(now: datetime, startup: bool = False):
         log.warning("archive failed: %s", e)
     rep = disk_report()
     quiet = not (11 <= now.astimezone(BERLIN).hour < 23)        # VACUUM locks the database for seconds — never at peak
-    if quiet and rep["free_mb"] > rep["db_mb"] * 1.3 + 20 and (startup or rep["pct"] and rep["pct"] >= 70):
+    # never at startup: with every city in the DB a VACUUM takes minutes and every request waits on the lock,
+    # which looked like "connecting…" after each deploy — only when the volume is really filling up (≥ 70 %)
+    if quiet and not startup and rep["free_mb"] > rep["db_mb"] * 1.3 + 20 and rep["pct"] and rep["pct"] >= 70:
         if store.vacuum():
             rep = disk_report()
     store.log("info", f"housekeeping: freed {freed / 1e6:.0f} MB of event files · DB {rep['db_mb']} MB · volume {rep['used_mb']}/{rep['total_mb']} MB ({rep['pct']}%)")
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5.2"
+VERSION = "6.5.3"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -836,6 +838,9 @@ async def post_start(now: datetime):
         log.exception("housekeeping failed: %s", e)
     try:
         backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
+        recent = [b for b in DATA_DIR.glob("quickzi-backup-*.db") if now.timestamp() - b.stat().st_mtime < 6 * 3600]
+        if recent:
+            raise RuntimeError("skipped — a backup from the last 6 h exists (restarts must not copy the DB every time)")
         await loop.run_in_executor(None, store.backup_to, str(backup))
         for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db"))[:-3]:
             old_b.unlink(missing_ok=True)
@@ -2408,7 +2413,7 @@ async def api_intercom_match_riders():
 
 
 @app.get("/health")
-def health():
+async def health():                                           # async: answers even when every worker thread waits on the DB
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-5:], "automation_error": STATE.get("auto_last_error", ""),
