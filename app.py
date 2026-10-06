@@ -151,7 +151,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.4.1"
+VERSION = "6.4.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1467,7 +1467,7 @@ async def api_automations_get(recheck: int = 0):
                        **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
                          "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name},
-            "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "23:30–09:00", "daily_cap": AUTO_DAILY_CAP}
+            "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(40), "quiet_hours": "", "daily_cap": 0}
 
 
 @app.get("/api/automations/diag", dependencies=[Depends(require_login)])
@@ -1601,11 +1601,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
     def fire(rule: str, rid: str, name: str, oid: str, ref: str, **vals):
         why = ""
         if (rule, rid, oid) in sent_keys:
-            why = "already sent for this order in the last 26 h"
-        elif rule != "scorecard" and cap.get(rid, 0) >= AUTO_DAILY_CAP:
-            why = f"rider already got {AUTO_DAILY_CAP} messages today"
-        elif quiet and rule not in ("late_plan", "not_started"):
-            why = "quiet hours"
+            why = "already sent for this order"            # the only guard left: the same text never repeats on one order
         elif not on.get(rule):
             why = "rule switched off"
         elif not live_mode:
