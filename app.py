@@ -20,6 +20,7 @@ import os
 import secrets
 import shutil
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean
@@ -152,7 +153,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.5"
+VERSION = "6.5.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -164,6 +165,22 @@ store.plan_grace = rules.plan_grace_min
 store.wait_restaurant_min = rules.wait_restaurant_min
 tracker = RiderTracker()
 app = FastAPI()
+
+
+@app.middleware("http")
+async def _slow_request_log(request: Request, call_next):
+    """Anything slower than 2 s is written to the system log with its path — Settings → System shows it."""
+    t0 = time.monotonic()
+    resp = await call_next(request)
+    dt = time.monotonic() - t0
+    if dt > 2 and not request.url.path.startswith("/mt/"):
+        STATE.setdefault("slow", []).append({"at": iso(datetime.now(UTC)), "path": request.url.path, "s": round(dt, 1)})
+        del STATE["slow"][:-30]
+        try:
+            store.log("warning", f"slow request: {request.url.path} took {dt:.1f} s")
+        except Exception:
+            pass
+    return resp
 app.add_middleware(GZipMiddleware, minimum_size=2000)      # /api/state at peak is ~150 KB -> ~15 KB on the wire
 basic = HTTPBasic()
 
@@ -1033,12 +1050,19 @@ def process_event(p: dict):
         WAKE.set()
 
 
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+EVENT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="events")
+
+
 async def event_worker():
     """Processes queued webhook events one by one; a bad event is logged and skipped, never retried, never fatal."""
+    loop = asyncio.get_event_loop()
     while True:
         p = await EVENT_QUEUE.get()
         try:
-            process_event(p)
+            # off the event loop: with every city streaming GPS, hundreds of events a minute would otherwise
+            # block the HTTP side (the pages felt "very slow" once the Munich filter was removed)
+            await loop.run_in_executor(EVENT_POOL, process_event, p)
         except Exception as e:
             WEBHOOK_STATS["worker_errors"] += 1
             log.exception("event failed: %s", e)
