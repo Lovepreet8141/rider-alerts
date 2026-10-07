@@ -23,6 +23,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 7.0.2 — the last start-up pauses from /health
+- No forced garbage collection after reports (a full collection on a big heap paused every thread, the event loop
+  included, for up to 5 s); long-lived start-up data is frozen out of the collector (`gc.freeze`).
+- Settings are kept in memory (read on every rider message and every minute) and refreshed on every change.
+- Settings → System "delete day" and the shift-sheet upload run in a worker thread (delete-day held the server 5 s).
+- Naming a city relabels its stored orders in the background, in slices.
+- Restart test (10 000 orders/day copy): webhook p99 < 0.3 s during the start-up repair, longest pause 0.6 s, 0 failures.
+
 ## 7.0.1 — the 74-second freeze found by the watchdog
 - The watchdog named it: the Intercom page's "Conversations in progress" looked up each rider's order by parsing
   EVERY order of the day (all cities) — once per rider, on the event loop → server frozen 74 s.

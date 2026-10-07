@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "7.0.1"
+VERSION = "7.0.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -370,6 +370,8 @@ def json_bytes_response(obj) -> _Response:
 _RCACHE: dict = {}
 _RLOCKS: dict = {}
 _HEAVY = threading.Semaphore(2)
+import gc as _gc
+_gc.set_threshold(20000, 20, 50)     # young collections less often (each one pauses the event loop too)
 _LAST_TRIM = [0.0]
 
 
@@ -381,9 +383,7 @@ def _trim_memory():
     _LAST_TRIM[0] = time.monotonic()
     try:
         import ctypes
-        import gc
-        gc.collect()
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        ctypes.CDLL("libc.so.6").malloc_trim(0)       # releases the GIL; a full gc.collect() here froze the loop for 5 s
     except Exception:
         pass
 import sys as _sys
@@ -1017,8 +1017,19 @@ async def evaluate_loop():
         await asyncio.sleep(2)
 
 
+def _gc_freeze():
+    """Everything loaded at start-up (today's orders, riders, caches) lives for hours: move it out of the garbage
+    collector's view, so its full collections — which pause every thread, the event loop included — stay short."""
+    try:
+        import gc
+        gc.freeze()
+    except Exception:
+        pass
+
+
 def prewarm_reports():
     """After a start, compute the reports people open first (all cities + the default city), one after another."""
+    _gc_freeze()
     for c in ("", CITY):
         for call in (lambda: api_fleets(period="week", city=c), lambda: api_insights(period="today", city=c),
                      lambda: api_insights(period="week", city=c), lambda: api_riders_page(period="today", city=c, fleet=""),
@@ -2607,9 +2618,11 @@ async def api_shifts_import(request: Request):
             pass
     if not text.strip():
         raise HTTPException(400, "empty upload")
-    res = store.shifts_import(text, datetime.now(UTC), rider_names())
+    from starlette.concurrency import run_in_threadpool
+    names = rider_names()
+    res = await run_in_threadpool(store.shifts_import, text, datetime.now(UTC), names)
     if res.get("ok"):
-        store.shifts_relink(rider_names())
+        await run_in_threadpool(store.shifts_relink, names)
         PAGE_CACHE.clear()
     return res
 
@@ -2846,7 +2859,8 @@ async def api_delete_day(request: Request):
     if not (len(day) == 10 and day[4] == "-" and day[7] == "-"):
         raise HTTPException(400, "day must be YYYY-MM-DD")
     now = datetime.now(UTC)
-    res = store.delete_day(day, now, dry_run=bool(body.get("dry_run")), city=str(body.get("city") or ""))
+    from starlette.concurrency import run_in_threadpool
+    res = await run_in_threadpool(store.delete_day, day, now, bool(body.get("dry_run")), str(body.get("city") or ""))   # was 5 s on the loop
     if res["deleted"]:
         INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
         for key in [k for k in list(STATE["open_alerts"]) if k[0] not in STATE["orders"]]:   # alerts of deleted orders

@@ -224,8 +224,15 @@ class Store:
     def set_city_name(self, area_id: str, name: str):
         self.city_map[area_id] = name
         self.set_settings({f"city:{area_id}": name})
-        self._exec("UPDATE orders SET city=? WHERE area=?", (name, area_id))
-        self._exec("UPDATE riders SET city=? WHERE city=? OR city=?", (name, area_id[:8], area_id))
+
+        def relabel():          # every stored order of that area: in slices, in the background (was one UPDATE on the loop)
+            try:
+                self._chunked("UPDATE orders SET city=? WHERE rowid IN (SELECT rowid FROM orders WHERE area=? AND (city IS NULL OR city != ?) LIMIT 2000)",
+                              (name, area_id, name))
+                self._exec("UPDATE riders SET city=? WHERE city=? OR city=?", (name, area_id[:8], area_id))
+            except Exception:
+                pass
+        threading.Thread(target=relabel, daemon=True).start()
 
     def set_fleet(self, rider_id: str, fleet: str):
         self.fleet_map[rider_id] = fleet
@@ -305,12 +312,20 @@ class Store:
         return self._rows("SELECT * FROM syslog ORDER BY id DESC LIMIT ?", (n,))
 
     def get_settings(self) -> dict:
-        return {r["key"]: r["value"] for r in self._rows("SELECT key, value FROM settings")}
+        """Kept in memory (it is read on every rider message and every minute by the automations); every change goes
+        through set_settings, which refreshes it."""
+        c = getattr(self, "_settings_cache", None)
+        if c is not None and time.monotonic() - c[0] < 30:
+            return dict(c[1])
+        data = {r["key"]: r["value"] for r in self._rows("SELECT key, value FROM settings")}
+        self._settings_cache = (time.monotonic(), data)
+        return dict(data)
 
     def set_settings(self, values: dict):
         for k, v in values.items():
             self._exec("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        (k, str(v)))
+        self._settings_cache = None
 
     # ================================================================ orders
     def upsert_order(self, o: dict, now: datetime, stacked: bool, force: bool = False):
