@@ -23,6 +23,15 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.6.2 — the bot stops talking when a person takes over
+
+- Once a conversation is forwarded to a person, the bot stays silent in it for 3 hours (only accident/injury still adds an urgent note).
+- The bot never sends the same answer twice within 30 min — if the rider insists, the conversation goes to a person.
+- "How can we help?" at most once per rider per 3 hours, and never when the rider already wrote a full sentence.
+- Riders talking about an order they just finished (photo won't upload, "complete this order") are matched to it.
+- Optional: set `ANTHROPIC_API_KEY` in Railway and messages the keyword rules can't place (any language) are
+  classified by Claude Haiku into one of the known situations. Without the key nothing changes.
+
 ## 6.6 — per-rule cities, riders matched automatically, faster with all cities
 
 - Each rule has its own 🏙 city picker on the Intercom page (empty = the default list / all cities). Rider

@@ -63,6 +63,7 @@ class Intercom:
         self._link_attr = None           # resolved lazily: the "Worker dashboard profile link" attribute
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
         self.rider_known = None          # rider_id -> bool (is this a MotionTools rider id the dashboard knows?)
+        self.on_unknown = None           # (contact_id, name, text) -> a rider wrote whom we cannot map to MotionTools
         self.on_incoming = None          # (rider_id, text, conversation_id) -> the app answers common questions
         self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
         self.auto_close = False          # close automatic conversations after sending (Settings; off = stay open until a rider replies)
@@ -480,9 +481,14 @@ class Intercom:
             return ext
         return ""
 
-    async def _resolve_then_dispatch(self, cid: str, contact: dict, conv_id: str, body, at, has_photo: bool):
+    async def _resolve_then_dispatch(self, cid: str, contact: dict, conv_id: str, body, at, has_photo: bool, tags=None):
         rid = await self.rider_of_contact(cid, contact)
         if not rid:
+            if self.on_unknown:
+                try:
+                    self.on_unknown(cid, (contact or {}).get("name") or (contact or {}).get("email") or cid, _text(body or ""))
+                except Exception:
+                    pass
             return
         t = self.thread(rid, (contact or {}).get("name") or "Rider")
         t["contact_id"], t["contact_src"] = cid, "link"
@@ -498,7 +504,7 @@ class Intercom:
                 pass
         if self.on_incoming:
             try:
-                self.on_incoming(rid, _text(body or ""), conv_id, False, has_photo)
+                self.on_incoming(rid, _text(body or ""), conv_id, False, has_photo, tags)
             except Exception:
                 pass
 
@@ -513,6 +519,7 @@ class Intercom:
         contact = contacts[0] if contacts else {}
         cid, ext = contact.get("id") or "", contact.get("external_id") or ""
         parts = ((item.get("conversation_parts") or {}).get("conversation_parts")) or []
+        tags = [t.get("name") for t in ((item.get("tags") or {}).get("tags") or []) if isinstance(t, dict)]
         user_parts = [p for p in parts if (p.get("author") or {}).get("type") in ("user", "lead", "contact")]
         if user_parts:
             body, author, at = user_parts[-1].get("body"), user_parts[-1].get("author") or {}, user_parts[-1].get("created_at")
@@ -529,7 +536,7 @@ class Intercom:
             rid = ext[6:] if ext.startswith("rider:") else (ext if ext and not ext.startswith("contact:") and self.rider_known and self.rider_known(ext) else f"contact:{cid}")
             if rid.startswith("contact:") and cid:
                 # a rider we never messaged writes first: find him through his MotionTools profile link, then answer
-                asyncio.create_task(self._resolve_then_dispatch(cid, contact, conv_id, body, at, has_photo))
+                asyncio.create_task(self._resolve_then_dispatch(cid, contact, conv_id, body, at, has_photo, tags))
                 return True
             t = self.thread(rid, author.get("name") or contact.get("name") or "Rider")
             t["contact_id"] = cid
@@ -540,7 +547,7 @@ class Intercom:
         self._save()
         if self.on_incoming and not str(t["rider_id"]).startswith("contact:"):
             try:
-                self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"), has_photo)
+                self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"), has_photo, tags)
             except Exception:
                 pass
         return True

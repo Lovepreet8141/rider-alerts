@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.6"
+VERSION = "6.6.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1875,6 +1875,48 @@ def _rider_live_order(rid: str):
     return mine[0] if mine else None
 
 
+def _rider_recent_order(rid: str):
+    """The order a rider is most likely talking about: his live one, else the one he finished in the last 90 min
+    (a rider who 'forgot to finish' or whose photo won't upload is often already marked delivered)."""
+    o = _rider_live_order(rid)
+    if o:
+        return o
+    cut = datetime.now(UTC) - timedelta(minutes=90)
+    mine = [x for x in list(STATE["orders"].values()) if x.get("rider_id") == rid and (x.get("delivered_at") or x.get("at_customer_at") or x.get("picked_up_at") or cut) >= cut]
+    if not mine:
+        try:
+            mine = [x for x in store.orders_in("today", datetime.now(UTC)) if x.get("rider_id") == rid and (x.get("delivered_at") or cut) >= cut]
+        except Exception:
+            mine = []
+    mine.sort(key=lambda x: x.get("delivered_at") or x.get("at_customer_at") or x.get("dispatched_at") or cut, reverse=True)
+    return mine[0] if mine else None
+
+
+ANTHROPIC_KEY = env("ANTHROPIC_API_KEY", "")
+SMART_INTENTS = ("not_ready", "closed", "no_order", "cant_deliver", "customer_unreachable", "customer_phone", "customer_find",
+                 "customer_problem", "forgot_finish", "damaged", "ack", "excuse", "urgent", "other")
+
+
+async def smart_intent(text: str, o) -> str:
+    """Optional (ANTHROPIC_API_KEY set in Railway): a message the keyword rules can't place is classified by Claude —
+    any language, any spelling. Only picks one of the known situations; never writes the reply itself."""
+    if not ANTHROPIC_KEY or not (text or "").strip():
+        return ""
+    import httpx
+    ctx = f"Rider's current order status: {PHASE_LABEL.get(o['phase'], o['phase'])}" if o else "Rider has no live order."
+    prompt = (f"A food-delivery rider wrote this to dispatch support:\n\"{text[:500]}\"\n{ctx}\n\n"
+              f"Which ONE situation is it? Answer with exactly one of: {', '.join(SMART_INTENTS)}.\n"
+              "not_ready=restaurant food not ready; closed=restaurant closed; no_order=restaurant has no such order/another rider took it; "
+              "cant_deliver=rider can't do the delivery; customer_unreachable=can't reach/contact customer; customer_phone=wants customer number; "
+              "customer_find=can't find address/entrance; customer_problem=customer refuses/complains; forgot_finish=order must be completed/closed in the app, photo upload fails; "
+              "damaged=order damaged; ack=ok/thanks/arrived; excuse=delay explanation; urgent=accident/injury/police; other=anything else.")
+    async with httpx.AsyncClient(timeout=8) as cli:
+        r = await cli.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                           json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]})
+        word = "".join(b.get("text", "") for b in (r.json().get("content") or [])).strip().lower().split()[0:1]
+    return word[0] if word and word[0] in SMART_INTENTS and word[0] != "other" else ""
+
+
 def auto_cities_enabled(settings: dict = None) -> set:
     """Cities that receive automatic messages; empty = all cities (Intercom page → Cities)."""
     raw = (settings or store.get_settings()).get("auto_cities") or ""
@@ -1955,17 +1997,17 @@ def _others(rid: str, o) -> str:
 
 
 flows = RiderFlows(store)
-flows.deps = {"order_for": _rider_live_order, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
+flows.deps = {"order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
               "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
 
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
 
 
-async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False):
+async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
     """A rider wrote to us (Intercom webhook): the flow engine answers what it can and forwards the rest with context."""
     now = datetime.now(UTC)
-    o = _rider_live_order(rid)
-    intent = classify(text, has_photo)
+    o = _rider_recent_order(rid)
+    intent = classify(text, has_photo, tags)
     if o is not None and intent in CUSTOMER_INTENTS and not o.get("customer_phone"):
         try:
             await enrich_order(o["id"], now)
@@ -1975,7 +2017,7 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
     last_ops = next((m for m in reversed(msgs) if m.get("from") == "ops"), None)
     last_ops_auto = bool(last_ops and last_ops.get("auto") and now.timestamp() - (last_ops.get("at") or 0) < 3600)
     try:
-        result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto)
+        result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags)
         store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {intent} → {result}")
     except Exception as e:
         log.exception("rider reply failed: %s", e)
@@ -2435,7 +2477,9 @@ def _remember_intercom(rid: str, c: dict):
 
 intercom.ic.on_match = _remember_intercom
 intercom.ic.rider_known = lambda rid: rid in STATE["riders"] or bool(store.get_settings().get(f"intercom_user:{rid}"))
-intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False, has_photo=False: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto, has_photo))
+intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False, has_photo=False, tags=None: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto, has_photo, tags))
+intercom.ic.on_unknown = lambda cid, name, text: (store.auto_log(datetime.now(UTC), "reply:unknown_rider", f"contact:{cid}", name, "", "", f"{text[:160]} — no MotionTools profile link on this Intercom contact, not answered", "failed", "rider not matched"),
+                                                   store.log("warning", f"Intercom: '{name}' wrote but has no MotionTools profile link — not answered"))
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
 intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
 

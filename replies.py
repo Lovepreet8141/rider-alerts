@@ -83,8 +83,10 @@ NOT_READY = ("not ready", "nicht fertig", "noch nicht", "not prepared", "prepari
              "hazır değil", "hazir degil", "غير جاهز", "ليس جاهز", "لم يجهز", "order is not", "bestellung ist nicht", "still waiting", "noch warten")
 READY = ("ready now", "jetzt fertig", "ist fertig", "is ready", "order ready", "bestellung fertig", "picked up", "abgeholt", "habs", "hab es", "got it", "have it", "got the order", "habe die bestellung", "on my way now", " ready", " fertig")
 NOT_READY_GUARD = ("not ready", "nicht fertig", "isn't ready", "isnt ready", "no ready", "not yet ready", "noch nicht fertig", "ready nahi")
-FORGOT_CTX = ("order", "bestellung", "app", "finish", "complete", "abschließ", "abschliess", "finaliz", "deliver", "liefer", "mark")
-FORGOT = ("forgot", "vergessen", "finish the order", "complete the order", "abschließen", "abschliessen", "close the order", "mark delivered", "als geliefert",
+FORGOT_CTX = ("order", "bestellung", "auftrag", "app", "finish", "complete", "abschließ", "abschliess", "finaliz", "deliver", "liefer", "mark", "photo", "foto", "bild", "upload")
+FORGOT = ("forgot", "vergessen", "finish the order", "complete the order", "complete this order", "complete order", "complete my order", "finish this order",
+          "finish order", "close this order", "end the order", "order complete", "photo not upload", "not getting upload", "not uploading", "can't upload", "cant upload",
+          "cannot upload", "upload nahi", "foto geht nicht", "foto lädt nicht", "bild lädt nicht", "auftrag abschließen", "beenden", "abschluss", "abschließen", "abschliessen", "close the order", "mark delivered", "als geliefert",
           "finalize", "finalise", "bhool", "نسيت", "unuttum", "not completed", "nicht abgeschlossen", "cannot complete", "can't complete")
 DAMAGED = ("damaged", "beschädigt", "beschaedigt", "kaputt", "spilled", "verschüttet", "verschuettet", "ausgelaufen", "leaking", "leak", "broken", "zerbrochen",
            "تالف", "hasarlı", "hasarli", "fell", "runtergefallen", "squashed")
@@ -131,7 +133,40 @@ def _has_word(low: str, words) -> bool:
     return False
 
 
-def classify(text: str, has_photo: bool = False) -> str:
+TAG_INTENTS = {
+    "not_ready": "not_ready", "order_not_ready": "not_ready", "notready": "not_ready", "order not ready": "not_ready", "not ready": "not_ready",
+    "closed": "closed", "restaurant_closed": "closed", "restaurant closed": "closed",
+    "no_order": "no_order", "already_taken": "no_order", "no order": "no_order",
+    "cant_deliver": "cant_deliver", "cannot_deliver": "cant_deliver", "can't do the delivery": "cant_deliver", "cant deliver": "cant_deliver", "i can't do the delivery": "cant_deliver",
+    "customer_unreachable": "customer_unreachable", "customer unreachable": "customer_unreachable", "cannot contact customer": "customer_unreachable",
+    "i cannot get in touch with the customer": "customer_unreachable", "customer not reachable": "customer_unreachable", "cant reach customer": "customer_unreachable",
+    "customer_phone": "customer_phone", "customer number": "customer_phone", "phone": "customer_phone",
+    "customer_find": "customer_find", "wrong address": "customer_find", "cant find": "customer_find",
+    "customer_problem": "customer_problem", "customer doesn't accept the order": "customer_problem", "customer refuses": "customer_problem", "customer problem": "customer_problem",
+    "forgot_finish": "forgot_finish", "forgot": "forgot_finish", "i forgot to finish the order on the app": "forgot_finish", "forgot to complete": "forgot_finish",
+    "damaged": "damaged", "order_damaged": "damaged", "order is damaged": "damaged",
+    "other": "other",
+}
+
+
+def intent_from_tags(tags) -> str:
+    """Intercom tags set by the workflow buttons (language-independent): 'q:not_ready', 'customer_unreachable', …"""
+    for t in tags or []:
+        name = str(t.get("name") if isinstance(t, dict) else t).strip().lower()
+        name = name[2:] if name.startswith("q:") else name
+        name = name.replace("-", "_") if "_" in name.replace("-", "_") and " " not in name else name
+        if name in TAG_INTENTS:
+            return TAG_INTENTS[name]
+        key = name.replace("_", " ")
+        if key in TAG_INTENTS:
+            return TAG_INTENTS[key]
+    return ""
+
+
+def classify(text: str, has_photo: bool = False, tags=None) -> str:
+    tagged = intent_from_tags(tags)
+    if tagged:
+        return tagged
     low = f" {(text or '').strip().lower()} "
     if has_photo and len(low.strip()) < 3:
         return "photo"
@@ -200,6 +235,10 @@ class RiderFlows:
     def __init__(self, store):
         self.store = store
         self.state: dict = {}
+        self.handover: dict = {}        # conversation id -> time it was handed to a person: the bot stays silent there
+        self.asked_other: dict = {}     # rider id -> time we last asked "how can we help?"
+        self.sent_keys: dict = {}       # rider id -> {query key: time sent}
+        self._last: dict = {}           # rider id -> his last message
         self.deps: dict = {}
         self._load()
 
@@ -208,12 +247,38 @@ class RiderFlows:
         try:
             raw = self.store.get_settings().get("rider_flows") or "{}"
             self.state = json.loads(raw)
+            self.handover = json.loads(self.store.get_settings().get("rider_handover") or "{}")
         except Exception:
             self.state = {}
 
+    HANDOVER_H = 3                      # hours the bot keeps out of a conversation a person has taken
+
+    def handed_over(self, conv: str) -> bool:
+        t = self.handover.get(conv or "")
+        return bool(t and time.time() - t < self.HANDOVER_H * 3600)
+
+    async def _send(self, rid, conv, key, o, **fmt):
+        """Never say the same thing twice: if this answer already went to the rider in the last 30 min, he is
+        clearly not helped by it — a person takes over instead of the bot repeating itself."""
+        last = self.sent_keys.setdefault(rid, {})
+        if key in last and time.time() - last[key] < 30 * 60 and key not in ("q:not_ready_check",):
+            await self._fwd(rid, conv, f"🔁 rider is not helped by our automatic answer ({key[2:].replace('_', ' ')}) — please reply personally.\nRider: {self.state.get(rid, {}).get('last') or self._last.get(rid, '')}", o=o)
+            return False
+        last[key] = time.time()
+        await self.deps["send"](rid, conv, key, o, **fmt)
+        return True
+
+    async def _fwd(self, rid, conv, note, urgent=False, o=None):
+        """Forward to a person and step back: from now on that person owns the conversation."""
+        await self.deps["forward"](rid, conv, note, urgent=urgent, o=o)
+        if conv:
+            self.handover[conv] = time.time()
+            self._save()
+
     def _save(self):
         try:
-            self.store.set_settings({"rider_flows": json.dumps(self.state)[:60000]})
+            self.handover = {c: t for c, t in self.handover.items() if time.time() - t < self.HANDOVER_H * 3600}
+            self.store.set_settings({"rider_flows": json.dumps(self.state)[:60000], "rider_handover": json.dumps(self.handover)[:30000]})
         except Exception:
             pass
 
@@ -244,18 +309,34 @@ class RiderFlows:
         return self.deps["settings"]().get(f"auto:{key}", "1") == "1"
 
     # ---- a rider wrote to us
-    async def on_message(self, rid: str, text: str, conv: str, in_auto: bool = False, has_photo: bool = False, last_ops_auto: bool = False) -> str:
+    async def on_message(self, rid: str, text: str, conv: str, in_auto: bool = False, has_photo: bool = False, last_ops_auto: bool = False, tags=None) -> str:
         d = self.deps
         o = d["order_for"](rid)
-        intent = classify(text, has_photo)
+        intent = classify(text, has_photo, tags)
         st = self.state.get(rid)
+        self._last[rid] = (text or "")[:200]
         if st:
             st["conv"], st["last"] = conv, (text or "")[:120]
         ctx = f"{INTENT_LABEL.get(intent, intent)}"
         d["log"](rid, o, f"reply:{intent}", (text or "📷 photo")[:200])
 
+        if self.handed_over(conv):
+            if intent == "urgent":
+                await self._fwd(rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
+                return "urgent note added (person already on it)"
+            self.clear(rid)
+            return "silent — a person has this conversation"
+
+        if intent == "other" and d.get("smart"):
+            try:
+                guess = await d["smart"](text, o)
+                if guess:
+                    intent = guess
+            except Exception:
+                pass
+
         if intent == "urgent":
-            await d["forward"](rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
+            await self._fwd(rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
             self.clear(rid)
             return "forwarded urgent"
 
@@ -266,15 +347,15 @@ class RiderFlows:
                 if intent == "minutes":
                     n = int(NUM_RE.match(text).group(1))
                     n = max(1, min(n, 60))
-                    await d["send"](rid, conv, "q:not_ready_minutes", o, n=n)
+                    await self._send(rid, conv, "q:not_ready_minutes", o, n=n)
                     self.set(rid, "not_ready", "wait", n, conv=conv, asked=0, persuaded=st.get("persuaded", False), ref=(o or {}).get("ref", ""))
                     return f"waiting {n} min"
                 if intent in ("yes", "ack") and step != "persuade":
-                    await d["send"](rid, conv, "q:not_ready_ok", o)
+                    await self._send(rid, conv, "q:not_ready_ok", o)
                     self.set(rid, "not_ready", "wait", 10, conv=conv, asked=st.get("asked", 0), persuaded=st.get("persuaded", False), ref=(o or {}).get("ref", ""))
                     return "rider waits"
                 if intent == "yes" and step == "persuade":
-                    await d["send"](rid, conv, "q:not_ready_ok", o)
+                    await self._send(rid, conv, "q:not_ready_ok", o)
                     self.set(rid, "not_ready", "wait", 10, conv=conv, asked=0, persuaded=True, ref=(o or {}).get("ref", ""))
                     return "rider gives 10 more minutes"
                 if intent == "ready":
@@ -282,21 +363,21 @@ class RiderFlows:
                     return "ready — flow closed"
                 if intent in ("no", "cant_deliver"):
                     if not st.get("persuaded") and self.on("q:persuade"):
-                        await d["send"](rid, conv, "q:persuade", o)
+                        await self._send(rid, conv, "q:persuade", o)
                         self.set(rid, "not_ready", "persuade", 3, conv=conv, persuaded=True, asked=st.get("asked", 0), ref=(o or {}).get("ref", ""))
                         return "asked for 10 more minutes"
-                    await d["forward"](rid, conv, f"⚠ wants to hand back {(o or {}).get('ref', '')} — waiting at {(o or {}).get('restaurant', 'the restaurant')} for {self._wait_min(o)} min.\nRider: {text[:300]}", urgent=True, o=o)
+                    await self._fwd(rid, conv, f"⚠ wants to hand back {(o or {}).get('ref', '')} — waiting at {(o or {}).get('restaurant', 'the restaurant')} for {self._wait_min(o)} min.\nRider: {text[:300]}", urgent=True, o=o)
                     self.clear(rid)
                     return "forwarded: wants to hand back"
                 if intent in ("not_ready", "excuse", "other", "photo"):
                     if step == "persuade":
-                        await d["forward"](rid, conv, f"⚠ reply to our 'can you wait 10 more minutes' — needs a person.\nRider: {text[:300]}", urgent=True, o=o)
+                        await self._fwd(rid, conv, f"⚠ reply to our 'can you wait 10 more minutes' — needs a person.\nRider: {text[:300]}", urgent=True, o=o)
                         self.clear(rid)
                         return "forwarded"
                     return "noted (still waiting)"
                 # closed / no_order / customer… → fall through to a new flow
             elif flow == "await_reason":
-                await d["forward"](rid, conv, f"⚠ can't do the delivery — reason: {text[:300]}\nOther orders: {self._others(rid, o)}", urgent=intent == "urgent", o=o)
+                await self._fwd(rid, conv, f"⚠ can't do the delivery — reason: {text[:300]}\nOther orders: {self._others(rid, o)}", urgent=intent == "urgent", o=o)
                 self.clear(rid)
                 return "forwarded with reason"
             elif flow == "await_photo":
@@ -304,7 +385,7 @@ class RiderFlows:
                     kind = st.get("kind", "")
                     if o is not None and kind:
                         o["query_flag"] = {"closed": "restaurant closed", "damaged": "order damaged", "forgot": "handover photo — finalize"}.get(kind, kind)
-                    await d["forward"](rid, conv, f"📷 photo received — {o['query_flag'] if o else kind}. " + ("Please finalize the order in MotionTools." if kind == "forgot" else "Please decide."), o=o)
+                    await self._fwd(rid, conv, f"📷 photo received — {o['query_flag'] if o else kind}. " + ("Please finalize the order in MotionTools." if kind == "forgot" else "Please decide."), o=o)
                     self.clear(rid)
                     return "photo forwarded"
                 if intent in ("yes", "ack", "minutes"):
@@ -314,20 +395,20 @@ class RiderFlows:
                 if intent in ("customer_unreachable", "customer_phone", "customer_find"):
                     self.clear(rid)
                     return await self._card(rid, conv, o, intent)
-                await d["forward"](rid, conv, f"⚠ problem at the customer: {text[:300]}", o=o)
+                await self._fwd(rid, conv, f"⚠ problem at the customer: {text[:300]}", o=o)
                 self.clear(rid)
                 return "forwarded"
             elif flow == "customer_wait":
                 mins = round((time.time() - st.get("since", time.time())) / 60)
                 if o is not None:
                     o["query_flag"] = "customer unreachable" if intent in ("customer_unreachable", "no", "other", "customer_phone") else "address problem"
-                await d["forward"](rid, conv, f"⚠ {o['query_flag'] if o else 'customer problem'} — rider at the customer for {mins} min after our card.\nRider: {text[:300]}", o=o)
+                await self._fwd(rid, conv, f"⚠ {o['query_flag'] if o else 'customer problem'} — rider at the customer for {mins} min after our card.\nRider: {text[:300]}", o=o)
                 self.clear(rid)
                 return "forwarded"
             elif flow == "other_wait":
                 self.clear(rid)
                 if intent in ("other", "ack", "yes", "no", "excuse", "ready", "minutes"):
-                    await d["forward"](rid, conv, f"✉ {text[:300]}", o=o)
+                    await self._fwd(rid, conv, f"✉ {text[:300]}", o=o)
                     return "forwarded"
                 # a clear intent → new flow below
 
@@ -336,62 +417,62 @@ class RiderFlows:
             if o is not None:
                 o["kitchen_reported"] = True
             if not self.on("q:not_ready"):
-                await d["forward"](rid, conv, f"order not ready — {text[:300]}", o=o); return "forwarded"
-            await d["send"](rid, conv, "q:not_ready", o)
+                await self._fwd(rid, conv, f"order not ready — {text[:300]}", o=o); return "forwarded"
+            await self._send(rid, conv, "q:not_ready", o)
             self.set(rid, "not_ready", "wait", 10, conv=conv, asked=0, persuaded=False, ref=(o or {}).get("ref", ""))
             return "asked to wait"
         if intent == "closed":
             if o is not None:
                 o["query_flag"] = "restaurant closed?"
             if self.on("q:closed"):
-                await d["send"](rid, conv, "q:closed", o)
+                await self._send(rid, conv, "q:closed", o)
                 self.set(rid, "await_photo", "", 5, kind="closed", conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked for a photo"
-            await d["forward"](rid, conv, f"restaurant closed — {text[:300]}", o=o); return "forwarded"
+            await self._fwd(rid, conv, f"restaurant closed — {text[:300]}", o=o); return "forwarded"
         if intent == "no_order":
             if self.on("q:no_order"):
-                await d["send"](rid, conv, "q:no_order", o)
-            await d["forward"](rid, conv, f"⚠ restaurant says no such order / already taken.\nRider: {text[:300]}\nRiders on this order: {self._riders(o)}", urgent=True, o=o)
+                await self._send(rid, conv, "q:no_order", o)
+            await self._fwd(rid, conv, f"⚠ restaurant says no such order / already taken.\nRider: {text[:300]}\nRiders on this order: {self._riders(o)}", urgent=True, o=o)
             return "forwarded"
         if intent == "cant_deliver":
             if self.on("q:cant_deliver"):
-                await d["send"](rid, conv, "q:cant_deliver", o)
+                await self._send(rid, conv, "q:cant_deliver", o)
                 self.set(rid, "await_reason", "", 3, conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked why"
-            await d["forward"](rid, conv, f"⚠ can't do the delivery — {text[:300]}\nOther orders: {self._others(rid, o)}", urgent=True, o=o); return "forwarded"
+            await self._fwd(rid, conv, f"⚠ can't do the delivery — {text[:300]}\nOther orders: {self._others(rid, o)}", urgent=True, o=o); return "forwarded"
         if intent in ("customer_unreachable", "customer_phone", "customer_find"):
             return await self._card(rid, conv, o, intent)
         if intent == "customer_problem":
             if self.on("q:customer_problem"):
-                await d["send"](rid, conv, "q:customer_problem", o)
+                await self._send(rid, conv, "q:customer_problem", o)
                 self.set(rid, "await_problem", "", 10, conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked what exactly"
-            await d["forward"](rid, conv, f"problem at the customer — {text[:300]}", o=o); return "forwarded"
+            await self._fwd(rid, conv, f"problem at the customer — {text[:300]}", o=o); return "forwarded"
         if intent == "forgot_finish":
             done = o is None or o.get("phase") in ("delivered", "closed")
             if done and self.on("q:forgot_done"):
-                await d["send"](rid, conv, "q:forgot_done", o)
+                await self._send(rid, conv, "q:forgot_done", o)
                 return "already completed"
             if self.on("q:forgot_finish"):
-                await d["send"](rid, conv, "q:forgot_finish", o)
+                await self._send(rid, conv, "q:forgot_finish", o)
                 self.set(rid, "await_photo", "", 0, kind="forgot", conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked for the handover photo"
-            await d["forward"](rid, conv, f"forgot to finish in the app — {text[:300]}", o=o); return "forwarded"
+            await self._fwd(rid, conv, f"forgot to finish in the app — {text[:300]}", o=o); return "forwarded"
         if intent == "damaged":
             if o is not None:
                 o["query_flag"] = "order damaged?"
             if self.on("q:damaged"):
-                await d["send"](rid, conv, "q:damaged", o)
+                await self._send(rid, conv, "q:damaged", o)
                 self.set(rid, "await_photo", "", 5, kind="damaged", conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked for a photo"
-            await d["forward"](rid, conv, f"order damaged — {text[:300]}", o=o); return "forwarded"
+            await self._fwd(rid, conv, f"order damaged — {text[:300]}", o=o); return "forwarded"
         if intent == "photo":
-            await d["forward"](rid, conv, "📷 photo received without text", o=o)
+            await self._fwd(rid, conv, "📷 photo received without text", o=o)
             return "photo forwarded"
         if intent in ("ack", "yes", "ready"):
             if in_auto or last_ops_auto:
                 if self.on("q:ack"):
-                    await d["send"](rid, conv, "q:ack", o)
+                    await self._send(rid, conv, "q:ack", o)
                 return "acknowledged"
             return "ignored (reply to a person)"
         if intent == "excuse":
@@ -399,37 +480,40 @@ class RiderFlows:
                 o["excuse"] = text[:120]
             if in_auto or last_ops_auto:
                 if self.on("q:noted"):
-                    await d["send"](rid, conv, "q:noted", o)
+                    await self._send(rid, conv, "q:noted", o)
                 return "noted"
             return "ignored (reply to a person)"
         if intent == "minutes" and o is not None and o.get("phase") in ("at_restaurant", "to_restaurant", "accepted"):
             n = max(1, min(int(NUM_RE.match(text).group(1)), 60))
             o["kitchen_reported"] = True
-            await d["send"](rid, conv, "q:not_ready_minutes", o, n=n)
+            await self._send(rid, conv, "q:not_ready_minutes", o, n=n)
             self.set(rid, "not_ready", "wait", n, conv=conv, asked=0, persuaded=False, ref=o.get("ref", ""))
             return f"waiting {n} min"
         # other / no / unclear
         if in_auto:
-            await d["forward"](rid, conv, f"✉ reply to an automatic message — needs a person.\nRider: {text[:300]}", o=o)
+            await self._fwd(rid, conv, f"✉ reply to an automatic message — needs a person.\nRider: {text[:300]}", o=o)
             return "forwarded"
-        if self.on("q:other") and not st:
-            await d["send"](rid, conv, "q:other", o)
+        recently_asked = time.time() - self.asked_other.get(rid, 0) < 3 * 3600
+        substantive = len((text or "").split()) >= 4          # a real sentence = the rider already said what he needs
+        if self.on("q:other") and not st and not recently_asked and not substantive:
+            await self._send(rid, conv, "q:other", o)
+            self.asked_other[rid] = time.time()
             self.set(rid, "other_wait", "", 30, conv=conv, ref=(o or {}).get("ref", ""))
             return "asked how we can help"
-        await d["forward"](rid, conv, f"✉ {text[:300]}", o=o)
+        await self._fwd(rid, conv, f"✉ {text[:300]}", o=o)
         return "forwarded"
 
     async def _card(self, rid: str, conv: str, o, intent: str) -> str:
         d = self.deps
         if o is None:
-            await d["forward"](rid, conv, "asked for customer details but has no live order", o=None)
+            await self._fwd(rid, conv, "asked for customer details but has no live order", o=None)
             return "forwarded (no order)"
         card = d["customer_card"](o)
         closer = {"customer_phone": "q:customer_card_call", "customer_unreachable": "q:customer_card_wait", "customer_find": "q:customer_card_find"}[intent]
         if self.on("q:customer_card"):
-            await d["send"](rid, conv, "q:customer_card", o, closer_key=closer, **card)
+            await self._send(rid, conv, "q:customer_card", o, closer_key=closer, **card)
         if not card.get("phone_known"):
-            await d["forward"](rid, conv, f"ℹ rider needs the customer's number for {o.get('ref')} — not in MotionTools data, please look it up.", o=o)
+            await self._fwd(rid, conv, f"ℹ rider needs the customer's number for {o.get('ref')} — not in MotionTools data, please look it up.", o=o)
         self.set(rid, "customer_wait", "", 15, conv=conv, ref=o.get("ref", ""), kind=intent)
         return "customer card sent"
 
@@ -446,28 +530,28 @@ class RiderFlows:
                 if o is None or o.get("picked_up_at") or o.get("phase") not in ("at_restaurant", "to_restaurant", "accepted"):
                     self.clear(rid); continue
                 if self._wait_min(o) >= 20 and not st.get("decided"):
-                    await d["forward"](rid, conv, f"⏱ {o.get('ref')}: rider waiting {self._wait_min(o)} min at {o.get('restaurant')} — decide: keep waiting or reassign.\nLast from rider: {st.get('last', '')}", o=o)
+                    await self._fwd(rid, conv, f"⏱ {o.get('ref')}: rider waiting {self._wait_min(o)} min at {o.get('restaurant')} — decide: keep waiting or reassign.\nLast from rider: {st.get('last', '')}", o=o)
                     st["decided"] = True; self._save(); continue
                 if st.get("step") == "persuade" and until and t >= until:
-                    await d["forward"](rid, conv, f"⚠ no answer to 'can you wait 10 more minutes' — rider may hand back {o.get('ref')} ({self._wait_min(o)} min at {o.get('restaurant')}).", urgent=True, o=o)
+                    await self._fwd(rid, conv, f"⚠ no answer to 'can you wait 10 more minutes' — rider may hand back {o.get('ref')} ({self._wait_min(o)} min at {o.get('restaurant')}).", urgent=True, o=o)
                     self.clear(rid); continue
                 if st.get("step") == "wait" and until and t >= until:
                     if not st.get("asked"):
-                        await d["send"](rid, conv, "q:not_ready_check", o)
+                        await self._send(rid, conv, "q:not_ready_check", o)
                         st["asked"], st["until"] = 1, t + 5 * 60; self._save()
                     else:
-                        await d["forward"](rid, conv, f"⏱ {o.get('ref')}: no answer after the check, {self._wait_min(o)} min at {o.get('restaurant')}.", o=o)
+                        await self._fwd(rid, conv, f"⏱ {o.get('ref')}: no answer after the check, {self._wait_min(o)} min at {o.get('restaurant')}.", o=o)
                         self.clear(rid)
             elif flow in ("await_photo", "await_reason") and until and t >= until:
                 what = "photo" if flow == "await_photo" else "reason"
                 kind = st.get("kind") or "cannot deliver"
-                await d["forward"](rid, conv, f"⏳ no {what} received for '{kind}' — please follow up.", o=o)
+                await self._fwd(rid, conv, f"⏳ no {what} received for '{kind}' — please follow up.", o=o)
                 self.clear(rid)
             elif flow == "customer_wait":
                 if o is None or o.get("phase") in ("delivered", "closed", "cancelled"):
                     self.clear(rid); continue
                 if until and t >= until:
-                    await d["forward"](rid, conv, f"⏱ {o.get('ref')}: 15 min since the customer card, no news from the rider.", o=o)
+                    await self._fwd(rid, conv, f"⏱ {o.get('ref')}: 15 min since the customer card, no news from the rider.", o=o)
                     self.clear(rid)
             elif flow in ("await_problem", "other_wait") and until and t >= until:
                 self.clear(rid)
