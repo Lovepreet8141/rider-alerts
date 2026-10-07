@@ -199,6 +199,7 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_city_day ON orders(city, day)")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_day ON orders(day)")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_ref ON orders(ref)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_orders_rider ON orders(rider_id, dispatched_at)")   # "this rider's orders" without a table scan
             self.db.commit()
         self.city_map: dict = {}        # MotionTools service-area id -> city name (Settings "city:<id>")
         self.fleet_map: dict = {}       # rider id -> fleet name (Settings "fleet:<rider id>")
@@ -456,12 +457,14 @@ class Store:
             where += " AND city=?"; args.append(city)
         return int(self._rows(f"SELECT count(*) n FROM orders WHERE {where}", args)[0]["n"])
 
-    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "", limit: int = 0) -> list:
+    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "", limit: int = 0, rider_id: str = "") -> list:
         start, end = period_range(period, now)
         where = "((dispatched_at >= ? AND dispatched_at < ?) OR closed=0 OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?))"
         args = [iso(start), iso(end), iso(start), iso(end)]
         if city:
             where += " AND city=?"; args.append(city)
+        if rider_id:
+            where += " AND rider_id=?"; args.append(rider_id)
         lim = f" LIMIT {int(limit)}" if limit and not q else ""
         rows = self._rows(f"SELECT * FROM orders WHERE {where} ORDER BY COALESCE(dispatched_at, first_seen) DESC{lim}", args)
         out = [self._hydrate(r) for r in rows]
@@ -476,8 +479,21 @@ class Store:
         return self._hydrate(rows[0]) if rows else None
 
     def order_by_ref(self, ref: str):
-        rows = self._rows("SELECT * FROM orders WHERE upper(ref)=? ORDER BY first_seen DESC LIMIT 1", (ref.upper(),))
+        # ref IN (…) uses the index; upper(ref)=? scanned every order ever stored
+        rows = self._rows("SELECT * FROM orders WHERE ref IN (?, ?) ORDER BY first_seen DESC LIMIT 1", (ref, ref.upper()))
         return self._hydrate(rows[0]) if rows else None
+
+    def rider_recent(self, rider_id: str, since: datetime, limit: int = 5) -> list:
+        """A rider's orders that were picked up / reached / delivered since `since` — one indexed query instead of
+        parsing every order of the day (that froze the server for 74 s with all cities)."""
+        rows = self._rows("SELECT * FROM orders WHERE rider_id=? AND dispatched_at >= ? ORDER BY dispatched_at DESC LIMIT ?",
+                          (rider_id, iso(since - timedelta(hours=6)), limit))
+        return [self._hydrate(r) for r in rows]
+
+    def place_counts(self, since: datetime) -> dict:
+        return {r["place_id"]: r["n"] for r in self._rows(
+            "SELECT place_id, COUNT(*) AS n FROM orders WHERE dispatched_at >= ? AND place_id IS NOT NULL AND place_id != '' GROUP BY place_id",
+            (iso(since),))}
 
     def delete_day(self, day: str, now: datetime, dry_run: bool = False, city: str = "") -> dict:
         """Wipe one operating day that was recorded wrongly: its finished orders, their alerts and GPS points, and the

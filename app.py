@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "7.0"
+VERSION = "7.0.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -223,12 +223,8 @@ ENRICH_LOCK = asyncio.Lock()
 
 
 def cached_insights(period: str, now: datetime, city: str = "") -> dict:
-    hit = INSIGHTS_CACHE.get((period, city))
-    if hit and (now - hit[0]).total_seconds() < 30:
-        return hit[1]
-    data = store.insights(period, now, rules, sessions_ok=STATE['sync']['mode'] == 'api', city=city)
-    INSIGHTS_CACHE[(period, city)] = (now, data)
-    return data
+    """Shared by Insights, the rider panel and the reports: one cached computation per (period, city)."""
+    return _insights_cached(period=period, city=city)
 
 
 def city_of(o: dict) -> str:
@@ -443,6 +439,11 @@ def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True
     return deco
 
 
+@report_cache(60, 600)
+def _insights_cached(period: str = "today", city: str = "") -> dict:
+    return store.insights(period, datetime.now(UTC), rules, sessions_ok=STATE['sync']['mode'] == 'api', city=city)
+
+
 def fast_json(fn):
     @_functools.wraps(fn)
     def wrapper(*a, **kw):
@@ -552,7 +553,7 @@ async def probe_endpoints(now: datetime, quiet: bool = False):
     """Test every MotionTools endpoint once (startup + hourly). Restricted ones are skipped until the next probe."""
     if not mt.enabled:
         return
-    sample_order = next(iter(list(STATE["orders"].values())), None) or next(iter(store.orders_in("week", now)), None)
+    sample_order = next(iter(list(STATE["orders"].values())), None) or next(iter(store.orders_in("week", now, limit=1)), None)
     sample_place = next((o.get("place_id") for o in [sample_order] if o and o.get("place_id")), None) \
         or next(iter(projector.places), None)
     sample_rider = (sample_order or {}).get("rider_id") or next(iter(STATE["riders"]), None)
@@ -1036,7 +1037,6 @@ async def post_start(now: datetime):
     # housekeeping (old files, GPS purge, vacuum) is NOT done at startup any more — the hourly run at :30 does it.
     # the first minutes after a deploy belong to the people opening the dashboard, so the heavy repair waits too.
     await asyncio.sleep(90)
-    loop.run_in_executor(None, prewarm_reports)        # in the background: the first visitor after a deploy doesn't wait
     try:
         backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
         recent = [b for b in DATA_DIR.glob("quickzi-backup-*.db") if now.timestamp() - b.stat().st_mtime < 6 * 3600]
@@ -1058,10 +1058,11 @@ async def post_start(now: datetime):
             for o in [x for x in list(STATE["orders"].values()) if x["phase"] in ("delivered", "cancelled")]:
                 projector.finish(o, now)              # finished while we were down -> out of the live board
             store.log("info", f"rebuilt {n} orders of the last 7 days from the stored events ({on_hold} live orders on hold)")
-            INSIGHTS_CACHE.clear(); PULSE_CACHE.clear()
+            INSIGHTS_CACHE.clear(); PULSE_CACHE.clear(); _RCACHE.clear()
             evaluate_all(datetime.now(UTC))
     except Exception as e:
         log.exception("repair failed: %s", e)
+    loop.run_in_executor(None, prewarm_reports)        # in the background: the first visitor after a deploy doesn't wait
     try:
         total = 0
         while True:
@@ -1148,7 +1149,7 @@ async def sync_loop():
                     first = False
                 if first and ok:
                     # first run on an empty database: pull the last 7 days so week/month views are populated
-                    days = 7 if not store.orders_in("week", now) else 2
+                    days = 7 if not store.orders_in("week", now, limit=1) else 2
                     total = 0
                     for i in range(days):
                         total += await backfill_done(now - timedelta(days=i))
@@ -1546,11 +1547,7 @@ async def api_cities_set(request: Request):
 @fast_json
 def api_places():
     """Restaurants seen as MotionTools place ids (webhook mode) with the names given in Settings."""
-    seen = {}
-    for o in store.orders_in("month", datetime.now(UTC)):
-        pid = o.get("place_id")
-        if pid:
-            seen[pid] = seen.get(pid, 0) + 1
+    seen = store.place_counts(datetime.now(UTC) - timedelta(days=30))    # SQL count (was: a month of orders parsed)
     for o in list(STATE["orders"].values()):
         if o.get("place_id"):
             seen.setdefault(o["place_id"], 0)
@@ -1745,15 +1742,21 @@ def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
 
 @app.get("/api/automations", dependencies=[Depends(require_login)])
 async def api_automations_get(recheck: int = 0):
-    settings = store.get_settings()
-    now = datetime.now(UTC)
-    counts = store.auto_counts(now)
     st = intercom.ic.status
     if intercom.ic.enabled and (recheck or not st.get("checked")):
         try:
             await intercom.ic.check(force=True)                 # an error is re-checked on every visit, so a fix shows at once
         except Exception as e:
             log.warning("intercom check failed: %s", e)
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(_automations_payload)     # DB reads + flows off the event loop (it froze 74 s here)
+
+
+def _automations_payload() -> dict:
+    settings = store.get_settings()
+    now = datetime.now(UTC)
+    counts = store.auto_counts(now)
+    st = intercom.ic.status
     return {"rules": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}") == "1",
                        "cities": sorted(rule_cities_enabled(k, settings)), **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
@@ -2167,7 +2170,7 @@ def _rider_recent_order(rid: str):
     mine = [x for x in list(STATE["orders"].values()) if x.get("rider_id") == rid and (x.get("delivered_at") or x.get("at_customer_at") or x.get("picked_up_at") or cut) >= cut]
     if not mine:
         try:
-            mine = [x for x in store.orders_in("today", datetime.now(UTC)) if x.get("rider_id") == rid and (x.get("delivered_at") or cut) >= cut]
+            mine = [x for x in store.rider_recent(rid, cut) if (x.get("delivered_at") or x.get("at_customer_at") or x.get("picked_up_at") or cut) >= cut]
         except Exception:
             mine = []
     mine.sort(key=lambda x: x.get("delivered_at") or x.get("at_customer_at") or x.get("dispatched_at") or cut, reverse=True)
@@ -2357,7 +2360,10 @@ def _order_by_ref(text: str):
         hit = next((o for o in list(STATE["orders"].values()) if (o.get("ref") or "").upper() == tok), None)
         if hit is None:
             try:
-                hit = next((o for o in store.orders_in("today", datetime.now(UTC)) if (o.get("ref") or "").upper() == tok), None)
+                hit = store.order_by_ref(tok)                       # indexed lookup (was: every order of the day parsed)
+                seen = hit and (hit.get("dispatched_at") or hit.get("created_at"))
+                if hit and (not seen or (datetime.now(UTC) - seen) > timedelta(hours=24)):
+                    hit = None                                      # an old order number — not what he means today
             except Exception:
                 hit = None
         if hit is not None:
@@ -2748,7 +2754,7 @@ def api_rider(rid: str, period: str = "today", city: str = ""):
     ins = cached_insights(period, now, city)
     stats = next((r for r in ins["riders"] if r["rider_id"] == rid), None)
     idx = alerts_index()
-    orders = [order_view(o, now, idx) for o in store.orders_in(period, now, city=city) if o["rider_id"] == rid]
+    orders = [order_view(o, now, idx) for o in store.orders_in(period, now, city=city, rider_id=rid)]
     r = STATE["riders"].get(rid, {})
     return {"rider": stats or {"rider_id": rid, "rider": r.get("name", "")}, "phone": r.get("phone", ""),
             "online": r.get("online"), "orders": orders, "period_phases": ins["phases"]}

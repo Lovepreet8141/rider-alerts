@@ -368,7 +368,7 @@ class RiderFlows:
     def active(self) -> list:
         """For the Intercom page: who is in which flow, waiting for what."""
         out, now = [], time.time()
-        for rid, st in self.state.items():
+        for rid, st in list(self.state.items()):              # snapshot: may run in a worker thread
             o = self.deps["order_for"](rid) if self.deps.get("order_for") else None
             out.append({"rider_id": rid, "flow": st.get("flow"), "step": st.get("step"), "since_min": round((now - st.get("since", now)) / 60),
                         "until_min": round((st.get("until", 0) - now) / 60) if st.get("until") else None, "ref": (o or {}).get("ref") or st.get("ref", ""),

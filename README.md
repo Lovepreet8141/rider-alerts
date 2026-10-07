@@ -23,6 +23,15 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 7.0.1 — the 74-second freeze found by the watchdog
+- The watchdog named it: the Intercom page's "Conversations in progress" looked up each rider's order by parsing
+  EVERY order of the day (all cities) — once per rider, on the event loop → server frozen 74 s.
+  Now one indexed query per rider (`ix_orders_rider`), 40 riders in 5 ms; the Intercom page is built in a worker thread.
+- Same fix for every rider message (the bot looked up the rider's order and any order number the same way) and the
+  bot's timers: 2 ms per message.
+- Order-number lookup uses the index (was a scan of every order ever stored); rider panel reads only that rider's
+  orders; Settings → places counts in SQL; insights shared and cached for all pages.
+
 ## 7.0 — built for 10 000+ orders a day
 Load-tested on a copy with 25 cities: 10 000 orders today (1 000 live at once, 1 500 riders), 280 000 orders of
 history (30 days, 1.2 GB DB), GPS 50/s + new orders 5/s, six dispatchers polling, every report page opened.
