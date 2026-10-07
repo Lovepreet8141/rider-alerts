@@ -23,6 +23,18 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.8.4 — big pages no longer freeze the server
+- JSON for the heavy pages (City, Orders, Riders, Fleets, Insights, Daily, Settings, System …) is built and gzipped in a
+  worker thread. Before, FastAPI encoded it on the event loop: "Orders · this week" for 25 cities (14 MB) froze the
+  server for seconds — pages hung and MotionTools' webhook calls timed out (→ webhook switched off).
+- Orders list: newest 2 500 rows for week/month (the count of all is shown; search + CSV export still cover everything).
+- Measured with 21 400 orders: Orders·week 3.3 s → 0.4 s; longest webhook stall during it 2.2 s → 0.16 s.
+
+## 6.8.3 — no reminders into closed conversations
+- Before any timed message or note (holding reply, "rider waiting X min", photo/reason timeouts, 15-min customer check)
+  the dashboard reads the conversation: closed, snoozed, or a teammate wrote/closed after the rider's last message →
+  nothing is sent and the flow ends. Only a new message from the rider starts it again.
+
 ## 6.8.2
 - relay.py also works while the dashboard is still on an older version (falls back to single events).
 - "Received from riders" shows what the bot finally understood (Claude), not the first keyword guess.

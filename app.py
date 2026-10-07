@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.8.2"
+VERSION = "6.8.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -314,6 +314,52 @@ def require_login(creds: HTTPBasicCredentials = Depends(basic)):
     typed = creds.password.strip()
     if not DASH_PASSWORD or not secrets.compare_digest(typed.encode(), DASH_PASSWORD.encode()):
         raise HTTPException(401, "Wrong password", headers={"WWW-Authenticate": "Basic"})
+
+
+
+# ---------------------------------------------------------------- fast JSON
+# FastAPI turns a returned dict into JSON with jsonable_encoder ON THE EVENT LOOP, and the gzip middleware compresses
+# on the loop too. A week of orders for 25 cities is >10 MB: the loop froze for seconds, MotionTools' webhook calls
+# timed out meanwhile, and after 250 of those MotionTools switched the webhook off. These endpoints now build and
+# compress their JSON in the worker thread; the loop only hands over finished bytes.
+import functools as _functools
+import gzip as _gzip
+import inspect as _inspect
+from fastapi.responses import Response as _Response
+try:
+    import starlette.middleware.gzip as _sgz
+    _GZ_OK = "content_encoding_set" in _inspect.getsource(_sgz)     # middleware leaves pre-compressed bodies alone
+except Exception:
+    _GZ_OK = False
+
+
+def _jdefault(v):
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, (set, frozenset, tuple)):
+        return list(v)
+    if isinstance(v, Path):
+        return str(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def json_bytes_response(obj) -> _Response:
+    body = json.dumps(obj, default=_jdefault, ensure_ascii=False, separators=(",", ":")).encode()
+    headers = {"Cache-Control": "no-store"}
+    if _GZ_OK and len(body) > 4096:
+        body = _gzip.compress(body, compresslevel=5)
+        headers.update({"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return _Response(content=body, media_type="application/json", headers=headers)
+
+
+def fast_json(fn):
+    @_functools.wraps(fn)
+    def wrapper(*a, **kw):
+        out = fn(*a, **kw)
+        return out if isinstance(out, _Response) else json_bytes_response(out)
+    return wrapper
 
 
 # ====================================================================== sync
@@ -1223,6 +1269,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
 
 
 @app.get("/api/state", dependencies=[Depends(require_login)])
+@fast_json
 def api_state(city: str = "", done: int = 0):
     now = datetime.now(UTC)
     idx = alerts_index()
@@ -1308,6 +1355,7 @@ def api_state(city: str = "", done: int = 0):
 
 
 @app.get("/api/network", dependencies=[Depends(require_login)])
+@fast_json
 def api_network():
     """The Overview page: every city, ranked by trouble."""
     now = datetime.now(UTC)
@@ -1351,6 +1399,7 @@ def api_network():
 
 
 @app.get("/api/cities", dependencies=[Depends(require_login)])
+@fast_json
 def api_cities():
     """Service areas seen on orders, with the name given in Settings (webhook events only carry the area id)."""
     return {"areas": store.areas_seen(), "names": store.city_map}
@@ -1370,6 +1419,7 @@ async def api_cities_set(request: Request):
 
 
 @app.get("/api/places", dependencies=[Depends(require_login)])
+@fast_json
 def api_places():
     """Restaurants seen as MotionTools place ids (webhook mode) with the names given in Settings."""
     seen = {}
@@ -1396,6 +1446,7 @@ async def api_places_set(request: Request):
 
 
 @app.get("/api/riders", dependencies=[Depends(require_login)])
+@fast_json
 def api_riders():
     """Known riders with their phone numbers — MotionTools' number if it sent one, otherwise the one typed in Settings."""
     rows = {r["id"]: r for r in store.riders()}
@@ -1528,6 +1579,7 @@ def cached(key: tuple, ttl: int, now: datetime, build):
 
 
 @app.get("/api/riders-page", dependencies=[Depends(require_login)])
+@fast_json
 def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
     """The Riders page: every rider from orders + the shift sheet, status now, usual, per working hour, score."""
     _check_period(period)
@@ -2085,6 +2137,32 @@ async def human_replied_since(conv: str, since: float) -> bool:
     return False
 
 
+async def rider_waiting(conv: str, since: float) -> bool:
+    """Is the rider really still waiting? Not if the conversation is closed or snoozed, or a teammate wrote / closed it
+    after the rider's last message. On any doubt (Intercom unreachable) → don't nag."""
+    if not intercom.ic.enabled or not conv:
+        return False
+    try:
+        c = await intercom.ic.call("GET", f"/conversations/{conv}")
+    except Exception:
+        return False
+    if (c.get("state") or "") in ("closed", "snoozed") or c.get("open") is False:
+        return False
+    ours = {b for _, b in BOT_SENT}
+    parts = ((c.get("conversation_parts") or {}).get("conversation_parts")) or []
+    last_rider = max([p.get("created_at") or 0 for p in parts if (p.get("author") or {}).get("type") in ("user", "lead", "contact")] + [since - 5])
+    for p in parts:
+        if (p.get("created_at") or 0) < last_rider or (p.get("author") or {}).get("type") != "admin":
+            continue
+        kind = p.get("part_type")
+        if kind == "close" or kind == "snoozed":
+            return False
+        if kind in ("comment", "note") and _norm(p.get("body") or "") not in ours and "rider waiting" not in (p.get("body") or "") \
+                and "rider needs" not in (p.get("body") or "") and not (p.get("body") or "").lstrip("<p>").startswith(("⏰", "🔴", "⚠", "✉", "📞", "📷", "🔁", "ℹ")):
+            return False                          # a teammate wrote after the rider
+    return True
+
+
 async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, **fmt):
     settings = store.get_settings()
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
@@ -2104,6 +2182,7 @@ async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, *
 async def _flow_forward(rid: str, conv: str, note: str, urgent: bool = False, o=None):
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
     full = f"{'🔴 ' if urgent else '⚠ '}{name}: {note}\n{_order_ctx(o)}"
+    BOT_SENT.append((time.time(), _norm(full))); del BOT_SENT[:-300]
     ok = await intercom.ic.escalate(conv, full) if intercom.ic.enabled else False
     store.auto_log(datetime.now(UTC), "reply:forwarded", rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), note[:300], "sent" if ok else "failed", "" if ok else "could not reassign")
     store.log("warning" if urgent else "info", f"Intercom → inbox: {name}: {note[:100]}")
@@ -2144,7 +2223,7 @@ def _order_by_ref(text: str):
     return None
 
 
-flows.deps = {"human_replied_since": human_replied_since, "order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
+flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_replied_since, "order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
               "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
 
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
@@ -2289,6 +2368,7 @@ async def automation_loop():
 
 
 @app.get("/api/fleets", dependencies=[Depends(require_login)])
+@fast_json
 def api_fleets(period: str = "week", city: str = ""):
     """The Fleets page: every MotionTools organization on the same metrics, 14-day trend, phases vs network, riders."""
     _check_period(period)
@@ -2307,6 +2387,7 @@ def api_fleets(period: str = "week", city: str = ""):
 
 
 @app.get("/api/shifts", dependencies=[Depends(require_login)])
+@fast_json
 def api_shifts_get(day: str = ""):
     st = store.shifts_status()
     d = day or day_key(datetime.now(UTC))
@@ -2353,6 +2434,7 @@ async def api_probe():
 
 
 @app.get("/api/insights", dependencies=[Depends(require_login)])
+@fast_json
 def api_insights(period: str = "today", city: str = ""):
     _check_period(period)
     try:
@@ -2364,6 +2446,7 @@ def api_insights(period: str = "today", city: str = ""):
 
 
 @app.get("/api/staffing", dependencies=[Depends(require_login)])
+@fast_json
 def api_staffing(day: str = "", city: str = ""):
     """Riders per hour for one day (default tomorrow), weekday-aware, plus a summary for the next 7 days."""
     return store.staffing_plan(datetime.now(UTC), rules, day=day, city=city)
@@ -2382,15 +2465,19 @@ def _check_period(period):
 
 
 @app.get("/api/orders", dependencies=[Depends(require_login)])
+@fast_json
 def api_orders(period: str = "today", q: str = "", city: str = ""):
     _check_period(period)
     now = datetime.now(UTC)
-    rows = store.orders_in(period, now, q, city=city)
+    cap = 2500 if period not in ("today",) or not city else 5000     # a browser table of 20 000 rows helps nobody
+    rows = store.orders_in(period, now, q, city=city, limit=cap)
     idx = alerts_index()
-    return {"orders": [order_view(o, now, idx) for o in rows]}
+    total = len(rows) if q else store.count_in(period, now, city=city)
+    return {"orders": [order_view(o, now, idx) for o in rows[:cap]], "total": total, "shown": min(total, cap)}
 
 
 @app.get("/api/orders/{oid}", dependencies=[Depends(require_login)])
+@fast_json
 def api_order(oid: str):
     o = store.order(oid)
     if not o:
@@ -2423,6 +2510,7 @@ async def api_order_reason(oid: str, request: Request):
 
 
 @app.get("/api/orders/{oid}/events", dependencies=[Depends(require_login)])
+@fast_json
 def api_order_events(oid: str):
     """Every raw MotionTools event that touched this order (booking events + its tour's events) — the ground truth."""
     tours = {tid for tid, ids in projector.tours.items() if oid in ids}
@@ -2455,6 +2543,7 @@ def api_order_events(oid: str):
 
 
 @app.get("/api/riders/{rid}", dependencies=[Depends(require_login)])
+@fast_json
 def api_rider(rid: str, period: str = "today", city: str = ""):
     _check_period(period)
     now = datetime.now(UTC)
@@ -2468,6 +2557,7 @@ def api_rider(rid: str, period: str = "today", city: str = ""):
 
 
 @app.get("/api/daily", dependencies=[Depends(require_login)])
+@fast_json
 def api_daily(day: str = "", city: str = ""):
     now = datetime.now(UTC)
     day = day or day_key(now - timedelta(days=1))
@@ -2514,6 +2604,7 @@ def daily_brief(d: dict, staffing: dict = None) -> str:
 
 
 @app.get("/api/settings", dependencies=[Depends(require_login)])
+@fast_json
 def api_settings_get():
     return {"rules": rules.as_dict(), "reasons": REASONS, "labels": {
         "ptod_target_min": "PTOD target (minutes from dispatch to delivered)", "ptod_warn_min": "PTOD warning at (minutes)",
@@ -2594,6 +2685,7 @@ async def api_intercom_customer_fetch(request: Request, ref: str = "", key: str 
 
 
 @app.get("/api/system", dependencies=[Depends(require_login)])
+@fast_json
 def api_system():
     s = STATE["sync"]
     return {"version": VERSION, "started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,

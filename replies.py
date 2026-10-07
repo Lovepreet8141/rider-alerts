@@ -681,7 +681,11 @@ class RiderFlows:
             if not rid or t - self.sent_keys.get(rid, {}).get("q:holding", 0) < 20 * 60:
                 continue
             try:
-                if await self.person_engaged(conv) and t - self.handover.get(conv, t) > self.GRACE_MIN * 60:
+                rw = d.get("rider_waiting")
+                if rw and not await rw(conv, since):
+                    # a teammate answered, closed or snoozed the conversation — the rider is not waiting, stay quiet
+                    self.last_rider_at.pop(conv, None); continue
+                if not rw and await self.person_engaged(conv) and t - self.handover.get(conv, t) > self.GRACE_MIN * 60:
                     hr = d.get("human_replied_since")
                     if hr and await hr(conv, since):
                         self.last_rider_at.pop(conv, None); continue
@@ -699,31 +703,52 @@ class RiderFlows:
                 if o is None or o.get("picked_up_at") or o.get("phase") not in ("at_restaurant", "to_restaurant", "accepted"):
                     self.clear(rid); continue
                 if self._wait_min(o) >= 20 and not st.get("decided"):
-                    await self._fwd(rid, conv, f"⏱ {o.get('ref')}: rider waiting {self._wait_min(o)} min at {o.get('restaurant')} — decide: keep waiting or reassign.\nLast from rider: {st.get('last', '')}", o=o)
+                    await self._tick_fwd(rid, conv, st, f"⏱ {o.get('ref')}: rider waiting {self._wait_min(o)} min at {o.get('restaurant')} — decide: keep waiting or reassign.\nLast from rider: {st.get('last', '')}", o=o)
                     st["decided"] = True; self._save(); continue
                 if st.get("step") == "persuade" and until and t >= until:
-                    await self._fwd(rid, conv, f"⚠ no answer to 'can you wait 10 more minutes' — rider may hand back {o.get('ref')} ({self._wait_min(o)} min at {o.get('restaurant')}).", urgent=True, o=o)
+                    await self._tick_fwd(rid, conv, st, f"⚠ no answer to 'can you wait 10 more minutes' — rider may hand back {o.get('ref')} ({self._wait_min(o)} min at {o.get('restaurant')}).", urgent=True, o=o)
                     self.clear(rid); continue
                 if st.get("step") == "wait" and until and t >= until:
                     if not st.get("asked"):
-                        await self._send(rid, conv, "q:not_ready_check", o)
+                        await self._tick_send(rid, conv, st, "q:not_ready_check", o)
                         st["asked"], st["until"] = 1, t + 5 * 60; self._save()
                     else:
-                        await self._fwd(rid, conv, f"⏱ {o.get('ref')}: no answer after the check, {self._wait_min(o)} min at {o.get('restaurant')}.", o=o)
+                        await self._tick_fwd(rid, conv, st, f"⏱ {o.get('ref')}: no answer after the check, {self._wait_min(o)} min at {o.get('restaurant')}.", o=o)
                         self.clear(rid)
             elif flow in ("await_photo", "await_reason") and until and t >= until:
                 what = "photo" if flow == "await_photo" else "reason"
                 kind = st.get("kind") or "cannot deliver"
-                await self._fwd(rid, conv, f"⏳ no {what} received for '{kind}' — please follow up.", o=o)
+                await self._tick_fwd(rid, conv, st, f"⏳ no {what} received for '{kind}' — please follow up.", o=o)
                 self.clear(rid)
             elif flow == "customer_wait":
                 if o is None or o.get("phase") in ("delivered", "closed", "cancelled"):
                     self.clear(rid); continue
                 if until and t >= until:
-                    await self._fwd(rid, conv, f"⏱ {o.get('ref')}: 15 min since the customer card, no news from the rider.", o=o)
+                    await self._tick_fwd(rid, conv, st, f"⏱ {o.get('ref')}: 15 min since the customer card, no news from the rider.", o=o)
                     self.clear(rid)
             elif flow in ("await_problem", "other_wait") and until and t >= until:
                 self.clear(rid)
+
+    # ---- timer actions: never into a conversation a teammate already closed / answered
+    async def _closed_by_team(self, rid, conv, st) -> bool:
+        rw = self.deps.get("rider_waiting")
+        if not rw or not conv:
+            return False
+        try:
+            if not await rw(conv, st.get("since", time.time())):
+                self.clear(rid)
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _tick_fwd(self, rid, conv, st, note, **kw):
+        if not await self._closed_by_team(rid, conv, st):
+            await self._fwd(rid, conv, note, **kw)
+
+    async def _tick_send(self, rid, conv, st, key, o, **kw):
+        if not await self._closed_by_team(rid, conv, st):
+            await self._send(rid, conv, key, o, **kw)
 
     # ---- helpers
     def _wait_min(self, o) -> int:

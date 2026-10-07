@@ -401,13 +401,22 @@ class Store:
             if r["id"] not in keep_ids:
                 self._exec("UPDATE orders SET closed=1, updated_at=? WHERE id=? AND closed=0", (iso(now), r["id"]))
 
-    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "") -> list:
+    def count_in(self, period: str, now: datetime, city: str = "") -> int:
         start, end = period_range(period, now)
         where = "((dispatched_at >= ? AND dispatched_at < ?) OR closed=0 OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?))"
         args = [iso(start), iso(end), iso(start), iso(end)]
         if city:
             where += " AND city=?"; args.append(city)
-        rows = self._rows(f"SELECT * FROM orders WHERE {where} ORDER BY COALESCE(dispatched_at, first_seen) DESC", args)
+        return int(self._rows(f"SELECT count(*) n FROM orders WHERE {where}", args)[0]["n"])
+
+    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "", limit: int = 0) -> list:
+        start, end = period_range(period, now)
+        where = "((dispatched_at >= ? AND dispatched_at < ?) OR closed=0 OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?))"
+        args = [iso(start), iso(end), iso(start), iso(end)]
+        if city:
+            where += " AND city=?"; args.append(city)
+        lim = f" LIMIT {int(limit)}" if limit and not q else ""
+        rows = self._rows(f"SELECT * FROM orders WHERE {where} ORDER BY COALESCE(dispatched_at, first_seen) DESC{lim}", args)
         out = [self._hydrate(r) for r in rows]
         if q:
             ql = q.lower()
