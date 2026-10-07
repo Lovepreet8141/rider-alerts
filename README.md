@@ -23,6 +23,15 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.9 — master switches, safe city list, relay without variables
+- Intercom page → **Intercom automation**: two master switches. *Bot answers rider queries* (off = the dashboard writes
+  nothing in rider chats, no timers, no order-number question) and *Rule messages* (off = no automatic rule message to
+  any rider). Switching off asks for confirmation.
+- Cities for the rules: **nothing ticked = no rule messages** (before: nothing ticked = all cities, so one empty save
+  messaged riders in all 25 cities). "All cities" is now an explicit choice (with confirmation).
+- relay.py needs **no variables**: it takes the secret from the MotionTools URL and always answers 200 — a wrong or
+  missing secret can no longer get the webhook blocked; it shows in the relay's /health instead.
+
 ## 6.8.4 — big pages no longer freeze the server
 - JSON for the heavy pages (City, Orders, Riders, Fleets, Insights, Daily, Settings, System …) is built and gzipped in a
   worker thread. Before, FastAPI encoded it on the event loop: "Orders · this week" for 25 cities (14 MB) froze the
@@ -54,8 +63,7 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
   or is busy, events wait in the relay and arrive afterwards — MotionTools never sees a failure, so it can no longer
   switch the webhook off.
 - Setup: Railway → New → GitHub repo (same repo) → service Settings: Start command `uvicorn relay:app --host 0.0.0.0 --port $PORT`,
-  Watch paths `relay.py`, Networking → Generate domain; Variables `WEBHOOK_PATH_SECRET` (same value) and
-  `DASHBOARD_URL=https://web-production-a68a4d.up.railway.app`. Then in MotionTools change the webhook URL to
+  Watch paths `relay.py`, Networking → Generate domain (no variables needed since 6.9). Then in MotionTools change the webhook URL to
   `https://<relay-domain>/mt/<WEBHOOK_PATH_SECRET>`. Check `https://<relay-domain>/health` → `waiting` should be ~0.
 
 ## 6.7.3 — webhook blocked warning after 5 min

@@ -6,12 +6,12 @@ never restarts: it answers MotionTools at once, keeps every event in order, and 
 When the dashboard is restarting or busy, events wait here (up to RELAY_MAX) and arrive a moment later — nothing lost,
 MotionTools never sees an error.
 
-Railway: second service from the same GitHub repo
+Railway: second service from the same GitHub repo — NO variables needed
   Start command   uvicorn relay:app --host 0.0.0.0 --port $PORT
   Watch paths     relay.py            (so dashboard updates never redeploy the relay)
-  Variables       WEBHOOK_PATH_SECRET = the same value as the dashboard
-                  DASHBOARD_URL       = https://web-production-a68a4d.up.railway.app
-MotionTools webhook URL → https://<relay-domain>/mt/<WEBHOOK_PATH_SECRET>
+MotionTools webhook URL → https://<relay-domain>/mt/<the same secret as before>
+The relay accepts whatever secret is in the URL and passes it on to the dashboard, which checks it. A wrong secret
+shows up in the relay's /health (last_error) — MotionTools still never sees a failure, so it can never block.
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ import time
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 
-SECRET = os.environ.get("WEBHOOK_PATH_SECRET", "").strip()
-TARGET = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
+SECRET = os.environ.get("WEBHOOK_PATH_SECRET", "").strip()          # optional: otherwise the one in MotionTools' URL
+TARGET = (os.environ.get("DASHBOARD_URL", "").strip() or "https://web-production-a68a4d.up.railway.app").rstrip("/")
 MAX = int(os.environ.get("RELAY_MAX", "300000"))
 BATCH = int(os.environ.get("RELAY_BATCH", "300"))
 
@@ -38,9 +38,10 @@ WAKE = asyncio.Event()
 
 @app.post("/mt/{secret}")
 async def catch(secret: str, request: Request):
-    if not SECRET or not secrets.compare_digest(secret, SECRET):
-        ST["rejected"] += 1
-        raise HTTPException(404)
+    if SECRET and not secrets.compare_digest(secret, SECRET):
+        ST["rejected"] += 1                 # counted, but still answered 200: MotionTools must never see a failure
+        return {"ok": True}
+    ST["path"] = secret
     try:
         p = await request.json()
     except Exception:
@@ -57,7 +58,8 @@ async def catch(secret: str, request: Request):
 @app.get("/")
 @app.get("/health")
 def health():
-    return {"ok": True, "role": "relay", "waiting": len(BUF), "target": TARGET or "(DASHBOARD_URL missing)", **ST}
+    return {"ok": True, "role": "relay", "waiting": len(BUF), "target": TARGET,
+            **{k: v for k, v in ST.items() if k != "path"}, "secret_seen": bool(SECRET or ST.get("path"))}
 
 
 async def forwarder():
@@ -71,19 +73,19 @@ async def forwarder():
                 except asyncio.TimeoutError:
                     pass
                 continue
-            if not TARGET or not SECRET:
-                ST["last_error"] = "DASHBOARD_URL or WEBHOOK_PATH_SECRET missing"
-                await asyncio.sleep(10)
+            key = SECRET or ST.get("path") or ""
+            if not key:
+                await asyncio.sleep(2)
                 continue
             n = min(BATCH, len(BUF))
             chunk = [BUF[i] for i in range(n)]
             try:
-                r = await cli.post(f"{TARGET}/mt/{SECRET}/batch", json=chunk)
+                r = await cli.post(f"{TARGET}/mt/{key}/batch", json=chunk)
                 if r.status_code in (404, 405):
                     # dashboard still on an older version without /batch: hand them over one by one
                     ok = 0
                     for p in chunk:
-                        r1 = await cli.post(f"{TARGET}/mt/{SECRET}", json=p)
+                        r1 = await cli.post(f"{TARGET}/mt/{key}", json=p)
                         if r1.status_code != 200:
                             break
                         ok += 1
@@ -101,10 +103,11 @@ async def forwarder():
                     ST["forwarded"] += n
                     ST["last_ok"] = time.strftime("%Y-%m-%d %H:%M:%S")
                     ST["fail_streak"], backoff = 0, 1.0
+                    ST["last_error"] = ""
                     if len(BUF) < BATCH:
                         await asyncio.sleep(0.5)          # collect a little — fewer, bigger calls
                     continue
-                ST["last_error"] = f"dashboard answered {r.status_code}"
+                ST["last_error"] = f"dashboard answered {r.status_code}" + (" — the secret in the MotionTools URL does not match WEBHOOK_PATH_SECRET of the dashboard" if r.status_code == 404 else "")
             except Exception as e:
                 ST["last_error"] = f"{type(e).__name__}: {str(e)[:120]}"
             ST["fail_streak"] += 1

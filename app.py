@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.8.4"
+VERSION = "6.9"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1638,6 +1638,7 @@ async def api_automations_get(recheck: int = 0):
                        "on": sorted(auto_cities_enabled(settings))},
             "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
             "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
+            "master": ic_master(settings),
             "received": list(intercom.ic.webhooks)[:60],
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(200), "quiet_hours": "", "daily_cap": 0}
 
@@ -1764,6 +1765,9 @@ async def api_automations_set(request: Request):
     for k, v in (body.get("rule_cities") or {}).items():
         if k in keys and isinstance(v, list):
             vals[f"auto_cities:{k}"] = json.dumps([str(c)[:60] for c in v][:60]) if v else ""
+    for k, v in (body.get("master") or {}).items():
+        if k in ("bot", "rules"):
+            vals[f"ic_{k}"] = "1" if v else "0"
     if "close" in body:
         vals["intercom_auto_close"] = "1" if body.get("close") else ""
         intercom.ic.auto_close = bool(body.get("close"))
@@ -1774,7 +1778,7 @@ async def api_automations_set(request: Request):
         intercom.ic.status["checked"] = 0
     if vals:
         store.set_settings(vals)
-        store.log("info", "automation rules changed: " + ", ".join(f"{k}={'on' if v == '1' else v or 'off'}" for k, v in vals.items()))
+        store.log("info", "automation rules changed: " + ", ".join(f"{k}={'on' if v == '1' else 'off' if v in ('', '0') else v}" for k, v in vals.items()))
     return {"ok": True}
 
 
@@ -1824,6 +1828,7 @@ def automation_tick(now: datetime, trace: list = None) -> list:
     cap = store.auto_today(now)
     cities_on = auto_cities_enabled(settings)
     rule_cities = {k: rule_cities_enabled(k, settings) for k, _, _ in AUTOMATIONS}
+    master = ic_master(settings)
     out = []
 
     def auto_city(oid: str, rid: str) -> str:
@@ -1837,8 +1842,12 @@ def automation_tick(now: datetime, trace: list = None) -> list:
         why = ""
         if (rule, rid, oid) in sent_keys:
             why = "already sent for this order"            # the only guard left: the same text never repeats on one order
-        elif (rule_cities.get(rule) or cities_on) and (auto_city(oid, rid) not in (rule_cities.get(rule) or cities_on)):
+        elif not (rule_cities.get(rule) or cities_on):
+            why = "no city selected (Intercom → Cities)"
+        elif "*" not in (rule_cities.get(rule) or cities_on) and auto_city(oid, rid) not in (rule_cities.get(rule) or cities_on):
             why = f"city not enabled for this rule ({auto_city(oid, rid) or '?'})"
+        elif not master["rules"]:
+            why = "rule messages switched off (Intercom → master switch)"
         elif not on.get(rule):
             why = "rule switched off"
         elif not live_mode:
@@ -2074,8 +2083,15 @@ async def smart_intent(text: str, o, prev: str = "") -> str:
     return res
 
 
+def ic_master(settings: dict = None) -> dict:
+    """Intercom page → master switches. bot = the dashboard answers rider queries; rules = automatic rule messages."""
+    st = settings or store.get_settings()
+    return {"bot": st.get("ic_bot", "1") == "1", "rules": st.get("ic_rules", "1") == "1"}
+
+
 def auto_cities_enabled(settings: dict = None) -> set:
-    """Cities that receive automatic messages; empty = all cities (Intercom page → Cities)."""
+    """Cities that receive automatic rule messages (Intercom page → Cities). Empty = NO city (nothing is sent);
+    "*" = every city. An empty list must never mean "everyone" — one wrong click would message riders everywhere."""
     raw = (settings or store.get_settings()).get("auto_cities") or ""
     try:
         return {c for c in json.loads(raw) if c} if raw.startswith("[") else {c.strip() for c in raw.split(",") if c.strip()}
@@ -2235,6 +2251,10 @@ RIDER_LOCKS: dict = {}
 async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
     """One rider's messages are answered one after another (a question and a quick '?' arrive together — the '?' must
     see what the bot did with the question)."""
+    if not ic_master()["bot"]:
+        intercom.ic.note_in(conversation_id, STATE["riders"].get(rid, {}).get("name") or rid, text or "📷 photo",
+                            "bot is OFF (Intercom → master switch) — left for the team", rider_id=rid)
+        return
     lock = RIDER_LOCKS.setdefault(rid, asyncio.Lock())
     async with lock:
         await _handle_rider_reply(rid, text, conversation_id, in_auto, has_photo, tags)
@@ -2359,7 +2379,8 @@ async def automation_loop():
                 BOT_SENT.append((time.time(), _norm(text))); del BOT_SENT[:-300]
                 m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref, auto=True)
                 store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", "") or m.get("note", ""))
-            await flows.tick(now)
+            if ic_master()["bot"]:
+                await flows.tick(now)
             STATE["auto_last_error"] = ""
         except Exception as e:
             log.exception("automation failed: %s", e)
@@ -2774,6 +2795,8 @@ async def _unknown_rider(cid: str, name: str, text: str, conv: str):
     """We can't tell which rider this is (no profile link, never matched). Ask once for the order number — the
     number identifies him (the order's rider) and from then on he is known for good."""
     store.auto_log(datetime.now(UTC), "reply:unknown_rider", f"contact:{cid}", name, "", "", f"{text[:160]} — rider not identified yet", "received", "")
+    if not ic_master()["bot"]:
+        return                                              # bot off: the conversation stays with the team as it arrived
     if not conv or time.time() - UNKNOWN_ASKED.get(cid, 0) < 2 * 3600:
         if conv and intercom.ic.enabled:
             await intercom.ic.escalate(conv, f"⚠ {name}: rider not identified (no MotionTools profile link) and no order number — please answer.\nRider: {text[:300]}")
