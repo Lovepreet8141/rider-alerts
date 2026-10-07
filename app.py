@@ -141,7 +141,7 @@ def housekeeping(now: datetime, startup: bool = False):
             log.warning("could not shrink the legacy event file: %s", e)
     store.cleanup(now)
     try:
-        store.archive_old(now)
+        store.archive_old(now, int(env("ARCHIVE_DAYS", "45") or 45))
     except Exception as e:
         log.warning("archive failed: %s", e)
     rep = disk_report()
@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.9"
+VERSION = "7.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -173,6 +173,9 @@ app = FastAPI()
 async def _slow_request_log(request: Request, call_next):
     """Anything slower than 2 s is written to the system log with its path — Settings → System shows it."""
     t0 = time.monotonic()
+    if request.method != "GET" and request.url.path.startswith("/api/") \
+            and not request.url.path.startswith(("/api/intercom", "/api/automations", "/api/alerts", "/api/login")):
+        _RCACHE.clear()                                   # data behind the reports changed (reasons, fleets, shifts…)
     try:
         resp = await call_next(request)
     except Exception as e:
@@ -241,8 +244,9 @@ NETWORK_CACHE: dict = {}
 
 def network_now(now: datetime) -> dict:
     """Every city on one page: live counts from memory, today's results from SQL, a status per city."""
-    if NETWORK_CACHE and (now - NETWORK_CACHE["at"]).total_seconds() < 10:
-        return NETWORK_CACHE["data"]
+    nc_at, nc_data = NETWORK_CACHE.get("at"), NETWORK_CACHE.get("data")      # read once: another thread may clear it
+    if nc_at and nc_data is not None and (now - nc_at).total_seconds() < 15:
+        return nc_data
     today = store.network_today(now, rules.plan_grace_min)
     cities = {}
     for o in list(STATE["orders"].values()):
@@ -345,13 +349,98 @@ def _jdefault(v):
     return str(v)
 
 
+try:
+    import orjson as _orjson
+except Exception:
+    _orjson = None
+
+
 def json_bytes_response(obj) -> _Response:
-    body = json.dumps(obj, default=_jdefault, ensure_ascii=False, separators=(",", ":")).encode()
+    body = None
+    if _orjson is not None:
+        try:
+            body = _orjson.dumps(obj, default=_jdefault, option=_orjson.OPT_NON_STR_KEYS)
+        except Exception:
+            body = None
+    if body is None:
+        body = json.dumps(obj, default=_jdefault, ensure_ascii=False, separators=(",", ":")).encode()
     headers = {"Cache-Control": "no-store"}
     if _GZ_OK and len(body) > 4096:
         body = _gzip.compress(body, compresslevel=5)
         headers.update({"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
     return _Response(content=body, media_type="application/json", headers=headers)
+
+
+_RCACHE: dict = {}
+_RLOCKS: dict = {}
+_HEAVY = threading.Semaphore(2)
+_LAST_TRIM = [0.0]
+
+
+def _trim_memory():
+    """A month report builds hundreds of thousands of order dicts; Python frees them but keeps the memory. Hand it
+    back to the system (at most every 30 s) so Railway's memory stays low."""
+    if time.monotonic() - _LAST_TRIM[0] < 30:
+        return
+    _LAST_TRIM[0] = time.monotonic()
+    try:
+        import ctypes
+        import gc
+        gc.collect()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+import sys as _sys
+_sys.setswitchinterval(0.002)        # worker threads crunching a report hand the CPU back to the event loop every 2 ms
+_RGUARD = threading.Lock()
+
+
+def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True):
+    """Reports over many orders (week, month, fleets, riders…) are computed once and served from memory; several
+    dispatchers opening the same page share ONE computation. When a cached report is older than its ttl it is still
+    served at once (stale-while-revalidate) and a fresh one is computed in the background — so after the first
+    computation nobody waits for a month of orders again. Any change (POST) clears the cache."""
+    def deco(fn):
+        @_functools.wraps(fn)
+        def wrapper(*a, **kw):
+            key = (fn.__name__, a, tuple(sorted(kw.items())))
+            period = str(kw.get("period") or kw.get("day") or "")
+            live = period in ("", "today")
+            ttl = ttl_live if live else ttl_past
+            max_stale = (ttl * 4 if live else 1800) if stale else ttl
+            hit = _RCACHE.get(key)
+            age = time.monotonic() - hit[0] if hit else None
+            if hit and age < ttl:
+                return hit[1]
+            with _RGUARD:
+                lk = _RLOCKS.setdefault(key, threading.Lock())
+            if hit and age < max_stale:
+                if lk.acquire(blocking=False):            # nobody refreshing yet → refresh in the background
+                    def refresh():
+                        try:
+                            with _HEAVY:
+                                _RCACHE[key] = (time.monotonic(), fn(*a, **kw))
+                                _trim_memory()
+                        except Exception as e:
+                            log.warning("background refresh of %s failed: %s", fn.__name__, e)
+                        finally:
+                            lk.release()
+                    threading.Thread(target=refresh, daemon=True).start()
+                return hit[1]
+            with lk:
+                hit = _RCACHE.get(key)
+                if hit and time.monotonic() - hit[0] < ttl:
+                    return hit[1]
+                with _HEAVY:                                 # at most two big computations at once — the loop keeps its CPU share
+                    out = fn(*a, **kw)
+                    _trim_memory()
+                _RCACHE[key] = (time.monotonic(), out)
+                if len(_RCACHE) > 150:
+                    for k, _ in sorted(_RCACHE.items(), key=lambda kv: kv[1][0])[:50]:
+                        _RCACHE.pop(k, None)
+                return out
+        return wrapper
+    return deco
 
 
 def fast_json(fn):
@@ -927,6 +1016,19 @@ async def evaluate_loop():
         await asyncio.sleep(2)
 
 
+def prewarm_reports():
+    """After a start, compute the reports people open first (all cities + the default city), one after another."""
+    for c in ("", CITY):
+        for call in (lambda: api_fleets(period="week", city=c), lambda: api_insights(period="today", city=c),
+                     lambda: api_insights(period="week", city=c), lambda: api_riders_page(period="today", city=c, fleet=""),
+                     lambda: api_riders_page(period="week", city=c, fleet="")):
+            try:
+                call()
+            except Exception as e:
+                log.warning("prewarm failed: %s", e)
+            time.sleep(1)
+
+
 async def post_start(now: datetime):
     """The slow parts of a start (housekeeping, DB backup, replaying the event log) run AFTER the server is already
     answering — a restart at peak must not take the dashboard down for a minute."""
@@ -934,14 +1036,18 @@ async def post_start(now: datetime):
     # housekeeping (old files, GPS purge, vacuum) is NOT done at startup any more — the hourly run at :30 does it.
     # the first minutes after a deploy belong to the people opening the dashboard, so the heavy repair waits too.
     await asyncio.sleep(90)
+    loop.run_in_executor(None, prewarm_reports)        # in the background: the first visitor after a deploy doesn't wait
     try:
         backup = DATA_DIR / f"quickzi-backup-{now.strftime('%Y%m%d-%H%M')}.db"
         recent = [b for b in DATA_DIR.glob("quickzi-backup-*.db") if now.timestamp() - b.stat().st_mtime < 6 * 3600]
         if recent:
             raise RuntimeError("skipped — a backup from the last 6 h exists (restarts must not copy the DB every time)")
+        free = shutil.disk_usage(str(DATA_DIR)).free
+        if free < store.db_size_bytes() * 1.5:
+            raise RuntimeError("skipped — not enough free space on the volume for a copy of the database")
+        for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db")):
+            old_b.unlink(missing_ok=True)                # ONE backup is kept: at 10 000 orders a day the DB is GBs
         await loop.run_in_executor(None, store.backup_to, str(backup))
-        for old_b in sorted(DATA_DIR.glob("quickzi-backup-*.db"))[:-3]:
-            old_b.unlink(missing_ok=True)
     except Exception as e:
         log.warning("backup failed: %s", e)
     try:
@@ -965,7 +1071,7 @@ async def post_start(now: datetime):
                 break
         if total:
             store.log("info", f"{total} older orders received their city / day columns")
-        archived = await loop.run_in_executor(None, store.archive_old, now)
+        archived = await loop.run_in_executor(None, store.archive_old, now, int(env("ARCHIVE_DAYS", "45") or 45))
         if archived:
             store.log("info", f"{archived} orders older than 90 days archived (numbers kept, details dropped)")
         INSIGHTS_CACHE.clear(); PULSE_CACHE.clear(); NETWORK_CACHE.clear()
@@ -1070,9 +1176,22 @@ async def sync_loop():
         WAKE.clear()
 
 
+@app.on_event("shutdown")
+def shutdown():
+    try:
+        intercom.ic._flush()                     # the debounced thread file: nothing lost on a restart
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def startup():
     now = datetime.now(UTC)
+    try:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 16   # 40 worker threads × a DB reader each was memory for nothing
+    except Exception:
+        pass
     store.close_stale_sessions(now)
     for o in store.open_orders():
         STATE["orders"][o["id"]] = o
@@ -1178,8 +1297,9 @@ def process_event(p: dict):
         name = projector.apply(p)
         STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
         DIRTY["events"] += 1                                      # alerts are re-evaluated by evaluate_loop (every 2 s)
-        if str(p.get("event") or "") not in GPS_EVENTS:
-            PULSE_CACHE.clear()                                   # an order may have finished — today's numbers change
+        if str(p.get("event") or "") == "transition" and str((p.get("data") or {}).get("to") or "") in ("done", "completed", "finished", "paid", "processing_payment", "cancelled") \
+                or str(p.get("event") or "") == "stop_completed":
+            PULSE_CACHE["changed_at"] = datetime.now(UTC)         # an order finished — today's numbers are recomputed (max every 15 s)
         if mt.enabled and name != "other area":
             asyncio.create_task(enrich_after_event(p))          # fill names / phones / GPS through open endpoints
     else:
@@ -1270,6 +1390,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
 
 @app.get("/api/state", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(4, 4, stale=False)
 def api_state(city: str = "", done: int = 0):
     now = datetime.now(UTC)
     idx = alerts_index()
@@ -1284,9 +1405,11 @@ def api_state(city: str = "", done: int = 0):
         except Exception as e:                                   # one broken order must never blank the whole board
             log.warning("order_view failed for %s: %s", o.get("id"), e)
     orders = sorted(views, key=lambda v: (v["phase"] == "on_hold", -(v["elapsed"] or 0)))
-    PULSE_CACHE.setdefault("by_city", {})
-    pc = PULSE_CACHE["by_city"].get(city)
-    if pc is None or (now - pc["at"]).total_seconds() > 60:
+    by_city = PULSE_CACHE.setdefault("by_city", {})          # local ref: the webhook may clear PULSE_CACHE meanwhile
+    pc = by_city.get(city)
+    age = (now - pc["at"]).total_seconds() if pc else None
+    changed = PULSE_CACHE.get("changed_at")
+    if pc is None or age > 120 or (changed and changed > pc["at"] and age > 15):
         today = store.delivered("today", now, city=city)
         done_by, last_by = {}, {}
         for o in today:
@@ -1295,7 +1418,7 @@ def api_state(city: str = "", done: int = 0):
                 if o.get("delivered_at") and (o["rider_id"] not in last_by or o["delivered_at"] > last_by[o["rider_id"]]):
                     last_by[o["rider_id"]] = o["delivered_at"]
         recent = sorted(today, key=lambda o: o["delivered_at"], reverse=True)[:40]
-        pc = PULSE_CACHE["by_city"][city] = dict(at=now, n=len(today), ptods=[o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None],
+        pc = by_city[city] = dict(at=now, n=len(today), ptods=[o["phases"]["ptod"] for o in today if o["phases"]["ptod"] is not None],
                                                  plan=[o["phases"]["vs_plan"] for o in today if o["phases"]["vs_plan"] is not None], done_by=done_by, last_by=last_by,
                                                  recent=recent, cancelled=store.cancelled_today(now, city))
     ptods, plan = pc["ptods"], pc["plan"]
@@ -1356,6 +1479,7 @@ def api_state(city: str = "", done: int = 0):
 
 @app.get("/api/network", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(20, 20)
 def api_network():
     """The Overview page: every city, ranked by trouble."""
     now = datetime.now(UTC)
@@ -1447,6 +1571,7 @@ async def api_places_set(request: Request):
 
 @app.get("/api/riders", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(10, 10)
 def api_riders():
     """Known riders with their phone numbers — MotionTools' number if it sent one, otherwise the one typed in Settings."""
     rows = {r["id"]: r for r in store.riders()}
@@ -1580,6 +1705,7 @@ def cached(key: tuple, ttl: int, now: datetime, build):
 
 @app.get("/api/riders-page", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(60, 300)
 def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
     """The Riders page: every rider from orders + the shift sheet, status now, usual, per working hour, score."""
     _check_period(period)
@@ -2284,12 +2410,57 @@ async def _handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto
         await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
 
 
+LOOP_BEAT = {"t": time.monotonic(), "thread": None}
+BLOCKED: list = []          # the last loop stalls with the code that caused them (watchdog thread)
+
+
+def _watchdog():
+    """Runs in its own thread, so it sees what the event loop is doing even while the loop is frozen: if the loop has not
+    ticked for 3 s, the loop thread's current stack is written to the Railway log and kept for /health. That names the
+    exact line that blocks the server instead of guessing."""
+    import sys as _sys
+    import traceback as _tb
+    reported = 0.0
+    while True:
+        time.sleep(1)
+        stuck = time.monotonic() - LOOP_BEAT["t"]
+        if stuck < 3:
+            reported = 0.0
+            continue
+        if stuck - reported < 5:
+            continue
+        reported = stuck
+        try:
+            frame = _sys._current_frames().get(LOOP_BEAT["thread"])
+            stack = [ln.strip().replace("\n", " ") for ln in _tb.format_stack(frame)[-10:]] if frame else []
+        except Exception as e:
+            stack = [f"(no stack: {e})"]
+        entry = {"at": iso(datetime.now(UTC)), "stuck_s": round(stuck, 1), "queue": EVENT_QUEUE.qsize(), "stack": stack}
+        BLOCKED.append(entry); del BLOCKED[:-10]
+        print(f"QUICKZI EVENT LOOP BLOCKED {stuck:.1f}s (queue {EVENT_QUEUE.qsize()}) at:\n  " + "\n  ".join(stack), flush=True)
+
+
+def _mem_mb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    return 0.0
+
+
 async def loop_lag_monitor():
     """How long the server is blind: the event loop should wake every second; anything later = it was blocked."""
     worst = []
+    LOOP_BEAT["thread"] = threading.get_ident()
+    threading.Thread(target=_watchdog, name="loop-watchdog", daemon=True).start()
     while True:
         t = time.monotonic()
+        LOOP_BEAT["t"] = t
         await asyncio.sleep(1)
+        LOOP_BEAT["t"] = time.monotonic()
         lag = time.monotonic() - t - 1
         worst.append(lag); del worst[:-300]
         STATE["loop_lag"] = {"now_s": round(lag, 2), "max_5min_s": round(max(worst), 2)}
@@ -2390,6 +2561,7 @@ async def automation_loop():
 
 @app.get("/api/fleets", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(60, 300)
 def api_fleets(period: str = "week", city: str = ""):
     """The Fleets page: every MotionTools organization on the same metrics, 14-day trend, phases vs network, riders."""
     _check_period(period)
@@ -2409,6 +2581,7 @@ def api_fleets(period: str = "week", city: str = ""):
 
 @app.get("/api/shifts", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(30, 60)
 def api_shifts_get(day: str = ""):
     st = store.shifts_status()
     d = day or day_key(datetime.now(UTC))
@@ -2456,6 +2629,7 @@ async def api_probe():
 
 @app.get("/api/insights", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(60, 300)
 def api_insights(period: str = "today", city: str = ""):
     _check_period(period)
     try:
@@ -2468,6 +2642,7 @@ def api_insights(period: str = "today", city: str = ""):
 
 @app.get("/api/staffing", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(300, 600)
 def api_staffing(day: str = "", city: str = ""):
     """Riders per hour for one day (default tomorrow), weekday-aware, plus a summary for the next 7 days."""
     return store.staffing_plan(datetime.now(UTC), rules, day=day, city=city)
@@ -2487,6 +2662,7 @@ def _check_period(period):
 
 @app.get("/api/orders", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(15, 120)
 def api_orders(period: str = "today", q: str = "", city: str = ""):
     _check_period(period)
     now = datetime.now(UTC)
@@ -2565,6 +2741,7 @@ def api_order_events(oid: str):
 
 @app.get("/api/riders/{rid}", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(30, 300)
 def api_rider(rid: str, period: str = "today", city: str = ""):
     _check_period(period)
     now = datetime.now(UTC)
@@ -2579,6 +2756,7 @@ def api_rider(rid: str, period: str = "today", city: str = ""):
 
 @app.get("/api/daily", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(60, 600)
 def api_daily(day: str = "", city: str = ""):
     now = datetime.now(UTC)
     day = day or day_key(now - timedelta(days=1))
@@ -2707,6 +2885,7 @@ async def api_intercom_customer_fetch(request: Request, ref: str = "", key: str 
 
 @app.get("/api/system", dependencies=[Depends(require_login)])
 @fast_json
+@report_cache(30, 30)
 def api_system():
     s = STATE["sync"]
     return {"version": VERSION, "started": iso(STARTED), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60), "sync": s,
@@ -2857,7 +3036,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": intercom.ic.webhooks[:10], "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": intercom.ic.webhooks[:10], "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

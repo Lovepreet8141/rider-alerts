@@ -13,6 +13,7 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 
 UTC = timezone.utc
@@ -61,13 +62,22 @@ class Rules:
 
 
 # ---------------------------------------------------------------- helpers
-def ts(v) -> Optional[datetime]:
-    if not v:
-        return None
+@lru_cache(maxsize=262144)
+def _ts_str(v: str) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def ts(v) -> Optional[datetime]:
+    """Parse a timestamp. Strings are cached: a month report parses millions of them and most repeat (an order's
+    history repeats its own phase times)."""
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v.astimezone(UTC)
+    return _ts_str(v if isinstance(v, str) else str(v))
 
 
 def iso(dt: Optional[datetime]) -> Optional[str]:

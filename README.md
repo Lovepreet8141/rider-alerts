@@ -23,6 +23,29 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 7.0 — built for 10 000+ orders a day
+Load-tested on a copy with 25 cities: 10 000 orders today (1 000 live at once, 1 500 riders), 280 000 orders of
+history (30 days, 1.2 GB DB), GPS 50/s + new orders 5/s, six dispatchers polling, every report page opened.
+- **Readers no longer block the webhook.** Before: one DB connection + one lock — a month report held the lock and
+  the event loop (and MotionTools' webhook) waited up to 46 s. Now every thread reads through its own connection (WAL),
+  only writes take the lock. Backups copy through their own connection; big deletes/archiving run in 2 000-row slices.
+- **Reports are cached** (stale-while-revalidate): first computation once, then instant; an expired report is served
+  at once while a fresh one is computed in the background; max two big computations at a time; common reports are
+  pre-computed after a deploy. Any change (reasons, fleets, shifts, settings) clears the cache.
+- **Today's numbers** on the City page are no longer recomputed on every event (was: 10 000 orders parsed per refresh).
+- Faster parsing (orjson, cached timestamps), restaurant waits computed once per order, memory handed back after big reports.
+- Fixed: rare 500 on /api/state when an event arrived during a refresh (`KeyError: 'by_city'`).
+- Results: webhook p99 47 ms (max 0.3 s) under full load, 0 failed deliveries, longest loop stall 0.14 s (was 46 s);
+  City page all cities 0.16 s (was 2.2 s); cached reports 5–25 ms; memory ~650 MB (was 1.1 GB); restart: answering
+  after 3.5 s, webhook p99 < 0.6 s during the start-up repair.
+- Railway: volume ≥ 20 GB recommended at this volume (one DB backup is kept; raw order details archived after
+  `ARCHIVE_DAYS`, default 45). New dependency: `orjson` (requirements.txt).
+
+## 6.9.1 — watchdog
+- A watchdog thread writes `QUICKZI EVENT LOOP BLOCKED …s at: <file, line>` to the Railway log (and /health →
+  `loop_blocked`) whenever the server stops answering for 3 s+, so a freeze names its exact cause. /health also shows `memory_mb`.
+- Intercom thread file is written at most every 10 s (before: the whole file on every message, on the event loop); 100 messages kept per rider.
+
 ## 6.9 — master switches, safe city list, relay without variables
 - Intercom page → **Intercom automation**: two master switches. *Bot answers rider queries* (off = the dashboard writes
   nothing in rider chats, no timers, no order-number question) and *Rule messages* (off = no automatic rule message to

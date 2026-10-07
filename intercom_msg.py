@@ -36,7 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 HOSTS = {"us": "https://api.intercom.io", "eu": "https://api.eu.intercom.io", "au": "https://api.au.intercom.io"}
 API_VERSION = "2.11"
-MAX_PER_THREAD = 200
+MAX_PER_THREAD = 100
 
 
 def _text(h: str) -> str:
@@ -105,9 +105,21 @@ class Intercom:
             return {}
 
     def _save(self):
+        """Debounced: the whole thread file (thousands of messages) was rewritten on EVERY incoming or outgoing message —
+        on the event loop. Now it is written at most every 10 s."""
+        if getattr(self, "_save_due", False):
+            return
+        self._save_due = True
+        try:
+            asyncio.get_running_loop().call_later(10, self._flush)
+        except RuntimeError:
+            self._flush()
+
+    def _flush(self):
+        self._save_due = False
         with self.lock:
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.threads, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(json.dumps(self.threads, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
             tmp.replace(self.path)
 
     def thread(self, rider_id: str, name: str = "", phone: str = "") -> dict:

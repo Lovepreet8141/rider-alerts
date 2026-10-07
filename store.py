@@ -18,10 +18,17 @@ from __future__ import annotations
 import csv
 import io
 import json
+try:
+    import orjson as _orjson                 # 3–5× faster JSON (optional; plain json if it is not installed)
+    _loads = _orjson.loads
+except Exception:                            # pragma: no cover
+    _orjson = None
+    _loads = json.loads
 import math
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from statistics import mean, median
 
@@ -128,7 +135,7 @@ def day_key(dt: datetime) -> str:
 
 def _avg(vals):
     vals = [v for v in vals if v is not None]
-    return round(mean(vals), 1) if vals else None
+    return round(math.fsum(vals) / len(vals), 1) if vals else None      # statistics.mean is ~20× slower
 
 
 def _pct(ok, n):
@@ -163,9 +170,13 @@ def _count(values) -> dict:
 class Store:
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.path = path
+        self.db = sqlite3.connect(path, check_same_thread=False)        # the ONE writer connection (guarded by self.lock)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.Lock()
+        self._local = threading.local()          # one read-only connection per thread (WAL: readers never wait for the writer)
+        self._batch = False
+        self._batch_thread = None
         self._alert_written: dict = {}          # alert id -> last payload written (skip identical UPDATEs)
         with self.lock:
             # WAL + synchronous=NORMAL: a commit no longer fsyncs the main file (the Railway volume is slow at that);
@@ -222,14 +233,48 @@ class Store:
         self._exec("UPDATE orders SET fleet=? WHERE rider_id=?", (fleet, rider_id))
 
     def areas_seen(self) -> list:
-        """Every service area that ever appeared on an order, with its name (if given) and order count (30 days)."""
-        rows = self._rows("SELECT area, city, COUNT(*) AS n, MAX(updated_at) AS last FROM orders WHERE area IS NOT NULL AND area != '' "
-                          "AND updated_at >= ? GROUP BY area ORDER BY n DESC", (iso(datetime.now(UTC) - timedelta(days=30)),))
+        """Every service area that ever appeared on an order, with its name (if given) and order count (30 days).
+        Cached 10 min: a GROUP BY over a month of orders ran on every page refresh."""
+        c = getattr(self, "_areas_cache", None)
+        if c and time.monotonic() - c[0] < 600:
+            rows = c[1]
+        else:
+            rows = self._areas_rows()
+            self._areas_cache = (time.monotonic(), rows)
         return [{"area": r["area"], "name": self.city_map.get(r["area"], ""), "shown_as": r["city"] or r["area"][:8], "orders": r["n"], "last": r["last"]} for r in rows]
 
+    def _areas_rows(self) -> list:
+        return self._rows("SELECT area, city, COUNT(*) AS n, MAX(updated_at) AS last FROM orders WHERE area IS NOT NULL AND area != '' "
+                          "AND updated_at >= ? GROUP BY area ORDER BY n DESC", (iso(datetime.now(UTC) - timedelta(days=30)),))
+
+    def _reader(self):
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = sqlite3.connect(self.path, check_same_thread=False)
+            c.row_factory = sqlite3.Row
+            for pragma in ("busy_timeout=5000", "temp_store=MEMORY", "cache_size=-4000", "query_only=1"):
+                try:
+                    c.execute(f"PRAGMA {pragma}")
+                except Exception:
+                    pass
+            self._local.conn = c
+        return c
+
     def _rows(self, sql, args=()):
-        with self.lock:
-            return [dict(r) for r in self.db.execute(sql, args).fetchall()]
+        """Reads never take the writer lock any more: with one shared connection + lock, a month report in a worker
+        thread held the lock for a minute and the event loop (webhook!) waited behind it. In WAL mode every thread
+        reads through its own connection and sees everything committed. Only the thread doing a batched write reads
+        through the writer, so it sees its own uncommitted rows."""
+        if self._batch and self._batch_thread == threading.get_ident():
+            with self.lock:
+                return [dict(r) for r in self.db.execute(sql, args).fetchall()]
+        try:
+            return [dict(r) for r in self._reader().execute(sql, args).fetchall()]
+        except sqlite3.OperationalError as e:
+            if "no such" in str(e) or "locked" in str(e):           # schema changed under an old reader → reconnect once
+                self._local.conn = None
+                return [dict(r) for r in self._reader().execute(sql, args).fetchall()]
+            raise
 
     def _exec(self, sql, args=()):
         with self.lock:
@@ -242,9 +287,11 @@ class Store:
         """Many writes, one commit (startup repair, backfills): a commit per row on the Railway volume is what
         held the lock for minutes."""
         self._batch = True
+        self._batch_thread = threading.get_ident()
 
     def end_batch(self):
         self._batch = False
+        self._batch_thread = None
         with self.lock:
             self.db.commit()
 
@@ -369,7 +416,7 @@ class Store:
         return n
 
     def _hydrate(self, r: dict) -> dict:
-        o = json.loads(r["raw"]) if r.get("raw") else new_order(r["id"], r.get("ref") or "", r.get("area"))
+        o = _loads(r["raw"]) if r.get("raw") else new_order(r["id"], r.get("ref") or "", r.get("area"))
         if not r.get("raw"):                       # archived row: rebuild what the columns know
             for k in ("rider_id", "rider", "restaurant", "place_id", "customer_addr", "customer_zip", "status", "phase", "cancel_reason",
                       "dispatched_at", "accepted_at", "started_at", "at_restaurant_at", "picked_up_at", "at_customer_at", "delivered_at"):
@@ -477,7 +524,18 @@ class Store:
         """Rows older than keep_days lose their raw JSON (history, addresses, phones) but keep every number the reports
         use. At 170 000 orders a month this keeps the database at a fraction of the size."""
         cutoff = day_key(now - timedelta(days=keep_days))
-        return self._exec("UPDATE orders SET raw=NULL WHERE day < ? AND raw IS NOT NULL AND closed=1", (cutoff,)).rowcount
+        return self._chunked("UPDATE orders SET raw=NULL WHERE rowid IN (SELECT rowid FROM orders WHERE day < ? AND raw IS NOT NULL AND closed=1 LIMIT 2000)", (cutoff,))
+
+    def _chunked(self, sql, args) -> int:
+        """Big UPDATE/DELETE in slices of 2000 rows, each its own short write — never one statement that holds the
+        database for seconds while live events wait."""
+        total = 0
+        while True:
+            n = self._exec(sql, args).rowcount
+            total += max(n, 0)
+            if n < 2000:
+                return total
+            time.sleep(0.05)
 
     def network_today(self, now: datetime, grace: int) -> dict:
         """Per city, today, straight from SQL: delivered, on-time %, avg PTOD, cancelled, orders per hour."""
@@ -617,20 +675,24 @@ class Store:
         return round(d / 1000, 1)
 
     def cleanup(self, now: datetime):
-        self._exec("DELETE FROM positions WHERE at < ?", (iso(now - timedelta(days=self.POSITION_KEEP_DAYS)),))
-        self._exec("DELETE FROM rider_sessions WHERE online_at < ?", (iso(now - timedelta(days=60)),))
-        self._exec("DELETE FROM alerts WHERE opened_at < ?", (iso(now - timedelta(days=90)),))
+        self._chunked("DELETE FROM positions WHERE rowid IN (SELECT rowid FROM positions WHERE at < ? LIMIT 2000)", (iso(now - timedelta(days=self.POSITION_KEEP_DAYS)),))
+        self._chunked("DELETE FROM rider_sessions WHERE rowid IN (SELECT rowid FROM rider_sessions WHERE online_at < ? LIMIT 2000)", (iso(now - timedelta(days=60)),))
+        self._chunked("DELETE FROM alerts WHERE rowid IN (SELECT rowid FROM alerts WHERE opened_at < ? LIMIT 2000)", (iso(now - timedelta(days=90)),))
 
     def backup_to(self, path: str):
+        """Copies through its own connection — the writer (and so the webhook) is never blocked by a backup."""
         import sqlite3 as _sq
-        with self.lock:
-            dst = _sq.connect(path)
-            self.db.backup(dst)
-            dst.close()
+        src = _sq.connect(self.path)
+        dst = _sq.connect(path)
+        try:
+            src.backup(dst, pages=2000, sleep=0.01)
+        finally:
+            dst.close(); src.close()
 
     def db_size_bytes(self) -> int:
         try:
-            page, cnt = self.db.execute("PRAGMA page_size").fetchone()[0], self.db.execute("PRAGMA page_count").fetchone()[0]
+            c = self._reader()
+            page, cnt = c.execute("PRAGMA page_size").fetchone()[0], c.execute("PRAGMA page_count").fetchone()[0]
             return page * cnt
         except Exception:
             return 0
@@ -700,9 +762,9 @@ class Store:
 
         # --- restaurants ---
         restaurants = []
-        kitchen, own_waits = {}, {}                         # per order: kitchen wait (any rider) · per rider: own waits
+        kitchen, own_waits, rwait = {}, {}, {}              # per order: kitchen wait (any rider) · per rider: own waits
         for o in orders:
-            k, w = restaurant_waits(o)
+            k, w = rwait[o["id"]] = restaurant_waits(o)     # computed ONCE per order (was three times)
             kitchen[o["id"]] = k
             for rid, (m, gave_up) in w.items():
                 if rid and m is not None:
@@ -715,7 +777,7 @@ class Store:
                                 "refs": [o["ref"] for o in rs_sorted[:4]],
                                 "avg_wait": _avg([kitchen.get(o["id"]) for o in d]),          # first rider's arrival -> pickup
                                 "max_wait": max([kitchen.get(o["id"]) or 0 for o in d], default=None),
-                                "gave_up": sum(1 for o in rs for _, g in restaurant_waits(o)[1].values() if g),
+                                "gave_up": sum(1 for o in rs for _, g in rwait[o["id"]][1].values() if g),
                                 "avg_ptod": _avg([o["phases"]["ptod"] for o in d]),
                                 "within_pct": _within(d, tgt)})
         restaurants.sort(key=lambda x: -(x["avg_wait"] or 0))
@@ -744,7 +806,7 @@ class Store:
             for h in o.get("history") or []:
                 if h.get("what") == "released" and h.get("rider_id"):
                     handbacks[h["rider_id"]] = handbacks.get(h["rider_id"], 0) + 1
-            for rid, (m, gave_up) in restaurant_waits(o)[1].items():
+            for rid, (m, gave_up) in rwait[o["id"]][1].items():
                 if gave_up and rid and m is not None and m >= rules.wait_restaurant_min:
                     excused[rid] = excused.get(rid, 0) + 1       # handed back after waiting long enough — the kitchen's fault
         riders = []
@@ -755,7 +817,8 @@ class Store:
             ph = lambda k: _avg([o["phases"][k] for o in d])
             busy = sum((o["phases"]["ptod"] or 0) - (o["phases"]["to_accept"] or 0) for o in d)  # accept -> delivered
             online = self.online_minutes(rid, start, min(end, now)) if sessions_ok else 0
-            kms = [self.trail_km(o) for o in d[-8:]]            # one positions query per order — keep it small
+            pos_from = now - timedelta(days=self.POSITION_KEEP_DAYS)   # GPS points exist only for the last days
+            kms = [self.trail_km(o) for o in d[-4:] if o.get("delivered_at") and o["delivered_at"] >= pos_from]
             kms = [k for k in kms if k]
             riders.append({"rider_id": rid, "rider": rs[-1]["rider"] or "Unknown", "city": rs[-1].get("city") or "", "fleet": rs[-1].get("fleet") or "",
                            "orders": len(rs), "delivered": len(d),
