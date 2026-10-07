@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.6.2"
+VERSION = "6.6.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -422,10 +422,23 @@ async def probe_endpoints(now: datetime, quiet: bool = False):
         store.log("info", "MotionTools endpoint check: " + mt.endpoint_summary())
 
 
-async def enrich_order(bid: str, now: datetime = None) -> bool:
-    """Webhook mode: read one booking through the API (if the detail endpoint is open) and fill the gaps."""
+ENRICH_BG_PER_HOUR = int(env("ENRICH_BG_PER_HOUR", "30") or 30)
+ENRICH_LOG: list = []
+
+
+async def enrich_order(bid: str, now: datetime = None, bg: bool = True) -> bool:
+    """Webhook mode: read one booking through the API (if the detail endpoint is open) and fill the gaps.
+    MotionTools allows only a small number of detail reads per hour in restricted mode — background enrichment
+    (new orders, alerts) gets ENRICH_BG_PER_HOUR of them, so a rider asking for the customer's number always
+    finds quota left (bg=False skips the budget)."""
     if not mt.enabled or not mt.detail_available():
         return False
+    t = time.time()
+    ENRICH_LOG[:] = [x for x in ENRICH_LOG if t - x < 3600]
+    if bg and len(ENRICH_LOG) >= ENRICH_BG_PER_HOUR:
+        return False
+    if bg:
+        ENRICH_LOG.append(t)
     b = await mt.get_booking(bid)
     if not b:
         return False
@@ -770,7 +783,20 @@ def compute_stacks(now: datetime):
 
 
 def evaluate_all(now: datetime):
+    t0 = time.monotonic()
+    store.begin_batch()
+    try:
+        _evaluate_all(now)
+    finally:
+        store.end_batch()
+        STATE["eval_ms"] = int((time.monotonic() - t0) * 1000)
+
+
+def _evaluate_all(now: datetime):
     compute_stacks(now)
+    by_order: dict = {}
+    for oid, kind in list(STATE["open_alerts"]):
+        by_order.setdefault(oid, []).append(kind)
     for key in [k for k in list(STATE["open_alerts"]) if k[0] not in STATE["orders"]]:
         store.resolve_alert(STATE["open_alerts"].pop(key), "order completed", now)
         STATE["sev"].pop(key, None)
@@ -788,7 +814,7 @@ def evaluate_all(now: datetime):
                 store.update_alert(STATE["open_alerts"][key], payload, now)
             else:
                 STATE["open_alerts"][key] = store.open_alert(payload, now)
-        for key in [k for k in STATE["open_alerts"] if k[0] == o["id"] and k[1] not in conds]:
+        for key in [(o["id"], kind) for kind in by_order.get(o["id"], ()) if kind not in conds and (o["id"], kind) in STATE["open_alerts"]]:
             store.resolve_alert(STATE["open_alerts"].pop(key), PHASE_LABEL.get(o["phase"], o["phase"]).lower(), now)
             STATE["sev"].pop(key, None)
             STATE["heads"].pop(key, None)
@@ -929,7 +955,10 @@ async def sync_loop():
                         store.log("info", f"MotionTools bookings endpoint works ({mt.stats['bookings_path']}) — switching to API mode")
                         first = True
                     elif mt.stats.get("detail_path"):
-                        for o in list(STATE["orders"].values()):        # finished while we were down? close them now
+                        # finished while we were down? only the oldest few — reading every order burned the hourly quota
+                        stale = sorted((o for o in list(STATE["orders"].values()) if o.get("dispatched_at") and (now - o["dispatched_at"]).total_seconds() > 90 * 60),
+                                       key=lambda o: o["dispatched_at"])[:10]
+                        for o in stale:
                             await enrich_order(o["id"], now)
                 if last_sweep is None or (now - last_sweep) >= timedelta(minutes=2):
                     await sweep_rider_status(now)
@@ -1025,6 +1054,7 @@ async def startup():
     asyncio.create_task(automation_loop())
     asyncio.create_task(city_names_loop())
     asyncio.create_task(intercom_match_loop())
+    asyncio.create_task(loop_lag_monitor())
 
 
 # ====================================================================== webhook (wakes the sync)
@@ -1176,7 +1206,7 @@ def api_state(city: str = "", done: int = 0):
     orders = sorted(views, key=lambda v: (v["phase"] == "on_hold", -(v["elapsed"] or 0)))
     PULSE_CACHE.setdefault("by_city", {})
     pc = PULSE_CACHE["by_city"].get(city)
-    if pc is None or (now - pc["at"]).total_seconds() > 20:
+    if pc is None or (now - pc["at"]).total_seconds() > 60:
         today = store.delivered("today", now, city=city)
         done_by, last_by = {}, {}
         for o in today:
@@ -1505,7 +1535,7 @@ async def api_automations_get(recheck: int = 0):
     now = datetime.now(UTC)
     counts = store.auto_counts(now)
     st = intercom.ic.status
-    if intercom.ic.enabled and (recheck or not st.get("checked") or st.get("error")):
+    if intercom.ic.enabled and (recheck or not st.get("checked")):
         try:
             await intercom.ic.check(force=True)                 # an error is re-checked on every visit, so a fix shows at once
         except Exception as e:
@@ -1591,6 +1621,26 @@ async def api_flow_clear(rid: str):
         await _flow_forward(rid, st["conv"], "a person took over from the dashboard", o=_rider_live_order(rid))
     flows.clear(rid)
     return {"ok": True}
+
+
+@app.get("/api/debug/booking-shape", dependencies=[Depends(require_login)])
+def api_booking_shape():
+    """Which fields a MotionTools booking detail has (values masked) — to see where the customer's phone lives."""
+    b = STATE["raw_samples"].get("booking")
+    def shape(x, d=0):
+        if d > 5:
+            return "…"
+        if isinstance(x, dict):
+            return {k: shape(v, d + 1) for k, v in x.items()}
+        if isinstance(x, list):
+            return [shape(x[0], d + 1)] if x else []
+        if isinstance(x, str):
+            return f"str({len(x)})" if x else "''"
+        return type(x).__name__
+    o = next((x for x in list(STATE["orders"].values()) if x.get("customer_addr")), None)
+    return {"have_sample": bool(b), "shape": shape(b) if b else None,
+            "example_order_fields": {k: bool(o.get(k)) for k in ("customer_phone", "customer_name", "customer_notes", "customer_addr")} if o else None,
+            "orders_with_phone": sum(1 for x in list(STATE["orders"].values()) if x.get("customer_phone")), "orders_live": len(STATE["orders"])}
 
 
 @app.post("/api/automations/classify", dependencies=[Depends(require_login)])
@@ -2010,7 +2060,7 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
     intent = classify(text, has_photo, tags)
     if o is not None and intent in CUSTOMER_INTENTS and not o.get("customer_phone"):
         try:
-            await enrich_order(o["id"], now)
+            await enrich_order(o["id"], now, bg=False)
         except Exception:
             pass
     msgs = intercom.ic.threads.get(rid, {}).get("messages", [])
@@ -2022,6 +2072,21 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
     except Exception as e:
         log.exception("rider reply failed: %s", e)
         await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
+
+
+async def loop_lag_monitor():
+    """How long the server is blind: the event loop should wake every second; anything later = it was blocked."""
+    worst = []
+    while True:
+        t = time.monotonic()
+        await asyncio.sleep(1)
+        lag = time.monotonic() - t - 1
+        worst.append(lag); del worst[:-300]
+        STATE["loop_lag"] = {"now_s": round(lag, 2), "max_5min_s": round(max(worst), 2)}
+        if lag > 3:
+            STATE.setdefault("slow", []).append({"at": iso(datetime.now(UTC)), "path": "(server blocked)", "s": round(lag, 1),
+                                                 "eval_ms": STATE.get("eval_ms"), "queue": EVENT_QUEUE.qsize()})
+            del STATE["slow"][:-30]
 
 
 async def intercom_match_loop():
@@ -2096,7 +2161,9 @@ async def automation_loop():
         try:
             now = datetime.now(UTC)
             STATE["auto_last_tick"] = iso(now)
+            t0 = time.monotonic()
             todo = await asyncio.get_event_loop().run_in_executor(None, automation_tick, now)
+            STATE["auto_tick_ms"] = int((time.monotonic() - t0) * 1000)
             for aid, rid, name, text, ref in todo:
                 r = STATE["riders"].get(rid, {})
                 m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref, auto=True)
@@ -2517,7 +2584,9 @@ async def api_intercom_match_riders():
 async def health():                                           # async: answers even when every worker thread waits on the DB
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
-            "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-5:], "automation_error": STATE.get("auto_last_error", ""),
+            "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
+            "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},

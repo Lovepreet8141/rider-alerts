@@ -127,6 +127,43 @@ def _addr(stop: dict) -> str:
     return ", ".join(x for x in [street, city] if x)
 
 
+def _deep_find(obj, words, skip=(), depth=0):
+    """First non-empty string value whose key contains one of `words` (searches nested dicts/lists).
+    MotionTools tenants put the customer's phone / name / notes under different keys — this finds them anyway."""
+    if depth > 4 or obj is None:
+        return ""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if any(w in kl for w in words) and not any(x in kl for x in skip) and isinstance(v, (str, int)) and str(v).strip():
+                return str(v).strip()
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and not any(x in str(k).lower() for x in skip):
+                r = _deep_find(v, words, skip, depth + 1)
+                if r:
+                    return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _deep_find(v, words, skip, depth + 1)
+            if r:
+                return r
+    return ""
+
+
+def customer_fields(b: dict, drop: dict) -> dict:
+    """Customer phone / name / delivery notes: the dropoff stop first, then booking-level customer/recipient/contact."""
+    skip = ("driver", "courier", "restaurant", "pickup", "place", "vendor", "merchant", "created_by", "dispatcher", "organization")
+    holders = [drop] + [b.get(k) for k in ("customer", "recipient", "receiver", "contact", "end_customer", "consignee", "passenger", "client") if isinstance(b.get(k), dict)]
+    phone = name = notes = ""
+    for h in holders:
+        phone = phone or _deep_find(h, ("phone", "mobile", "telefon", "msisdn"), skip)
+        name = name or _deep_find(h, ("contact_name", "recipient_name", "customer_name", "full_name", "first_name", "name"), skip + ("street", "city", "place_name", "company"))
+        notes = notes or _deep_find(h, ("note", "comment", "instruction", "description", "remark", "hint", "details"), skip)
+    if not phone:
+        phone = _deep_find(b.get("custom_fields") or b.get("metadata") or b.get("properties") or {}, ("phone", "mobile", "telefon"), skip)
+    return {"customer_phone": phone, "customer_name": name, "customer_notes": notes[:300]}
+
+
 def _name(obj: Optional[dict]) -> str:
     if not obj:
         return ""
@@ -202,9 +239,7 @@ def parse_booking(b: dict) -> dict:
         "area": (b.get("service_area") or {}).get("id"), "area_name": (b.get("service_area") or {}).get("name"),
         "rider_id": driver.get("id"), "rider": _name(driver), "restaurant": restaurant,
         "restaurant_phone": pick.get("phone_number") or "", "customer_addr": _addr(drop),
-        "customer_phone": drop.get("phone_number") or "",
-        "customer_name": _name(drop.get("contact") if isinstance(drop.get("contact"), dict) else None) or drop.get("contact_name") or drop.get("name") or drop.get("recipient_name") or "",
-        "customer_notes": " ".join(str(drop.get(k)) for k in ("notes", "note", "comment", "instructions", "delivery_instructions", "address_notes", "description") if drop.get(k))[:300],
+        **customer_fields(b, drop),
         "pick_lat": pick.get("lat"), "pick_lng": pick.get("lng"), "drop_lat": drop.get("lat"), "drop_lng": drop.get("lng"),
         "rider_lat": loc.get("lat"), "rider_lng": loc.get("lng"),
         "eta_restaurant": ts(pick.get("expected_arrival_at")), "eta_customer": ts(drop.get("expected_arrival_at")),
