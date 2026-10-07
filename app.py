@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.6.4"
+VERSION = "6.6.7"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1647,8 +1647,16 @@ def api_booking_shape():
 async def api_classify(request: Request):
     """Intercom page: 'what would the dashboard understand?' — type a rider message, see the intent."""
     body = await request.json() or {}
-    i = classify(str(body.get("text") or ""), bool(body.get("photo")))
-    return {"intent": i, "label": INTENT_LABEL.get(i, i)}
+    text = str(body.get("text") or "")
+    i, via = classify(text, bool(body.get("photo"))), "keywords"
+    if i == "other" and ANTHROPIC_KEY:
+        try:
+            g = await smart_intent(text, None)
+            if g:
+                i, via = g, "Claude"
+        except Exception as e:
+            return {"intent": i, "label": f"{INTENT_LABEL.get(i, i)} (Claude error: {str(e)[:80]})"}
+    return {"intent": i, "label": f"{INTENT_LABEL.get(i, i)} — via {via}"}
 
 
 @app.post("/api/automations", dependencies=[Depends(require_login)])
@@ -2047,7 +2055,24 @@ def _others(rid: str, o) -> str:
 
 
 flows = RiderFlows(store)
-flows.deps = {"order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
+def _order_by_ref(text: str):
+    """An order reference anywhere in the rider's message (6–8 letters/digits like 7DDP8F) that we know today."""
+    import re as _re
+    for tok in _re.findall(r"\b[A-Z0-9]{5,9}\b", (text or "").upper()):
+        if not _re.search(r"[A-Z]", tok) or not _re.search(r"\d", tok):
+            continue
+        hit = next((o for o in list(STATE["orders"].values()) if (o.get("ref") or "").upper() == tok), None)
+        if hit is None:
+            try:
+                hit = next((o for o in store.orders_in("today", datetime.now(UTC)) if (o.get("ref") or "").upper() == tok), None)
+            except Exception:
+                hit = None
+        if hit is not None:
+            return hit
+    return None
+
+
+flows.deps = {"order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
               "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
 
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
@@ -2585,7 +2610,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "claude_classifier": bool(ANTHROPIC_KEY), "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

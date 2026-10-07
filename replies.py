@@ -58,6 +58,8 @@ QUERIES = [
      "Die Bestellung ist bei uns schon abgeschlossen – alles gut. / The order is already completed on our side – all good."),
     ("q:damaged", "Order damaged → ask for a photo",
      "Bitte schick mir ein Foto der Bestellung. / Please send me a photo of the order."),
+    ("q:order_ref", "Rider sends only an order number → confirm the order, ask what's wrong",
+     "Danke, Bestellung {ref} gefunden ({status}, {restaurant} → {address}). Was ist das Problem? / Thanks, found order {ref} ({status}, {restaurant} → {address}). What is the problem?"),
     ("q:other", "Anything unclear → one question (never the order number)",
      "Wie können wir helfen? / How can we help?"),
     ("q:ack", "Rider confirms an automatic message (ok / arrived / on the way)",
@@ -94,7 +96,9 @@ CANT = ("can't do", "cant do", "cannot do", "can't deliver", "cant deliver", "ca
         "kann nicht machen", "can't continue", "cannot continue", "nicht weiter", "unable", "bike", "fahrrad", "panne", "flat", "platten", "reifen", "tire", "tyre",
         "sick", "krank", "going home", "nach hause", "feierabend", "too far", "zu weit", "too big", "zu groß", "zu gross", "nahi kar sakta", "لا أستطيع التوصيل",
         "teslim edemiyorum", "i can't", "ich kann nicht")
-UNREACH = ("ما يرد", "ما بيرد", "مش بيرد", "مابيرد", "ما يجاوب", "لا يجيب", "ما يرد على", "مش عم يرد", "ما حدا بيفتح", "cannot contact", "can't contact", "cant contact", "not contact", "nicht kontaktieren", "no contact", "not answering", "doesn't answer", "does not answer", "no answer", "keine antwort", "geht nicht ran", "nicht erreich", "can't reach", "cant reach",
+UNREACH = ("التواصل", "تواصل", "الاتصال", "اتصل", "اتصال", "يرد", "يجاوب", "يرد على", "communicat", "can't call", "cannot call", "not reachable",
+           "erreichen", "erreiche", "nicht erreichbar", "ulaşamıyorum", "ulasamiyorum", "cevap vermiyor", "ne javlja", "ne odgovara", "ne mogu kontaktirati",
+           "contact nahi", "baat nahi", "ما يرد", "ما بيرد", "مش بيرد", "مابيرد", "ما يجاوب", "لا يجيب", "ما يرد على", "مش عم يرد", "ما حدا بيفتح", "cannot contact", "can't contact", "cant contact", "not contact", "nicht kontaktieren", "no contact", "not answering", "doesn't answer", "does not answer", "no answer", "keine antwort", "geht nicht ran", "nicht erreich", "can't reach", "cant reach",
            "cannot reach", "not reach", "not picking", "not responding", "doesn't respond", "doesnt respond", "nobody opens", "macht nicht auf", "not opening",
            "door", "tür", "tuer", "klingel", "bell", "nicht erreichbar", "unreachable", "switched off", "ausgeschaltet", "mailbox", "voicemail",
            "لا يرد", "cevap vermiyor", "phone nahi utha", "utha nahi")
@@ -192,7 +196,7 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "customer_phone"
     if _has(low, CANT):
         return "cant_deliver"
-    if _has_word(low, NO) and len(low.strip()) <= 40:
+    if _has_word(low, NO) and len(low.strip()) <= 40 and not _has(low, CUSTOMER) and not _has(low, ("restaurant", "مطعم", "المطعم")):
         return "no"
     if _has(low, NOT_READY) and not _has(low, CUSTOMER):
         return "not_ready"
@@ -215,7 +219,7 @@ INTENT_LABEL = {"not_ready": "order not ready", "closed": "restaurant closed", "
                 "cant_deliver": "can't do the delivery", "customer_unreachable": "customer not reachable", "customer_find": "can't find the address",
                 "customer_phone": "asked for the customer's number", "customer_problem": "problem at the customer", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
-                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready"}
+                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
@@ -239,6 +243,7 @@ class RiderFlows:
         self.asked_other: dict = {}     # rider id -> time we last asked "how can we help?"
         self.sent_keys: dict = {}       # rider id -> {query key: time sent}
         self._last: dict = {}           # rider id -> his last message
+        self.named_ref: dict = {}       # rider id -> (order ref he wrote himself, when)
         self.deps: dict = {}
         self._load()
 
@@ -312,7 +317,15 @@ class RiderFlows:
     async def on_message(self, rid: str, text: str, conv: str, in_auto: bool = False, has_photo: bool = False, last_ops_auto: bool = False, tags=None) -> str:
         d = self.deps
         o = d["order_for"](rid)
+        named = d["order_by_ref"](text) if d.get("order_by_ref") else None
+        if named is not None:
+            o = named                                    # the rider named the order himself — that's the one he means
+            self.named_ref[rid] = (named.get("ref"), time.time())
+        elif o is None and rid in self.named_ref and time.time() - self.named_ref[rid][1] < 2 * 3600 and d.get("order_by_ref"):
+            o = d["order_by_ref"](self.named_ref[rid][0])   # he told us the order earlier in this chat
         intent = classify(text, has_photo, tags)
+        if named is not None and intent == "other" and len((text or "").split()) <= 3:
+            intent = "order_ref"
         st = self.state.get(rid)
         self._last[rid] = (text or "")[:200]
         if st:
@@ -472,6 +485,14 @@ class RiderFlows:
         if intent == "photo":
             await self._fwd(rid, conv, "📷 photo received without text", o=o)
             return "photo forwarded"
+        if intent == "order_ref":
+            if self.on("q:order_ref"):
+                await self._send(rid, conv, "q:order_ref", o, status=d["status_of"](o) if d.get("status_of") else o.get("phase", ""),
+                                 address=f"{o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip())
+                self.set(rid, "other_wait", "", 30, conv=conv, ref=o.get("ref", ""))
+                return "order recognised, asked what's wrong"
+            await self._fwd(rid, conv, f"✉ order {o.get('ref')}", o=o)
+            return "forwarded"
         if intent in ("ack", "yes", "ready"):
             if in_auto or last_ops_auto:
                 if self.on("q:ack"):
