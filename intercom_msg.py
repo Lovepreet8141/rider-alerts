@@ -64,6 +64,10 @@ class Intercom:
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
         self.rider_known = None          # rider_id -> bool (is this a MotionTools rider id the dashboard knows?)
         self.on_unknown = None           # (contact_id, name, text) -> a rider wrote whom we cannot map to MotionTools
+        self.rider_by_contact = None     # (contact_id, email, phone, name) -> rider id from earlier matches
+        self.rider_from_text = None      # message text -> rider id of an order number mentioned in it
+        self.contact_rider: dict = {}    # Intercom contact id -> rider id learned from an order number
+        self.pending: dict = {}          # contact id -> the question an unidentified rider asked
         self.on_incoming = None          # (rider_id, text, conversation_id) -> the app answers common questions
         self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
         self.auto_close = False          # close automatic conversations after sending (Settings; off = stay open until a rider replies)
@@ -479,14 +483,35 @@ class Intercom:
                     return m.group(1)
         if ext and self.rider_known and self.rider_known(ext):
             return ext
+        if cid in self.contact_rider:
+            return self.contact_rider[cid]
+        if self.rider_by_contact:                    # matched earlier through phone / name: same email user or same contact id
+            r = self.rider_by_contact(cid, str(c.get("email") or ""), str(c.get("phone") or ""), str(c.get("name") or ""))
+            if r:
+                return r
         return ""
+
+    def _bind_contact(self, cid: str, rid: str):
+        """Remember for good: this Intercom contact is this MotionTools rider."""
+        self.contact_rider[cid] = rid
+        t = self.thread(rid, "Rider")
+        t["contact_id"], t["contact_src"] = cid, "order"
+        self.threads.pop(f"contact:{cid}", None)
+        self._save()
 
     async def _resolve_then_dispatch(self, cid: str, contact: dict, conv_id: str, body, at, has_photo: bool, tags=None):
         rid = await self.rider_of_contact(cid, contact)
+        from_ref = False
+        if not rid and self.rider_from_text:
+            rid = self.rider_from_text(_text(body or ""))       # he wrote an order number → that order's rider is him
+            if rid:
+                self._bind_contact(cid, rid)
+                from_ref = True
         if not rid:
+            self.pending[cid] = _text(body or "")[:400]       # his question, answered as soon as we know who he is
             if self.on_unknown:
                 try:
-                    self.on_unknown(cid, (contact or {}).get("name") or (contact or {}).get("email") or cid, _text(body or ""))
+                    self.on_unknown(cid, (contact or {}).get("name") or (contact or {}).get("email") or cid, _text(body or ""), conv_id)
                 except Exception:
                     pass
             return
@@ -504,7 +529,10 @@ class Intercom:
                 pass
         if self.on_incoming:
             try:
-                self.on_incoming(rid, _text(body or ""), conv_id, False, has_photo, tags)
+                text = _text(body or "")
+                if from_ref and self.pending.get(cid):
+                    text = f"{self.pending.pop(cid)} {text}"       # first question + the order number = one complete request
+                self.on_incoming(rid, text, conv_id, False, has_photo, tags)
             except Exception:
                 pass
 
@@ -532,6 +560,9 @@ class Intercom:
             has_photo = True
         t = next((x for x in self.threads.values() if conv_id and conv_id in (x.get("conversation_id"), x.get("auto_conversation_id"))), None) \
             or next((x for x in self.threads.values() if cid and x.get("contact_id") == cid), None)
+        if t is not None and str(t.get("rider_id", "")).startswith("contact:") and cid:
+            asyncio.create_task(self._resolve_then_dispatch(cid, contact, conv_id, body, at, has_photo, tags))
+            return True
         if t is None:
             rid = ext[6:] if ext.startswith("rider:") else (ext if ext and not ext.startswith("contact:") and self.rider_known and self.rider_known(ext) else f"contact:{cid}")
             if rid.startswith("contact:") and cid:

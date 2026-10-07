@@ -96,7 +96,9 @@ CANT = ("can't do", "cant do", "cannot do", "can't deliver", "cant deliver", "ca
         "kann nicht machen", "can't continue", "cannot continue", "nicht weiter", "unable", "bike", "fahrrad", "panne", "flat", "platten", "reifen", "tire", "tyre",
         "sick", "krank", "going home", "nach hause", "feierabend", "too far", "zu weit", "too big", "zu groß", "zu gross", "nahi kar sakta", "لا أستطيع التوصيل",
         "teslim edemiyorum", "i can't", "ich kann nicht")
-UNREACH = ("التواصل", "تواصل", "الاتصال", "اتصل", "اتصال", "يرد", "يجاوب", "يرد على", "communicat", "can't call", "cannot call", "not reachable",
+UNREACH = ("antwortet nicht", "reagiert nicht", "meldet sich nicht", "nicht vor ort", "nicht zu hause", "nicht zuhause", "niemand zu hause", "macht nicht auf",
+           "does not respond", "doesn't respond", "not respond", "no response", "not on site", "not at home", "not home", "not there", "nobody home", "no one home",
+           "nobody there", "no one there", "kunde nicht da", "customer not there", "التواصل", "تواصل", "الاتصال", "اتصل", "اتصال", "يرد", "يجاوب", "يرد على", "communicat", "can't call", "cannot call", "not reachable",
            "erreichen", "erreiche", "nicht erreichbar", "ulaşamıyorum", "ulasamiyorum", "cevap vermiyor", "ne javlja", "ne odgovara", "ne mogu kontaktirati",
            "contact nahi", "baat nahi", "ما يرد", "ما بيرد", "مش بيرد", "مابيرد", "ما يجاوب", "لا يجيب", "ما يرد على", "مش عم يرد", "ما حدا بيفتح", "cannot contact", "can't contact", "cant contact", "not contact", "nicht kontaktieren", "no contact", "not answering", "doesn't answer", "does not answer", "no answer", "keine antwort", "geht nicht ran", "nicht erreich", "can't reach", "cant reach",
            "cannot reach", "not reach", "not picking", "not responding", "doesn't respond", "doesnt respond", "nobody opens", "macht nicht auf", "not opening",
@@ -178,7 +180,7 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "urgent"
     if NUM_RE.match(text or ""):
         return "minutes"
-    if _has(low, NO_ORDER):
+    if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)):
         return "no_order"
     if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")):
         return "closed"

@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.6.7"
+VERSION = "6.6.9"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2568,10 +2568,54 @@ def _remember_intercom(rid: str, c: dict):
 
 
 intercom.ic.on_match = _remember_intercom
+def _rider_by_contact(cid: str, email: str, phone: str, name: str) -> str:
+    user = email.split("@")[0].lower() if email else ""
+    for rid, t in list(intercom.ic.threads.items()):
+        if cid and t.get("contact_id") == cid and not str(rid).startswith("contact:"):
+            return rid
+    if user:
+        for rid, u in list(INTERCOM_USER.items()):
+            if (u or "").lower() == user:
+                return rid
+    digits = "".join(ch for ch in phone if ch.isdigit())[-9:]
+    if len(digits) >= 8:
+        for rid, r in list(STATE["riders"].items()):
+            if "".join(ch for ch in str(r.get("phone") or "") if ch.isdigit()).endswith(digits):
+                return rid
+    return ""
+
+
+intercom.ic.rider_by_contact = _rider_by_contact
 intercom.ic.rider_known = lambda rid: rid in STATE["riders"] or bool(store.get_settings().get(f"intercom_user:{rid}"))
 intercom.ic.on_incoming = lambda rid, text, conv, in_auto=False, has_photo=False, tags=None: asyncio.create_task(handle_rider_reply(rid, text, conv, in_auto, has_photo, tags))
-intercom.ic.on_unknown = lambda cid, name, text: (store.auto_log(datetime.now(UTC), "reply:unknown_rider", f"contact:{cid}", name, "", "", f"{text[:160]} — no MotionTools profile link on this Intercom contact, not answered", "failed", "rider not matched"),
-                                                   store.log("warning", f"Intercom: '{name}' wrote but has no MotionTools profile link — not answered"))
+UNKNOWN_ASKED: dict = {}
+
+
+async def _unknown_rider(cid: str, name: str, text: str, conv: str):
+    """We can't tell which rider this is (no profile link, never matched). Ask once for the order number — the
+    number identifies him (the order's rider) and from then on he is known for good."""
+    store.auto_log(datetime.now(UTC), "reply:unknown_rider", f"contact:{cid}", name, "", "", f"{text[:160]} — rider not identified yet", "received", "")
+    if not conv or time.time() - UNKNOWN_ASKED.get(cid, 0) < 2 * 3600:
+        if conv and intercom.ic.enabled:
+            await intercom.ic.escalate(conv, f"⚠ {name}: rider not identified (no MotionTools profile link) and no order number — please answer.\nRider: {text[:300]}")
+        return
+    UNKNOWN_ASKED[cid] = time.time()
+    msg = ("Damit ich dir sofort helfen kann: schick mir bitte die Bestellnummer (z. B. 7DDP8F). / "
+           "So I can help you right away: please send me the order number (e.g. 7DDP8F).")
+    if intercom.ic.enabled:
+        try:
+            await intercom.ic.call("POST", f"/conversations/{conv}/reply", {"message_type": "comment", "type": "admin", "admin_id": intercom.ic.admin, "body": f"<p>{msg}</p>"})
+        except Exception as e:
+            log.warning("unknown rider reply failed: %s", e)
+
+
+def _rider_from_text(text: str) -> str:
+    o = _order_by_ref(text)
+    return (o or {}).get("rider_id") or ""
+
+
+intercom.ic.on_unknown = lambda cid, name, text, conv="": asyncio.create_task(_unknown_rider(cid, name, text, conv))
+intercom.ic.rider_from_text = _rider_from_text
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
 intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
 
