@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.7.3"
+VERSION = "6.8.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1089,6 +1089,33 @@ async def webhook(secret: str, request: Request):
     except asyncio.QueueFull:
         WEBHOOK_STATS["dropped"] += 1
     return {"ok": True}
+
+
+@app.post("/mt/{secret}/batch")
+async def webhook_batch(secret: str, request: Request):
+    """Events forwarded by relay.py (the always-on webhook catcher): a list, in MotionTools' order.  Answers 503 when
+    the queue is too full, so the relay keeps them and retries instead of anything being lost."""
+    if not secrets.compare_digest(secret, PATH_SECRET):
+        WEBHOOK_STATS["rejected"] += 1
+        raise HTTPException(404)
+    try:
+        items = await request.json()
+    except Exception:
+        raise HTTPException(400, "not json")
+    if not isinstance(items, list):
+        items = [items]
+    if EVENT_QUEUE.qsize() + len(items) > EVENT_QUEUE.maxsize - 1000:
+        raise HTTPException(503, "busy — retry")
+    s = STATE["sync"]
+    for p in items:
+        if isinstance(p, dict):
+            EVENT_QUEUE.put_nowait(p)
+    s["webhook_events"] += len(items)
+    s["last_webhook"] = iso(datetime.now(UTC))
+    s["silent_min"], s["webhook_silent"] = 0, False
+    WEBHOOK_STATS["relay_batches"] = WEBHOOK_STATS.get("relay_batches", 0) + 1
+    WEBHOOK_STATS["relay_last"] = s["last_webhook"]
+    return {"ok": True, "queued": len(items), "queue": EVENT_QUEUE.qsize()}
 
 
 def process_event(p: dict):
@@ -2123,7 +2150,18 @@ flows.deps = {"human_replied_since": human_replied_since, "order_by_ref": _order
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
 
 
+RIDER_LOCKS: dict = {}
+
+
 async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
+    """One rider's messages are answered one after another (a question and a quick '?' arrive together — the '?' must
+    see what the bot did with the question)."""
+    lock = RIDER_LOCKS.setdefault(rid, asyncio.Lock())
+    async with lock:
+        await _handle_rider_reply(rid, text, conversation_id, in_auto, has_photo, tags)
+
+
+async def _handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
     """A rider wrote to us (Intercom webhook): the flow engine answers what it can and forwards the rest with context."""
     now = datetime.now(UTC)
     o = _rider_recent_order(rid)
@@ -2140,7 +2178,7 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
         result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags)
         store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {intent} → {result}")
         intercom.ic.note_in(conversation_id, STATE['riders'].get(rid, {}).get('name') or rid, text or "📷 photo",
-                            f"understood as {intent}{' · order ' + (o.get('ref') or '') if o else ' · no recent order found'} → {result}", rider_id=rid)
+                            f"understood as {flows.last_intent.get(rid, intent)}{' · order ' + (o.get('ref') or '') if o else ' · no recent order found'} → {result}", rider_id=rid)
     except Exception as e:
         intercom.ic.note_in(conversation_id, rid, text or "", f"ERROR: {str(e)[:120]} → forwarded to team")
         log.exception("rider reply failed: %s", e)

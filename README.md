@@ -23,6 +23,29 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.8.2
+- relay.py also works while the dashboard is still on an older version (falls back to single events).
+- "Received from riders" shows what the bot finally understood (Claude), not the first keyword guess.
+- "Is anyone there? / هل يوجد احد هنا" = rider waiting → holding reply + urgent forward. Car / bike / battery trouble →
+  "can't do the delivery". "Nobody at the restaurant" → restaurant closed (photo).
+
+## 6.8.1 — no empty customer card, "?" means "I'm waiting"
+- Number not in MotionTools data → no card with "siehe App": the rider is told a dispatcher sends the number now, and the
+  conversation goes to the team as URGENT.
+- "?", "??", "und?", "hello?" after the bot answered = the rider is waiting → holding reply + urgent forward (never "How can we help?").
+- A rider's messages are handled one after another (a question and a quick "?" no longer race each other).
+- "not here … send me his number" is no longer read as "restaurant has no such order".
+
+## 6.8 — webhook relay (25 cities, updates without losing events)
+- New file **relay.py**: a second, tiny Railway service that receives the MotionTools webhook, answers instantly and
+  forwards events in order (batches of 300) to the dashboard at `/mt/<secret>/batch`. While the dashboard restarts
+  or is busy, events wait in the relay and arrive afterwards — MotionTools never sees a failure, so it can no longer
+  switch the webhook off.
+- Setup: Railway → New → GitHub repo (same repo) → service Settings: Start command `uvicorn relay:app --host 0.0.0.0 --port $PORT`,
+  Watch paths `relay.py`, Networking → Generate domain; Variables `WEBHOOK_PATH_SECRET` (same value) and
+  `DASHBOARD_URL=https://web-production-a68a4d.up.railway.app`. Then in MotionTools change the webhook URL to
+  `https://<relay-domain>/mt/<WEBHOOK_PATH_SECRET>`. Check `https://<relay-domain>/health` → `waiting` should be ~0.
+
 ## 6.7.3 — webhook blocked warning after 5 min
 - With 10+ live orders the "No events from MotionTools" banner appears after 5 silent minutes (was 15).
 - **Install rule:** upload all files in ONE commit (GitHub → Add file → Upload files → drop all files → one Commit). Every commit is a Railway redeploy; while the server restarts MotionTools' calls fail, and after 250 failed calls MotionTools switches the webhook off.

@@ -50,6 +50,9 @@ QUERIES = [
     ("q:customer_card_find", "…closing line when the rider can't find the address",
      "Prüfe die Notizen und den Kartenpunkt. Wenn du es in 3 Minuten nicht findest, ruf den Kunden an und frag nach dem Eingang."
      " / Check the notes and the map pin. If you can't find it within 3 minutes, call the customer and ask for the entrance."),
+    ("q:phone_lookup", "Rider needs the customer's number but MotionTools didn't send it → a dispatcher sends it",
+     "Einen Moment – ein Disponent schickt dir gleich die Nummer des Kunden. Bitte bleib vor Ort, klingel nochmal und schau, ob jemand kommt."
+     " / One moment – a dispatcher will send you the customer's number right away. Please stay there, ring the bell again and see if someone comes."),
     ("q:customer_problem", "Customer doesn't accept / problem at the customer → ask what exactly",
      "Was genau ist das Problem? / What exactly is the problem?"),
     ("q:forgot_finish", "Forgot to finish the order in the app → deliver + photo",
@@ -79,7 +82,7 @@ YES = ("ok", "okay", "oke", "ja", "yes", "yeah", "yep", "sure", "fine", "alles k
 NO = ("nein", "no ", "nope", "nicht warten", "not wait", "can't wait", "cant wait", "cannot wait", "kann nicht warten", "cancel", "stornier",
       "zurückgeben", "zurueckgeben", "hand back", "give back", "leave", "gehe jetzt", "i go", "ich gehe", "nahi", "nai", "لا ", "لا أستطيع", "hayır", "hayir", "yok")
 URGENT = ("unfall", "accident", "verletzt", "injur", "hurt", "polizei", "police", "crash", "ambulance", "krankenwagen", "hospital", "krankenhaus")
-CLOSED = ("geschlossen", "closed", " zu.", " zu ", "locked", "nobody there", "niemand da", "niemand hier", "not open", "nicht offen", "nicht geöffnet", "shut",
+CLOSED = ("لا يوجد احد في المطعم", "لا يوجد أحد في المطعم", "nobody at the restaurant", "no one at the restaurant", "niemand im restaurant", "geschlossen", "closed", " zu.", " zu ", "locked", "nobody there", "niemand da", "niemand hier", "not open", "nicht offen", "nicht geöffnet", "shut",
           "مغلق", "kapalı", "kapali", "band hai", "closed restaurant", "restaurant closed")
 NO_ORDER = ("does not have this order", "doesn't have this order", "does not have the order", "doesn't have the order", "not have this order",
             "hat diese bestellung nicht", "hat die bestellung nicht", "hat keine bestellung", "kennt die bestellung nicht", "ليس لديهم الطلب", "ما عندهم الطلب",
@@ -98,7 +101,7 @@ FORGOT = ("forgot", "vergessen", "finish the order", "complete the order", "comp
           "finalize", "finalise", "bhool", "نسيت", "unuttum", "not completed", "nicht abgeschlossen", "cannot complete", "can't complete")
 DAMAGED = ("damaged", "beschädigt", "beschaedigt", "kaputt", "spilled", "verschüttet", "verschuettet", "ausgelaufen", "leaking", "leak", "broken", "zerbrochen",
            "تالف", "hasarlı", "hasarli", "fell", "runtergefallen", "squashed")
-CANT = ("لا أستطيع القيام بالتوصيل", "لا أستطيع التوصيل", "ما بقدر وصل", "ما اقدر اوصل", "القيام بالتوصيل", "cannot make the delivery", "can't make the delivery",
+CANT = ("مشكلة بالسيارة", "مشكلة في السيارة", "السيارة تعطلت", "الدراجة", "car broke", "car problem", "problem with my car", "auto kaputt", "panne", "reifen", "flat tire", "platten", "akku leer", "battery empty", "bike broke", "fahrrad kaputt", "unfall", "accident", "حادث", "لا أستطيع القيام بالتوصيل", "لا أستطيع التوصيل", "ما بقدر وصل", "ما اقدر اوصل", "القيام بالتوصيل", "cannot make the delivery", "can't make the delivery",
         "can't do", "cant do", "cannot do", "can't deliver", "cant deliver", "cannot deliver", "kann nicht liefern", "kann nicht ausliefern", "nicht liefern",
         "kann nicht machen", "can't continue", "cannot continue", "nicht weiter", "unable", "bike", "fahrrad", "panne", "flat", "platten", "reifen", "tire", "tyre",
         "sick", "krank", "going home", "nach hause", "feierabend", "too far", "zu weit", "too big", "zu groß", "zu gross", "nahi kar sakta", "لا أستطيع التوصيل",
@@ -182,6 +185,25 @@ def intent_from_tags(tags) -> str:
     return ""
 
 
+NUDGE_PHRASES = ("is anyone there", "anyone there", "anyone here", "is someone there", "jemand da", "ist jemand da", "hallo?",
+                 "هل يوجد احد", "هل يوجد أحد", "حدا هون", "في حدا", "فيه احد", "يا جماعة", "kimse var mı", "koi hai")
+NUDGE_WORDS = {"und", "and", "hello", "hallo", "hi", "hey", "anyone", "jemand", "update", "news", "still", "noch", "wait", "waiting",
+               "und jetzt", "what now", "bitte", "please", "pls", "plz", "any update", "any news", "still waiting", "warte noch", "ich warte"}
+
+
+def is_nudge(text: str) -> bool:
+    """'?', '??', 'und?', 'hello?' … — the rider is waiting for an answer to what he already asked."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if re.fullmatch(r"[\s?!.¿؟…]+", t):
+        return True
+    core = re.sub(r"[?!.¿؟…]+", "", t).strip()
+    if any(ph in t for ph in NUDGE_PHRASES) and len(t.split()) <= 5 and not any(w in t for w in ("restaurant", "مطعم", "المطعم", "kunde", "customer", "العميل", "الزبون")):
+        return True
+    return ("?" in t or "؟" in t) and core in NUDGE_WORDS
+
+
 def classify(text: str, has_photo: bool = False, tags=None) -> str:
     tagged = intent_from_tags(tags)
     if tagged:
@@ -189,13 +211,15 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
     low = f" {(text or '').strip().lower()} "
     if has_photo and len(low.strip()) < 3:
         return "photo"
+    if is_nudge(text):
+        return "nudge"
     if _has(low, URGENT):
         return "urgent"
     if NUM_RE.match(text or ""):
         return "minutes"
     if _has(low, REMOVE):
         return "remove_order"
-    if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)):
+    if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)) and not _has(low, PHONE):
         return "no_order"
     if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")):
         return "closed"
@@ -232,7 +256,7 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
     return "other"
 
 
-INTENT_LABEL = {"not_ready": "order not ready", "closed": "restaurant closed", "no_order": "restaurant: no such order / already taken",
+INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "order not ready", "closed": "restaurant closed", "no_order": "restaurant: no such order / already taken",
                 "cant_deliver": "can't do the delivery", "customer_unreachable": "customer not reachable", "customer_find": "can't find the address",
                 "customer_phone": "asked for the customer's number", "customer_problem": "problem at the customer", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
@@ -265,6 +289,7 @@ class RiderFlows:
         self.last_rider_at: dict = {}   # conversation id -> when the rider started waiting
         self.conv_rider: dict = {}      # conversation id -> rider id
         self.card_conv: dict = {}       # conversation id -> when the customer card was sent into it
+        self.last_intent: dict = {}     # rider id -> what the bot finally understood (Claude or keywords)
         self.deps: dict = {}
         self._load()
 
@@ -304,7 +329,7 @@ class RiderFlows:
         """Never say the same thing twice: if this answer already went to the rider in the last 30 min, he is
         clearly not helped by it — a person takes over instead of the bot repeating itself."""
         last = self.sent_keys.setdefault(rid, {})
-        if key in last and time.time() - last[key] < 30 * 60 and key not in ("q:not_ready_check",):
+        if key in last and time.time() - last[key] < 30 * 60 and key not in ("q:not_ready_check", "q:holding"):
             await self._fwd(rid, conv, f"🔁 rider is not helped by our automatic answer ({key[2:].replace('_', ' ')}) — please reply personally.\nRider: {self.state.get(rid, {}).get('last') or self._last.get(rid, '')}", o=o)
             return False
         last[key] = time.time()
@@ -375,6 +400,16 @@ class RiderFlows:
         ctx = f"{INTENT_LABEL.get(intent, intent)}"
         d["log"](rid, o, f"reply:{intent}", (text or "📷 photo")[:200])
 
+        if intent == "nudge":
+            prev = self._prev.get(rid, "")
+            last_bot = max(self.sent_keys.get(rid, {}).values(), default=0)
+            if st or self.handed_over(conv) or time.time() - last_bot < 45 * 60 or conv in self.card_conv:
+                if time.time() - self.sent_keys.get(rid, {}).get("q:holding", 0) > 10 * 60:
+                    await self._send(rid, conv, "q:holding", o)
+                await self._fwd(rid, conv, f"⏰ rider is waiting for an answer (wrote '{text.strip()[:20]}').\nHis question: {prev[:300] or '—'}", urgent=True, o=o)
+                return "rider waiting ('?') → holding reply + urgent forward"
+            intent = "other"
+        self.last_intent[rid] = intent
         # understanding first: Claude reads every real sentence (any language, slang, typos) — keywords are the fallback
         in_yes_no = bool(st and st.get("flow") == "not_ready" and st.get("step") in ("wait", "persuade"))
         if d.get("smart") and not intent_from_tags(tags) and not in_yes_no and intent not in ("urgent", "minutes", "photo", "order_ref") \
@@ -393,6 +428,7 @@ class RiderFlows:
             except Exception:
                 pass
         self._prev[rid] = (text or "")[:200]
+        self.last_intent[rid] = intent
 
         if self.handed_over(conv):
             if intent in ("customer_phone", "customer_unreachable", "customer_find") and o is not None \
@@ -610,6 +646,14 @@ class RiderFlows:
             return "forwarded (no order)"
         card = d["customer_card"](o)
         closer = {"customer_phone": "q:customer_card_call", "customer_unreachable": "q:customer_card_wait", "customer_find": "q:customer_card_find"}[intent]
+        if not card.get("phone_known") and intent in ("customer_phone", "customer_unreachable"):
+            # an empty card ("see the app") helps nobody: tell him a person sends the number, and get a person on it now
+            if time.time() - self.card_conv.get(conv, 0) > 30 * 60:
+                await self._send(rid, conv, "q:phone_lookup", o)
+                self.card_conv[conv] = time.time()
+            await self._fwd(rid, conv, f"📞 rider needs the customer's number for {o.get('ref')} — not in MotionTools data, please send it to him now.", urgent=True, o=o)
+            self.set(rid, "customer_wait", "", 15, conv=conv, ref=o.get("ref", ""), kind=intent)
+            return "phone unknown → told rider a dispatcher sends it + urgent forward"
         if self.on("q:customer_card"):
             # the card is data, not a phrase: it goes into every conversation the rider asks in (riders often start a new
             # chat per button) — only a repeat inside the same conversation is skipped
