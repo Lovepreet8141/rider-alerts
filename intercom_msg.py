@@ -72,6 +72,7 @@ class Intercom:
         self.auto_team_name = ""         # Intercom team inbox for automatic messages (Settings); "" = same chat as manual
         self.auto_close = False          # close automatic conversations after sending (Settings; off = stay open until a rider replies)
         self._auto_team = None           # resolved team id
+        self.webhooks: list = []         # last rider messages received (what came in and what the dashboard did)
 
     @property
     def enabled(self) -> bool:
@@ -508,6 +509,8 @@ class Intercom:
                 self._bind_contact(cid, rid)
                 from_ref = True
         if not rid:
+            self.note_in(conv_id, (contact or {}).get("name") or cid, _text(body or "") or "📷 photo",
+                         "rider NOT identified (no MotionTools profile link on his Intercom contact) → asked for order number")
             self.pending[cid] = _text(body or "")[:400]       # his question, answered as soon as we know who he is
             if self.on_unknown:
                 try:
@@ -515,6 +518,7 @@ class Intercom:
                 except Exception:
                     pass
             return
+        self.note_in(conv_id, (contact or {}).get("name") or cid, _text(body or "") or "📷 photo", f"identified → rider {rid}, bot answering", rider_id=rid)
         t = self.thread(rid, (contact or {}).get("name") or "Rider")
         t["contact_id"], t["contact_src"] = cid, "link"
         if conv_id:
@@ -533,10 +537,44 @@ class Intercom:
                 if from_ref and self.pending.get(cid):
                     text = f"{self.pending.pop(cid)} {text}"       # first question + the order number = one complete request
                 self.on_incoming(rid, text, conv_id, False, has_photo, tags)
-            except Exception:
-                pass
+            except Exception as e:
+                self.note_in(conv_id, (contact or {}).get("name") or cid, _text(body or ""), f"ERROR in bot: {str(e)[:120]}")
 
-    def incoming(self, payload: dict) -> bool:
+    def note_in(self, conv_id: str, who: str, text: str, outcome: str, **extra):
+        """Remember what came in and what happened with it (Intercom page → Received)."""
+        e = next((x for x in self.webhooks if x["conv"] == conv_id and x["text"] == text), None)
+        if e is None:
+            e = {"at": int(time.time()), "conv": conv_id, "who": who, "text": (text or "")[:200], "outcome": outcome, **extra}
+            self.webhooks.insert(0, e)
+            del self.webhooks[60:]
+        else:
+            e.update(outcome=outcome, **extra)
+
+    @staticmethod
+    def _part_text(p: dict) -> str:
+        """Typed text, or the label of a workflow button the rider pressed."""
+        t = _text(p.get("body") or "")
+        if t:
+            return t
+        for key in ("reply_options", "quick_reply_options", "options"):
+            opts = p.get(key) or []
+            sel = [o for o in opts if isinstance(o, dict) and (o.get("selected") or o.get("chosen"))]
+            if sel:
+                return str(sel[0].get("text") or sel[0].get("label") or "")
+        return ""
+
+    async def _refetch_then_incoming(self, payload: dict, conv_id: str):
+        """Webhook without readable text (workflow button, trimmed payload): read the conversation itself."""
+        try:
+            full = await self.call("GET", f"/conversations/{conv_id}")
+        except Exception as e:
+            self.note_in(conv_id, "?", "", f"could not read conversation: {str(e)[:80]}")
+            return
+        item = dict((payload.get("data") or {}).get("item") or {})
+        item.update({k: v for k, v in (full or {}).items() if v})
+        self.incoming({**payload, "data": {"item": item}}, refetched=True)
+
+    def incoming(self, payload: dict, refetched: bool = False) -> bool:
         """Intercom webhook: a rider replied (or started a conversation)."""
         topic = payload.get("topic") or ""
         if topic not in ("conversation.user.replied", "conversation.user.created"):
@@ -550,14 +588,23 @@ class Intercom:
         tags = [t.get("name") for t in ((item.get("tags") or {}).get("tags") or []) if isinstance(t, dict)]
         user_parts = [p for p in parts if (p.get("author") or {}).get("type") in ("user", "lead", "contact")]
         if user_parts:
-            body, author, at = user_parts[-1].get("body"), user_parts[-1].get("author") or {}, user_parts[-1].get("created_at")
+            body, author, at = self._part_text(user_parts[-1]), user_parts[-1].get("author") or {}, user_parts[-1].get("created_at")
             has_photo = bool(user_parts[-1].get("attachments"))
         else:
             src = item.get("source") or {}
-            body, author, at = src.get("body"), src.get("author") or {}, item.get("created_at")
+            body, author, at = self._part_text(src), src.get("author") or {}, item.get("created_at")
             has_photo = bool(src.get("attachments"))
         if not has_photo and "<img" in (body or ""):
             has_photo = True
+        who = contact.get("name") or contact.get("email") or author.get("name") or cid or "?"
+        if not _text(body or "") and not has_photo:
+            if not refetched and conv_id and self.enabled:
+                self.note_in(conv_id, who, "", "no text in webhook → reading the conversation")
+                asyncio.create_task(self._refetch_then_incoming(payload, conv_id))
+            else:
+                self.note_in(conv_id, who, "", "no text found (only a button / empty message)")
+            return True
+        self.note_in(conv_id, who, _text(body or "") or "📷 photo", "received")
         t = next((x for x in self.threads.values() if conv_id and conv_id in (x.get("conversation_id"), x.get("auto_conversation_id"))), None) \
             or next((x for x in self.threads.values() if cid and x.get("contact_id") == cid), None)
         if t is not None and str(t.get("rider_id", "")).startswith("contact:") and cid:
@@ -577,10 +624,11 @@ class Intercom:
         t["unread"] = int(t.get("unread") or 0) + 1
         self._save()
         if self.on_incoming and not str(t["rider_id"]).startswith("contact:"):
+            self.note_in(conv_id, who, _text(body or "") or "📷 photo", f"known rider {t['rider_id']}, bot answering", rider_id=t["rider_id"])
             try:
                 self.on_incoming(t["rider_id"], _text(body or ""), conv_id, conv_id == t.get("auto_conversation_id"), has_photo, tags)
-            except Exception:
-                pass
+            except Exception as e:
+                self.note_in(conv_id, who, _text(body or ""), f"ERROR in bot: {str(e)[:120]}")
         return True
 
     async def escalate(self, conversation_id: str, note: str, team_id: str = "") -> bool:

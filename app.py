@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.7"
+VERSION = "6.7.3"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -837,12 +837,13 @@ def webhook_watch(now: datetime):
     online = sum(1 for r in list(STATE["riders"].values()) if r.get("online"))
     hour = now.astimezone(BERLIN).hour
     matters = live > 0 or (online > 0 and 11 <= hour < 23)
-    s["webhook_silent"] = s["mode"] == "webhook" and s["silent_min"] >= 15 and matters
+    limit = 5 if live >= 10 else 15                      # busy evening: 5 silent minutes already means the webhook is blocked
+    s["webhook_silent"] = s["mode"] == "webhook" and s["silent_min"] >= limit and matters
     if s["webhook_silent"] and not s["silent_logged"]:
         s["silent_logged"] = True
         store.log("error", f"no MotionTools events for {s['silent_min']} min while {live} orders are live / {online} riders online — "
                            "is the webhook still active in MotionTools (Settings → Webhooks)?")
-    elif not s["webhook_silent"] and s["silent_logged"] and s["silent_min"] < 15:
+    elif not s["webhook_silent"] and s["silent_logged"] and s["silent_min"] < limit:
         s["silent_logged"] = False
         store.log("info", "MotionTools events are arriving again")
 
@@ -1558,6 +1559,7 @@ async def api_automations_get(recheck: int = 0):
                        "on": sorted(auto_cities_enabled(settings))},
             "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
             "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
+            "received": list(intercom.ic.webhooks)[:60],
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(200), "quiet_hours": "", "daily_cap": 0}
 
 
@@ -2137,7 +2139,10 @@ async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto:
     try:
         result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags)
         store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {intent} → {result}")
+        intercom.ic.note_in(conversation_id, STATE['riders'].get(rid, {}).get('name') or rid, text or "📷 photo",
+                            f"understood as {intent}{' · order ' + (o.get('ref') or '') if o else ' · no recent order found'} → {result}", rider_id=rid)
     except Exception as e:
+        intercom.ic.note_in(conversation_id, rid, text or "", f"ERROR: {str(e)[:120]} → forwarded to team")
         log.exception("rider reply failed: %s", e)
         await _flow_forward(rid, conversation_id, f"(automation error: {e}) {text[:200]}", o=o)
 
@@ -2699,7 +2704,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": intercom.ic.webhooks[:10], "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

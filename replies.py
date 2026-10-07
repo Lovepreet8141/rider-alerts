@@ -264,6 +264,7 @@ class RiderFlows:
         self._prev: dict = {}           # rider id -> his previous message (context for Claude)
         self.last_rider_at: dict = {}   # conversation id -> when the rider started waiting
         self.conv_rider: dict = {}      # conversation id -> rider id
+        self.card_conv: dict = {}       # conversation id -> when the customer card was sent into it
         self.deps: dict = {}
         self._load()
 
@@ -395,7 +396,7 @@ class RiderFlows:
 
         if self.handed_over(conv):
             if intent in ("customer_phone", "customer_unreachable", "customer_find") and o is not None \
-                    and time.time() - self.sent_keys.get(rid, {}).get("q:customer_card", 0) > 30 * 60:
+                    and time.time() - self.card_conv.get(conv, 0) > 30 * 60:
                 return await self._card(rid, conv, o, intent)  # the customer card is pure data — useful even while a person handles it
             if await self.person_engaged(conv):
                 if intent == "urgent":
@@ -476,6 +477,8 @@ class RiderFlows:
                 await self._fwd(rid, conv, f"⚠ problem at the customer: {text[:300]}", o=o)
                 self.clear(rid)
                 return "forwarded"
+            elif flow == "customer_wait" and intent in ("customer_phone", "customer_unreachable", "customer_find") and time.time() - self.card_conv.get(conv, 0) > 30 * 60:
+                return await self._card(rid, conv, o, intent)      # asked again in a new chat: the card goes here too
             elif flow == "customer_wait":
                 mins = round((time.time() - st.get("since", time.time())) / 60)
                 if o is not None:
@@ -608,7 +611,13 @@ class RiderFlows:
         card = d["customer_card"](o)
         closer = {"customer_phone": "q:customer_card_call", "customer_unreachable": "q:customer_card_wait", "customer_find": "q:customer_card_find"}[intent]
         if self.on("q:customer_card"):
-            await self._send(rid, conv, "q:customer_card", o, closer_key=closer, **card)
+            # the card is data, not a phrase: it goes into every conversation the rider asks in (riders often start a new
+            # chat per button) — only a repeat inside the same conversation is skipped
+            if time.time() - self.card_conv.get(conv, 0) > 30 * 60:
+                await d["send"](rid, conv, "q:customer_card", o, closer_key=closer, **card)
+                self.card_conv[conv] = time.time()
+                self.sent_keys.setdefault(rid, {})["q:customer_card"] = time.time()
+                self.last_rider_at.pop(conv, None)
         if not card.get("phone_known"):
             await self._fwd(rid, conv, f"ℹ rider needs the customer's number for {o.get('ref')} — not in MotionTools data, please look it up.", o=o)
         self.set(rid, "customer_wait", "", 15, conv=conv, ref=o.get("ref", ""), kind=intent)

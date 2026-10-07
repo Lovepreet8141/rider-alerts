@@ -23,6 +23,15 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.7.3 — webhook blocked warning after 5 min
+- With 10+ live orders the "No events from MotionTools" banner appears after 5 silent minutes (was 15).
+- **Install rule:** upload all files in ONE commit (GitHub → Add file → Upload files → drop all files → one Commit). Every commit is a Railway redeploy; while the server restarts MotionTools' calls fail, and after 250 failed calls MotionTools switches the webhook off.
+
+## 6.7.2 — "Received from riders"
+- Intercom page → **Received from riders**: every rider message Intercom delivered, and what the bot did (identified / NOT identified → asked order number / understood as … → reply / error).
+- Workflow button presses (empty text in the webhook) are now read: the button label is used, or the conversation is fetched to get the rider's text.
+- `/health` → `intercom_received` shows the last 10.
+
 ## 6.7 — no rider is left talking to a wall
 
 - A forwarded conversation stays with the bot's "silence" only while a teammate is really on it: 5 minutes to
