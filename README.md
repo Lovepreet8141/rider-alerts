@@ -23,6 +23,17 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 6.7 — no rider is left talking to a wall
+
+- A forwarded conversation stays with the bot's "silence" only while a teammate is really on it: 5 minutes to
+  answer, or as long as a teammate has replied. Nobody answered → the bot takes the next message itself, and after
+  7 minutes of waiting the rider gets "a dispatcher has been alerted…" and you get an urgent ⏰ note.
+- With ANTHROPIC_API_KEY, Claude reads every real sentence first (any language, slang, Hinglish), with the rider's
+  previous message as context; the keyword lists are the fallback.
+- New situation "remove the order" (remove krna bhai / hatao / احذف الطلب / Auftrag entfernen): acknowledged at once,
+  urgent note to you, a repeat gets the holding reply instead of the same text.
+- More phrases: "cannot make the delivery" (Arabic), "door does not open", "restaurant does not have this order".
+
 ## 6.6.2 — the bot stops talking when a person takes over
 
 - Once a conversation is forwarded to a person, the bot stays silent in it for 3 hours (only accident/injury still adds an urgent note).

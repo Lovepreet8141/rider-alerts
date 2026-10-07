@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "6.6.9"
+VERSION = "6.7"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -176,11 +176,16 @@ async def _slow_request_log(request: Request, call_next):
     try:
         resp = await call_next(request)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        STATE["last_500"] = {"at": iso(datetime.now(UTC)), "path": request.url.path, "query": str(request.url.query)[:120],
+                             "error": f"{type(e).__name__}: {e}"[:300], "where": [l.strip()[-140:] for l in tb.splitlines() if l.strip().startswith("File") and "site-packages" not in l][-4:] + tb.splitlines()[-1:]}
         try:
             store.log("error", f"{request.url.path} crashed: {type(e).__name__}: {e}"[:400])
         except Exception:
             pass
-        raise
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": f"server error: {type(e).__name__}: {str(e)[:120]}"}, status_code=500)
     dt = time.monotonic() - t0
     if resp.status_code >= 500 and request.url.path.startswith("/api/"):
         STATE.setdefault("slow", []).append({"at": iso(datetime.now(UTC)), "path": request.url.path, "s": round(dt, 1), "error": resp.status_code})
@@ -1230,6 +1235,7 @@ def api_state(city: str = "", done: int = 0):
                 last_ev[o["rider_id"]] = le
     riders = []
     for rid in set(live_by) | set(pc["done_by"]):
+      try:
         r = STATE["riders"].get(rid) or projector.rider(rid, "", now)
         n = live_by.get(rid, 0)
         last = max([t for t in (last_ev.get(rid), pc["last_by"].get(rid)) if t], default=None)
@@ -1242,6 +1248,8 @@ def api_state(city: str = "", done: int = 0):
                        "map_url": f"https://maps.google.com/?q={r['lat']:.5f},{r['lng']:.5f}" if r.get("lat") is not None and n else "",
                        "still_min": tracker.stationary_minutes(rid, now, rules.stationary_radius_m) if n else None,
                        "last_fix_min": int((now - fix[0]).total_seconds() // 60) if fix else None})
+      except Exception as e:
+        log.warning("rider row %s failed: %s", rid, e)
     riders.sort(key=lambda x: ({"on_order": 0, "free": 1, "done": 2}[x["status"]], -x["orders"], x["last_min"] if x["last_min"] is not None else 9999, x["name"]))
     open_alerts = [a for a in alerts if a["resolved_at"] is None]
     last_ok = STATE["sync"]["last_ok"]
@@ -1951,28 +1959,38 @@ def _rider_recent_order(rid: str):
 
 
 ANTHROPIC_KEY = env("ANTHROPIC_API_KEY", "")
+SMART_CACHE: dict = {}
 SMART_INTENTS = ("not_ready", "closed", "no_order", "cant_deliver", "customer_unreachable", "customer_phone", "customer_find",
-                 "customer_problem", "forgot_finish", "damaged", "ack", "excuse", "urgent", "other")
+                 "customer_problem", "forgot_finish", "damaged", "remove_order", "ack", "excuse", "urgent", "other")
 
 
-async def smart_intent(text: str, o) -> str:
+async def smart_intent(text: str, o, prev: str = "") -> str:
     """Optional (ANTHROPIC_API_KEY set in Railway): a message the keyword rules can't place is classified by Claude —
     any language, any spelling. Only picks one of the known situations; never writes the reply itself."""
     if not ANTHROPIC_KEY or not (text or "").strip():
         return ""
+    key = (text.strip().lower()[:200], (o or {}).get("phase"), prev[:80])
+    if key in SMART_CACHE:
+        return SMART_CACHE[key]
     import httpx
     ctx = f"Rider's current order status: {PHASE_LABEL.get(o['phase'], o['phase'])}" if o else "Rider has no live order."
+    if prev:
+        ctx += f"\nHis previous message was: \"{prev[:200]}\""
     prompt = (f"A food-delivery rider wrote this to dispatch support:\n\"{text[:500]}\"\n{ctx}\n\n"
               f"Which ONE situation is it? Answer with exactly one of: {', '.join(SMART_INTENTS)}.\n"
               "not_ready=restaurant food not ready; closed=restaurant closed; no_order=restaurant has no such order/another rider took it; "
               "cant_deliver=rider can't do the delivery; customer_unreachable=can't reach/contact customer; customer_phone=wants customer number; "
               "customer_find=can't find address/entrance; customer_problem=customer refuses/complains; forgot_finish=order must be completed/closed in the app, photo upload fails; "
-              "damaged=order damaged; ack=ok/thanks/arrived; excuse=delay explanation; urgent=accident/injury/police; other=anything else.")
+              "damaged=order damaged; remove_order=wants the order removed/unassigned/cancelled from him; ack=ok/thanks/arrived; excuse=delay explanation; urgent=accident/injury/police; other=anything else.")
     async with httpx.AsyncClient(timeout=8) as cli:
         r = await cli.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]})
-        word = "".join(b.get("text", "") for b in (r.json().get("content") or [])).strip().lower().split()[0:1]
-    return word[0] if word and word[0] in SMART_INTENTS and word[0] != "other" else ""
+        word = [w.strip(".,:;!\"'`*") for w in "".join(b.get("text", "") for b in (r.json().get("content") or [])).strip().lower().split()[0:1]]
+    res = word[0] if word and word[0] in SMART_INTENTS and word[0] != "other" else ""
+    SMART_CACHE[key] = res
+    if len(SMART_CACHE) > 500:
+        SMART_CACHE.pop(next(iter(SMART_CACHE)))
+    return res
 
 
 def auto_cities_enabled(settings: dict = None) -> set:
@@ -2014,6 +2032,30 @@ def customer_card_data(o: dict) -> dict:
             "address": addr, "notes_line": f"📝 {notes}\n" if notes else "", "map_line": f"🗺️ {link}\n" if link else "", "phone_known": bool(phone)}
 
 
+BOT_SENT: list = []        # (time, first 60 chars) of what the dashboard itself wrote — to tell a teammate's reply from ours
+
+
+def _norm(t: str) -> str:
+    import re as _re
+    return _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", t or "")).strip().lower()[:60]
+
+
+async def human_replied_since(conv: str, since: float) -> bool:
+    """Did a teammate (not the dashboard, not the Intercom workflow bot) write in this conversation since `since`?"""
+    if not intercom.ic.enabled or not conv:
+        return False
+    c = await intercom.ic.call("GET", f"/conversations/{conv}")
+    ours = {b for _, b in BOT_SENT}
+    for p in ((c.get("conversation_parts") or {}).get("conversation_parts")) or []:
+        if p.get("part_type") != "comment" or (p.get("author") or {}).get("type") != "admin":
+            continue
+        if (p.get("created_at") or 0) < since - 5:
+            continue
+        if _norm(p.get("body") or "") not in ours:
+            return True
+    return False
+
+
 async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, **fmt):
     settings = store.get_settings()
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
@@ -2025,6 +2067,7 @@ async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, *
     now = datetime.now(UTC)
     aid = store.auto_log(now, key, rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), text, "pending" if intercom.ic.enabled else "dry")
     if intercom.ic.enabled:
+        BOT_SENT.append((time.time(), _norm(text))); del BOT_SENT[:-300]
         m = await intercom.ic.reply_in(conv, rid, name, text)
         store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
 
@@ -2072,7 +2115,7 @@ def _order_by_ref(text: str):
     return None
 
 
-flows.deps = {"order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
+flows.deps = {"human_replied_since": human_replied_since, "order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
               "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
 
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
@@ -2191,6 +2234,7 @@ async def automation_loop():
             STATE["auto_tick_ms"] = int((time.monotonic() - t0) * 1000)
             for aid, rid, name, text, ref in todo:
                 r = STATE["riders"].get(rid, {})
+                BOT_SENT.append((time.time(), _norm(text))); del BOT_SENT[:-300]
                 m = await intercom.ic.send(rid, r.get("name") or name, r.get("phone") or "", text, ref, auto=True)
                 store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", "") or m.get("note", ""))
             await flows.tick(now)
@@ -2602,6 +2646,7 @@ async def _unknown_rider(cid: str, name: str, text: str, conv: str):
     UNKNOWN_ASKED[cid] = time.time()
     msg = ("Damit ich dir sofort helfen kann: schick mir bitte die Bestellnummer (z. B. 7DDP8F). / "
            "So I can help you right away: please send me the order number (e.g. 7DDP8F).")
+    BOT_SENT.append((time.time(), _norm(msg)))
     if intercom.ic.enabled:
         try:
             await intercom.ic.call("POST", f"/conversations/{conv}/reply", {"message_type": "comment", "type": "admin", "admin_id": intercom.ic.admin, "body": f"<p>{msg}</p>"})
@@ -2654,7 +2699,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "claude_classifier": bool(ANTHROPIC_KEY), "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "loop_lag": STATE.get("loop_lag"), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

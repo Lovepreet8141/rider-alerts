@@ -60,6 +60,10 @@ QUERIES = [
      "Bitte schick mir ein Foto der Bestellung. / Please send me a photo of the order."),
     ("q:order_ref", "Rider sends only an order number → confirm the order, ask what's wrong",
      "Danke, Bestellung {ref} gefunden ({status}, {restaurant} → {address}). Was ist das Problem? / Thanks, found order {ref} ({status}, {restaurant} → {address}). What is the problem?"),
+    ("q:remove_order", "Rider wants the order removed / taken back → acknowledge, a dispatcher decides",
+     "Verstanden – ein Disponent prüft {ref} sofort und nimmt die Bestellung ggf. raus. Bitte kurz warten, wir melden uns in wenigen Minuten. / Understood – a dispatcher is checking {ref} right now and will remove it if needed. Please wait a moment, we'll get back to you within a few minutes."),
+    ("q:holding", "Rider waits for a person and nobody has answered yet",
+     "Danke für deine Geduld – ein Disponent ist informiert und meldet sich gleich bei dir. / Thanks for your patience – a dispatcher has been alerted and will reply to you shortly."),
     ("q:other", "Anything unclear → one question (never the order number)",
      "Wie können wir helfen? / How can we help?"),
     ("q:ack", "Rider confirms an automatic message (ok / arrived / on the way)",
@@ -77,7 +81,9 @@ NO = ("nein", "no ", "nope", "nicht warten", "not wait", "can't wait", "cant wai
 URGENT = ("unfall", "accident", "verletzt", "injur", "hurt", "polizei", "police", "crash", "ambulance", "krankenwagen", "hospital", "krankenhaus")
 CLOSED = ("geschlossen", "closed", " zu.", " zu ", "locked", "nobody there", "niemand da", "niemand hier", "not open", "nicht offen", "nicht geöffnet", "shut",
           "مغلق", "kapalı", "kapali", "band hai", "closed restaurant", "restaurant closed")
-NO_ORDER = ("no order", "no such", "kein auftrag", "keine bestellung", "nicht da", "already taken", "already picked", "schon abgeholt", "schon weg",
+NO_ORDER = ("does not have this order", "doesn't have this order", "does not have the order", "doesn't have the order", "not have this order",
+            "hat diese bestellung nicht", "hat die bestellung nicht", "hat keine bestellung", "kennt die bestellung nicht", "ليس لديهم الطلب", "ما عندهم الطلب",
+            "no order", "no such", "kein auftrag", "keine bestellung", "nicht da", "already taken", "already picked", "schon abgeholt", "schon weg",
             "another driver", "anderer fahrer", "andere fahrer", "wrong order", "falsche bestellung", "don't have", "dont have", "haben nicht", "haben keine",
             "not found", "nicht gefunden", "no booking", "they say no")
 NOT_READY = ("مش جاهز", "مو جاهز", "ما جاهز", "ما خلص", "لسا", "لسه", "not ready", "nicht fertig", "noch nicht", "not prepared", "preparing", "still cooking", "being prepared", "wird noch", "dauert", "takes time",
@@ -92,11 +98,13 @@ FORGOT = ("forgot", "vergessen", "finish the order", "complete the order", "comp
           "finalize", "finalise", "bhool", "نسيت", "unuttum", "not completed", "nicht abgeschlossen", "cannot complete", "can't complete")
 DAMAGED = ("damaged", "beschädigt", "beschaedigt", "kaputt", "spilled", "verschüttet", "verschuettet", "ausgelaufen", "leaking", "leak", "broken", "zerbrochen",
            "تالف", "hasarlı", "hasarli", "fell", "runtergefallen", "squashed")
-CANT = ("can't do", "cant do", "cannot do", "can't deliver", "cant deliver", "cannot deliver", "kann nicht liefern", "kann nicht ausliefern", "nicht liefern",
+CANT = ("لا أستطيع القيام بالتوصيل", "لا أستطيع التوصيل", "ما بقدر وصل", "ما اقدر اوصل", "القيام بالتوصيل", "cannot make the delivery", "can't make the delivery",
+        "can't do", "cant do", "cannot do", "can't deliver", "cant deliver", "cannot deliver", "kann nicht liefern", "kann nicht ausliefern", "nicht liefern",
         "kann nicht machen", "can't continue", "cannot continue", "nicht weiter", "unable", "bike", "fahrrad", "panne", "flat", "platten", "reifen", "tire", "tyre",
         "sick", "krank", "going home", "nach hause", "feierabend", "too far", "zu weit", "too big", "zu groß", "zu gross", "nahi kar sakta", "لا أستطيع التوصيل",
         "teslim edemiyorum", "i can't", "ich kann nicht")
-UNREACH = ("antwortet nicht", "reagiert nicht", "meldet sich nicht", "nicht vor ort", "nicht zu hause", "nicht zuhause", "niemand zu hause", "macht nicht auf",
+UNREACH = ("الباب لا يفتح", "ما بيفتح", "ما حدا فتح", "لا أحد يفتح", "door does not open", "door doesn't open", "door not open", "nobody opens the door",
+           "tür geht nicht auf", "öffnet nicht", "antwortet nicht", "reagiert nicht", "meldet sich nicht", "nicht vor ort", "nicht zu hause", "nicht zuhause", "niemand zu hause", "macht nicht auf",
            "does not respond", "doesn't respond", "not respond", "no response", "not on site", "not at home", "not home", "not there", "nobody home", "no one home",
            "nobody there", "no one there", "kunde nicht da", "customer not there", "التواصل", "تواصل", "الاتصال", "اتصل", "اتصال", "يرد", "يجاوب", "يرد على", "communicat", "can't call", "cannot call", "not reachable",
            "erreichen", "erreiche", "nicht erreichbar", "ulaşamıyorum", "ulasamiyorum", "cevap vermiyor", "ne javlja", "ne odgovara", "ne mogu kontaktirati",
@@ -155,6 +163,11 @@ TAG_INTENTS = {
 }
 
 
+REMOVE = ("remove this order", "remove the order", "remove order", "remove it", "remove esko", "remove isko", "remove krna", "remove krdo", "krdo remove", "remove kar",
+          "remove karo", "krdo bhai remove", "kar do remove", "krdo remove", "bhai remove", "hatao", "hata do", "order hata", "take this order", "take the order back", "unassign", "auftrag entfernen", "bestellung entfernen",
+          "nimm den auftrag", "auftrag rausnehmen", "storniere", "احذف الطلب", "شيل الطلب", "الغي الطلب", "siparişi kaldır")
+
+
 def intent_from_tags(tags) -> str:
     """Intercom tags set by the workflow buttons (language-independent): 'q:not_ready', 'customer_unreachable', …"""
     for t in tags or []:
@@ -180,6 +193,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "urgent"
     if NUM_RE.match(text or ""):
         return "minutes"
+    if _has(low, REMOVE):
+        return "remove_order"
     if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)):
         return "no_order"
     if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")):
@@ -221,7 +236,7 @@ INTENT_LABEL = {"not_ready": "order not ready", "closed": "restaurant closed", "
                 "cant_deliver": "can't do the delivery", "customer_unreachable": "customer not reachable", "customer_find": "can't find the address",
                 "customer_phone": "asked for the customer's number", "customer_problem": "problem at the customer", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
-                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only"}
+                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
@@ -246,6 +261,9 @@ class RiderFlows:
         self.sent_keys: dict = {}       # rider id -> {query key: time sent}
         self._last: dict = {}           # rider id -> his last message
         self.named_ref: dict = {}       # rider id -> (order ref he wrote himself, when)
+        self._prev: dict = {}           # rider id -> his previous message (context for Claude)
+        self.last_rider_at: dict = {}   # conversation id -> when the rider started waiting
+        self.conv_rider: dict = {}      # conversation id -> rider id
         self.deps: dict = {}
         self._load()
 
@@ -258,11 +276,28 @@ class RiderFlows:
         except Exception:
             self.state = {}
 
-    HANDOVER_H = 3                      # hours the bot keeps out of a conversation a person has taken
+    HANDOVER_H = 3                      # hours the bot keeps out of a conversation a person is answering
+    GRACE_MIN = 5                       # after a forward: minutes a person gets to answer before the bot steps back in
 
     def handed_over(self, conv: str) -> bool:
         t = self.handover.get(conv or "")
         return bool(t and time.time() - t < self.HANDOVER_H * 3600)
+
+    async def person_engaged(self, conv: str) -> bool:
+        """Silent only while a person is really on it: within the grace minutes after a forward, or when a teammate
+        has actually replied since. A forward nobody answers must not leave the rider talking to a wall."""
+        t = self.handover.get(conv or "")
+        if not t or time.time() - t > self.HANDOVER_H * 3600:
+            return False
+        if time.time() - t < self.GRACE_MIN * 60:
+            return True
+        hr = self.deps.get("human_replied_since")
+        if not hr:
+            return True
+        try:
+            return await hr(conv, t)
+        except Exception:
+            return True
 
     async def _send(self, rid, conv, key, o, **fmt):
         """Never say the same thing twice: if this answer already went to the rider in the last 30 min, he is
@@ -273,6 +308,8 @@ class RiderFlows:
             return False
         last[key] = time.time()
         await self.deps["send"](rid, conv, key, o, **fmt)
+        if key != "q:holding":
+            self.last_rider_at.pop(conv, None)          # the rider got an answer — nobody is waiting any more
         return True
 
     async def _fwd(self, rid, conv, note, urgent=False, o=None):
@@ -330,28 +367,51 @@ class RiderFlows:
             intent = "order_ref"
         st = self.state.get(rid)
         self._last[rid] = (text or "")[:200]
+        self.last_rider_at.setdefault(conv, time.time())
+        self.conv_rider[conv] = rid
         if st:
             st["conv"], st["last"] = conv, (text or "")[:120]
         ctx = f"{INTENT_LABEL.get(intent, intent)}"
         d["log"](rid, o, f"reply:{intent}", (text or "📷 photo")[:200])
 
-        if self.handed_over(conv) and intent in ("customer_phone", "customer_unreachable", "customer_find") and o is not None \
-                and time.time() - self.sent_keys.get(rid, {}).get("q:customer_card", 0) > 30 * 60:
-            return await self._card(rid, conv, o, intent)      # the customer card is pure data — useful even while a person handles it
-        if self.handed_over(conv):
-            if intent == "urgent":
-                await self._fwd(rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
-                return "urgent note added (person already on it)"
-            self.clear(rid)
-            return "silent — a person has this conversation"
-
-        if intent == "other" and d.get("smart"):
+        # understanding first: Claude reads every real sentence (any language, slang, typos) — keywords are the fallback
+        in_yes_no = bool(st and st.get("flow") == "not_ready" and st.get("step") in ("wait", "persuade"))
+        if d.get("smart") and not intent_from_tags(tags) and not in_yes_no and intent not in ("urgent", "minutes", "photo", "order_ref") \
+                and len((text or "").split()) >= 3:
             try:
-                guess = await d["smart"](text, o)
+                guess = await d["smart"](text, o, self._prev.get(rid, ""))
                 if guess:
                     intent = guess
             except Exception:
                 pass
+        elif intent == "other" and d.get("smart"):
+            try:
+                guess = await d["smart"](text, o, self._prev.get(rid, ""))
+                if guess:
+                    intent = guess
+            except Exception:
+                pass
+        self._prev[rid] = (text or "")[:200]
+
+        if self.handed_over(conv):
+            if intent in ("customer_phone", "customer_unreachable", "customer_find") and o is not None \
+                    and time.time() - self.sent_keys.get(rid, {}).get("q:customer_card", 0) > 30 * 60:
+                return await self._card(rid, conv, o, intent)  # the customer card is pure data — useful even while a person handles it
+            if await self.person_engaged(conv):
+                if intent == "urgent":
+                    await self._fwd(rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
+                    return "urgent note added (person already on it)"
+                self.clear(rid)
+                return "silent — a person is answering this conversation"
+            # forwarded, but nobody answered: the bot takes the conversation back and handles this message itself
+            self.handover.pop(conv, None)
+            self._save()
+            if intent in ("other", "no", "yes", "ack"):
+                waited = round((time.time() - self.last_rider_at.get(conv, time.time())) / 60)
+                if time.time() - self.sent_keys.get(rid, {}).get("q:holding", 0) > 20 * 60:
+                    await self._send(rid, conv, "q:holding", o)
+                await self._fwd(rid, conv, f"⏰ rider still waiting for an answer{f' ({waited} min)' if waited else ''} — please reply.\nRider: {text[:300]}", urgent=True, o=o)
+                return "holding reply + urgent re-forward"
 
         if intent == "urgent":
             await self._fwd(rid, conv, f"🔴 URGENT — {text[:300]}", urgent=True, o=o)
@@ -484,6 +544,17 @@ class RiderFlows:
                 self.set(rid, "await_photo", "", 5, kind="damaged", conv=conv, ref=(o or {}).get("ref", ""))
                 return "asked for a photo"
             await self._fwd(rid, conv, f"order damaged — {text[:300]}", o=o); return "forwarded"
+        if intent == "remove_order":
+            already = time.time() - self.sent_keys.get(rid, {}).get("q:remove_order", 0) < 30 * 60
+            if already:
+                if time.time() - self.sent_keys.get(rid, {}).get("q:holding", 0) > 20 * 60:
+                    await self._send(rid, conv, "q:holding", o)
+                await self._fwd(rid, conv, f"⏰ rider insists: remove {(o or {}).get('ref') or 'the order'} — still no answer.\nRider: {text[:300]}", urgent=True, o=o)
+                return "holding reply + urgent re-forward"
+            if self.on("q:remove_order"):
+                await self._send(rid, conv, "q:remove_order", o)
+            await self._fwd(rid, conv, f"🔴 wants {(o or {}).get('ref') or 'the order'} removed / taken back — please decide in MotionTools.\nRider: {text[:300]}", urgent=True, o=o)
+            return "acknowledged + forwarded (remove order)"
         if intent == "photo":
             await self._fwd(rid, conv, "📷 photo received without text", o=o)
             return "photo forwarded"
@@ -547,6 +618,25 @@ class RiderFlows:
     async def tick(self, now: datetime):
         d = self.deps
         t = now.timestamp()
+        # riders left waiting in a forwarded conversation: nobody answered for 7 min → holding reply + urgent note, once
+        for conv, since in list(self.last_rider_at.items()):
+            if t - since > 3 * 3600:
+                self.last_rider_at.pop(conv, None); continue
+            if t - since < 7 * 60 or not self.handed_over(conv):
+                continue
+            rid = self.conv_rider.get(conv)
+            if not rid or t - self.sent_keys.get(rid, {}).get("q:holding", 0) < 20 * 60:
+                continue
+            try:
+                if await self.person_engaged(conv) and t - self.handover.get(conv, t) > self.GRACE_MIN * 60:
+                    hr = d.get("human_replied_since")
+                    if hr and await hr(conv, since):
+                        self.last_rider_at.pop(conv, None); continue
+                o = d["order_for"](rid)
+                await self._send(rid, conv, "q:holding", o)
+                await d["forward"](rid, conv, f"⏰ rider waiting {round((t - since) / 60)} min without an answer — please reply now.", urgent=True, o=o)
+            except Exception:
+                pass
         for rid, st in list(self.state.items()):
             o = d["order_for"](rid)
             flow, until, conv = st.get("flow"), st.get("until") or 0, st.get("conv", "")
