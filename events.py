@@ -381,8 +381,9 @@ class Projector:
             if ev == "transition":
                 to = str(d.get("to") or "")
                 if to in DONE:
+                    # docs (2026-07-01): a booking also completes when its stops end FAILED — that is not a delivery
                     self.dispatched(o, now)
-                    if not o["delivered_at"]:
+                    if not o["delivered_at"] and not o.get("cancelled"):
                         o["delivered_at"] = now
                 elif to == "cancelled":
                     o["cancelled"] = True

@@ -188,7 +188,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "8.2"
+VERSION = "8.3"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -507,7 +507,7 @@ async def sync_riders(now: datetime):
         mt_phone = (u.get("profile") or {}).get("phone_number") or ""
         info = {"id": rid, "name": rider_name(u), "phone": projector.phone_for(rid, mt_phone), "mt_phone": mt_phone,
                 "online": online, "lat": loc.get("lat"), "lng": loc.get("lng"),
-                "active_ids": u.get("active_hailing_booking_ids") or u.get("active_booking_ids") or []}
+                "active_ids": [u["active_tour_id"]] if u.get("active_tour_id") else []}   # docs 2026-03-11: active_hailing_booking_ids is deprecated
         STATE["riders"][rid] = info
         store.upsert_rider(rid, info["name"], info["phone"], online, info["lat"], info["lng"], info["active_ids"], now)
         if online:

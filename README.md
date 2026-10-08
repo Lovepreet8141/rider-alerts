@@ -23,6 +23,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 8.3 — checked against MotionTools' announcements (changelog + all deprecations)
+- A booking whose drop-off FAILED now completes automatically in MotionTools (announcement 2026-07-01, "failed stops are
+  terminal"); that final `done` no longer counts as a delivery.
+- `stop_failed.outcome` (announcement 2026-07-15) drives the result: re-attempt = still live, skip/return = not delivered.
+- The deprecated user field `active_hailing_booking_ids` (2026-03-11) is no longer read; `active_tour_id` is used.
+- Nothing else in the deprecation list touches this system: no `hailing_booking.*` webhooks (removed 2025), no
+  earnings, failure-reasons, preferred-drivers, fleet-management or route-optimization endpoints.
+
 ## 8.2 — every webhook field read the way docs.motiontools.io defines it
 - **Failed delivery that MotionTools will re-attempt** (`stop_failed` with outcome `reattempt_now/later`) stays live; only
   `skip_recovery` / `return_*` close it as cancelled, with MotionTools' reason ("delivery failed — recipient unavailable").
