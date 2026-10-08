@@ -30,8 +30,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from events import DISPATCHED, Projector
-from mt import ACTIVE_STATUSES, PLACE_PATH, USER_PATH, MotionTools
+from events import DISPATCHED, SEEN_MAX, Projector, event_key
+from mt import ACTIVE_STATUSES, LIST_PATHS, PLACE_PATH, USER_PATH, MotionTools
 from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, classify, render_query
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, leg_stillness, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
 import store as store_mod
@@ -96,6 +96,39 @@ def recent_event_lines(n: int = 60000) -> list:
     return out[-n:]
 
 
+# event-log bytes written BEFORE this process started: those events were handled by the previous run (or by the
+# startup repair), so a repeated delivery of one of them must change nothing. Bytes after the mark are this run's.
+LOG_MARK = {}
+try:
+    LOG_MARK = {str(p): p.stat().st_size for p in event_files()[-2:]}
+except Exception:
+    pass
+
+
+def seen_keys_from_log() -> list:
+    """Event keys of the events logged before this start (yesterday's + today's file), oldest first."""
+    keys = []
+    for path, size in LOG_MARK.items():
+        try:
+            with open(path, "rb") as f:
+                start = max(0, size - 80 * 1024 * 1024)
+                f.seek(start)
+                data = f.read(size - start)
+            lines = data.decode("utf-8", "ignore").splitlines()
+            if start and lines:
+                lines = lines[1:]
+            for line in lines:
+                try:
+                    k = event_key(json.loads(line))
+                except Exception:
+                    continue
+                if k is not None:
+                    keys.append(k)
+        except Exception as e:
+            log.warning("could not read %s for repeat protection: %s", path, e)
+    return keys[-SEEN_MAX:]
+
+
 def disk_report() -> dict:
     try:
         u = shutil.disk_usage(str(DATA_DIR))
@@ -155,7 +188,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "8.0"
+VERSION = "8.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -218,7 +251,7 @@ PULSE_CACHE: dict = {}              # today's delivered/within/on-time numbers, 
 INSIGHTS_CACHE: dict = {}           # period -> (computed_at, data); 30 s — the Riders/Insights tabs poll every minute
 DIRTY = {"events": 0}               # webhook events since the last alert evaluation
 EVENT_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=100000)   # the webhook only queues; event_worker() processes
-WEBHOOK_STATS = {"rejected": 0, "dropped": 0, "worker_errors": 0, "last_rejected_path": ""}
+WEBHOOK_STATS = {"rejected": 0, "dropped": 0, "worker_errors": 0, "repeats": 0, "last_rejected_path": ""}
 ENRICH_LOCK = asyncio.Lock()
 
 
@@ -1058,6 +1091,10 @@ async def post_start(now: datetime):
     """The slow parts of a start (housekeeping, DB backup, replaying the event log) run AFTER the server is already
     answering — a restart at peak must not take the dashboard down for a minute."""
     loop = asyncio.get_event_loop()
+    try:
+        projector.seed_seen(await loop.run_in_executor(None, seen_keys_from_log))   # repeat protection across restarts
+    except Exception as e:
+        log.warning("repeat protection seed failed: %s", e)
     # housekeeping (old files, GPS purge, vacuum) is NOT done at startup any more — the hourly run at :30 does it.
     # the first minutes after a deploy belong to the people opening the dashboard, so the heavy repair waits too.
     await asyncio.sleep(90)
@@ -1127,17 +1164,14 @@ async def sync_loop():
                 await probe_endpoints(now)                 # learn what this token may read before doing anything
             mode = STATE["sync"]["mode"]
             if mt.enabled and mode == "webhook":
-                # every 30 min: probe again and retry the list endpoints — the moment MotionTools opens them we switch back
+                # every 30 min: re-check endpoints not known yet + close orders that finished while we were down.
+                # Webhooks stay the source of truth (MotionTools: subscribe instead of polling lists) — no switch to polling.
                 retry_at = STATE["sync"]["api_retry_at"]
                 if retry_at is None or now >= datetime.fromisoformat(retry_at):
                     STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
                     if not first:
                         await probe_endpoints(now, quiet=True)
-                    if await mt.list_bookings(AREAS, ACTIVE_STATUSES) is not None:
-                        set_mode("api")
-                        store.log("info", f"MotionTools bookings endpoint works ({mt.stats['bookings_path']}) — switching to API mode")
-                        first = True
-                    elif mt.stats.get("detail_path"):
+                    if mt.stats.get("detail_path"):
                         # finished while we were down? only the oldest few — reading every order burned the hourly quota
                         stale = sorted((o for o in list(STATE["orders"].values()) if o.get("dispatched_at") and (now - o["dispatched_at"]).total_seconds() > 90 * 60),
                                        key=lambda o: o["dispatched_at"])[:10]
@@ -1163,7 +1197,7 @@ async def sync_loop():
             if mt.enabled and STATE["sync"]["mode"] == "api":
                 await sync_riders(now)
                 ok = await sync_orders(now)
-                if not ok and (api_restricted() or all(mt.blocked(p) for p in ("/api/bookings/active", "/api/bookings", "/api/hailing/bookings"))):
+                if not ok and (api_restricted() or all(mt.blocked(p) for p in LIST_PATHS)):
                     set_mode("webhook")
                     STATE["sync"]["last_error"] = None
                     STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
@@ -1220,8 +1254,11 @@ def shutdown():
 @app.on_event("startup")
 async def startup():
     now = datetime.now(UTC)
-    remembered = store.get_settings().get("sync_mode")
-    STATE["sync"]["mode"] = remembered or ("api" if mt.enabled else "webhook")
+    # webhooks (through the relay) are the source of truth; the API only fills gaps (names, phones, addresses).
+    # MotionTools' docs: subscribe to webhooks instead of polling the bookings list — so no polling mode any more.
+    STATE["sync"]["mode"] = "webhook"
+    if store.get_settings().get("sync_mode") not in (None, "webhook"):
+        store.set_settings({"sync_mode": "webhook"})
     try:
         import anyio.to_thread
         anyio.to_thread.current_default_thread_limiter().total_tokens = 16   # 40 worker threads × a DB reader each was memory for nothing
@@ -1368,6 +1405,9 @@ def process_event(p: dict):
     if STATE["sync"]["mode"] == "webhook" or not mt.stats.get("bookings_path"):   # until the API is PROVEN to work, events are the truth
         name = projector.apply(p)
         STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
+        if name == "repeat":
+            WEBHOOK_STATS["repeats"] = WEBHOOK_STATS.get("repeats", 0) + 1
+            return                                                # delivered twice by MotionTools: already done
         DIRTY["events"] += 1                                      # alerts are re-evaluated by evaluate_loop (every 2 s)
         if str(p.get("event") or "") == "transition" and str((p.get("data") or {}).get("to") or "") in ("done", "completed", "finished", "paid", "processing_payment", "cancelled") \
                 or str(p.get("event") or "") == "stop_completed":
@@ -3116,7 +3156,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": intercom.ic.webhooks[:10], "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

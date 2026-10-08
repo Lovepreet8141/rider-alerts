@@ -1,20 +1,23 @@
 """MotionTools API client (read-only) for the Quickzi ops dashboard.
 
-MotionTools can put an account in "restricted API mode": some endpoints answer
-403 restricted_endpoint, others may still work.  This client therefore
-  * knows several paths for the same data (documented /api/bookings… first, legacy /api/hailing/… last),
-  * remembers which endpoints are restricted and stops calling them (until the next probe()),
-  * exposes stats["endpoints"] so the dashboard can show what is open and what is not.
+Rules followed (docs.motiontools.io):
+  * API token as `Authorization: Bearer`, server-side only, no X-Client-Version header (must be omitted with API tokens)
+  * only GET — this system never changes anything in MotionTools
+  * only the documented endpoints below; webhooks are the source of truth, the API only fills gaps
+  * 429 / "hourly limit" → that endpoint rests until the next hour
+  * "restricted_endpoint" (account in restricted API mode) → not asked again for 24 h
+
+MotionTools can put an account in "restricted API mode": some endpoints answer 403 restricted_endpoint, others may
+still work.  This client remembers which endpoints are restricted and exposes stats["endpoints"] so the dashboard
+can show what is open and what is not.
 
 Endpoints (docs.motiontools.io):
-  GET /api/bookings/active            active bookings
-  GET /api/bookings                   all bookings — filters[status][]=…, filters[service_area_id]=…, filters[local_done_at]=YYYY-MM-DD
-  GET /api/bookings/{id}              one booking with stops, driver, events timeline
-  GET /api/hailing/bookings[/{id}]    legacy paths for the same
-  GET /api/users?filters[role]=driver riders with online status, GPS, active orders
-  GET /api/users/{id}                 one user (name, phone)
-  GET /api/places/{id}                one place (restaurant name, address)
-  GET /api/user                       the token owner (sanity check)
+  GET /api/hailing/bookings           ListHailingBookings — filters[status][]=…, filters[service_area_id]=…
+  GET /api/hailing/bookings/{id}      ShowHailingBooking — one booking with stops, driver, events timeline
+  GET /api/users?filters[role]=driver ListUsers — riders
+  GET /api/users/{id}                 ShowUser — one user (name, phone)
+  GET /api/places/{id}                ShowPlace — one place (restaurant name, address)
+  GET /api/user                       ViewUserAccount — the token owner (sanity check)
 """
 from __future__ import annotations
 
@@ -30,18 +33,17 @@ BASE = "https://api.motiontools.io"
 ACTIVE_STATUSES = ["to_be_dispatched", "dispatched", "partially_dispatched", "pickable", "claimed", "en_route"]
 DONE_STATUSES = ["done", "paid", "processing_payment", "cancelled"]
 
-LIST_PATHS = ["/api/bookings/active", "/api/bookings", "/api/hailing/bookings"]
-HISTORY_PATHS = ["/api/bookings", "/api/hailing/bookings"]
-DETAIL_PATHS = ["/api/bookings/{id}", "/api/hailing/bookings/{id}"]
+LIST_PATHS = ["/api/hailing/bookings"]
+HISTORY_PATHS = ["/api/hailing/bookings"]
+DETAIL_PATHS = ["/api/hailing/bookings/{id}"]
+RESTRICTED_RECHECK = timedelta(hours=24)       # MotionTools: restricted_endpoint → "contact support"; don't keep knocking
 USERS_PATH = "/api/users"
 USER_PATH = "/api/users/{id}"
 PLACE_PATH = "/api/places/{id}"
 ME_PATH = "/api/user"
 
-LABELS = {"/api/user": "token owner", "/api/bookings/active": "active bookings", "/api/bookings": "bookings",
-          "/api/hailing/bookings": "bookings (legacy)", "/api/bookings/{id}": "booking detail",
-          "/api/hailing/bookings/{id}": "booking detail (legacy)", "/api/users": "riders list",
-          "/api/users/{id}": "rider detail", "/api/places/{id}": "restaurant detail"}
+LABELS = {"/api/user": "token owner", "/api/hailing/bookings": "bookings", "/api/hailing/bookings/{id}": "booking detail",
+          "/api/users": "riders list", "/api/users/{id}": "rider detail", "/api/places/{id}": "restaurant detail"}
 
 
 def enc_filters(filters: dict) -> list:
@@ -75,6 +77,7 @@ class MotionTools:
         self.blocked_paths: dict = {}          # endpoint key -> reason (restricted / http 404 / rate limit)
         self.blocked_until: dict = {}          # endpoint key -> datetime when a rate-limit block expires
         self.permanent: set = set()            # endpoint keys that answered 404 with a real id -> path does not exist here
+        self.restricted_at: dict = {}          # endpoint key -> when MotionTools said "restricted_endpoint"
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -122,6 +125,7 @@ class MotionTools:
             now = datetime.now(timezone.utc)
             if "restricted_endpoint" in res.text:
                 self.blocked_paths[key] = "restricted"
+                self.restricted_at[key] = now
                 self.stats["endpoints"][key] = "restricted"
             elif res.status_code == 429 or "rate_limit" in res.text:
                 # "restricted API access mode ... reached the hourly limit for this endpoint" -> usable again next hour
@@ -266,13 +270,14 @@ class MotionTools:
 
     # ---------- discovery ----------
     async def probe(self, booking_id: str = None, place_id: str = None, user_id: str = None) -> dict:
-        """Re-test the endpoints that answered 'restricted' earlier (cheap: a few calls), so the dashboard can show
-        what this token may read. Paths that do not exist (404) are never asked again; hourly quotas are respected."""
+        """Test the endpoints not known yet (cheap: a few calls), so the dashboard can show what this token may read.
+        Paths that do not exist (404) are never asked again; hourly quotas are respected; an endpoint MotionTools
+        called restricted is asked again only once a day."""
+        now = datetime.now(timezone.utc)
         for key in [k for k, why in self.blocked_paths.items() if why == "restricted"]:
-            self.blocked_paths.pop(key, None)
+            if now - self.restricted_at.get(key, now) >= RESTRICTED_RECHECK:
+                self.blocked_paths.pop(key, None)
         tests = [(ME_PATH, ME_PATH, []),
-                 ("/api/bookings/active", "/api/bookings/active", [("limit", "1")]),
-                 ("/api/bookings", "/api/bookings", [("limit", "1")]),
                  ("/api/hailing/bookings", "/api/hailing/bookings", [("limit", "1")]),
                  (USERS_PATH, USERS_PATH, enc_filters({"role": "driver"}) + [("limit", "1")])]
         if booking_id:

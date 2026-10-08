@@ -20,6 +20,7 @@ Phase sources
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
 from orders import UTC, new_order, phase_from, ts
@@ -32,6 +33,21 @@ DISPATCHED = {"pickable", "claimed", "en_route"}
 ASSIGNED = {"dispatched", "partially_dispatched", "scheduled"}
 DONE = {"done", "completed", "finished", "paid", "processing_payment"}
 STALE_HOURS = 3           # a live order without any MotionTools event for this long is closed automatically
+SEEN_MAX = 150000         # remembered event ids (≈ 1½ days of non-GPS events at 10 000 orders a day, ~15 MB)
+
+
+def event_key(p: dict):
+    """MotionTools delivers "at least once" — the same event can arrive twice (docs: Webhooks → Idempotence).
+    Every event has its own id (uuid); id + type + timestamp identify one delivery's content. GPS updates are
+    exempt: a repeated position changes nothing, and they are most of the traffic."""
+    eid = p.get("id")
+    if not eid or not isinstance(eid, (str, int)) or str(p.get("event") or "") == "driver_location_updated":
+        return None
+    d = p.get("data") if isinstance(p.get("data"), dict) else {}
+    # the subject (+ target state / stop) is part of the key too: only a true repeat can ever match
+    return hash((eid, str(p.get("resource_type") or ""), str(p.get("event") or ""), str(p.get("timestamp") or ""),
+                 str(d.get("booking_id") or d.get("tour_id") or d.get("driver_id") or ""), str(d.get("to") or ""),
+                 str(d.get("stop_id") or "")))
 
 
 class Projector:
@@ -45,7 +61,33 @@ class Projector:
         self.place_ll: dict = {}       # place_id -> (lat, lng): from the place API, a booking detail, or where a rider arrived
         self.phones: dict = {}         # rider_id -> phone number typed in Settings (used when MotionTools sends none)
         self.counts: dict = {}
+        self.done_keys: OrderedDict = OrderedDict()   # event_key -> None, oldest first (NOT self.seen: that is a method)
+        self.repeats = 0
         self._load()
+
+    # ---------------- at-least-once delivery ----------------
+    def repeat(self, p: dict) -> bool:
+        """True when this exact event was processed before (then it must change nothing)."""
+        k = event_key(p)
+        if k is None:
+            return False
+        if k in self.done_keys:
+            self.repeats += 1
+            return True
+        self.done_keys[k] = None
+        if len(self.done_keys) > SEEN_MAX:
+            self.done_keys.popitem(last=False)
+        return False
+
+    def seed_seen(self, keys: list):
+        """After a restart: the events already in the event log count as processed (they are, by the repair)."""
+        merged = OrderedDict.fromkeys(k for k in keys if k is not None)
+        for k in self.done_keys:
+            merged.pop(k, None)
+            merged[k] = None
+        while len(merged) > SEEN_MAX:
+            merged.popitem(last=False)
+        self.done_keys = merged
 
     # ---------------- persistence of small maps ----------------
     def _load(self):
@@ -297,6 +339,8 @@ class Projector:
 
     # ---------------- the event switch ----------------
     def apply(self, p: dict) -> str:
+        if self.repeat(p):
+            return "repeat"
         rtype, ev = str(p.get("resource_type") or ""), str(p.get("event") or "")
         name = f"{rtype}.{ev}"
         d = p.get("data") or {}

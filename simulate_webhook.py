@@ -17,6 +17,7 @@ import threading
 import time
 import json
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 
 UTC = timezone.utc
@@ -44,7 +45,7 @@ PLACE_BK, PLACE_CHO = "7a1c-burgerking", "9f2e-choque"
 
 
 def ev(rtype, event_name, t, **data):
-    return {"id": "e", "timestamp": t, "resource_type": rtype, "event": event_name, "data": {"service_area_id": AREA, **data}}
+    return {"id": str(uuid.uuid4()), "timestamp": t, "resource_type": rtype, "event": event_name, "data": {"service_area_id": AREA, **data}}
 
 
 BOOK: dict = {}          # booking id -> what the fake API knows about it

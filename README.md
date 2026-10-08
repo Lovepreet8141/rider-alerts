@@ -23,6 +23,25 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 8.1 — MotionTools' API and webhook rules, all kept (checked against MotionTools' openapi.json)
+- **Repeated deliveries change nothing.** MotionTools delivers webhooks "at least once". Every event id is remembered
+  (≈ 1½ days, also across restarts), and a repeat is ignored and counted in /health → `webhook.repeats`. Before, a late
+  repeat of "pickable" counted as a hand-back and a repeat of "created" brought a delivered order back as live.
+- **Signature check** (relay v3): `X-Mtools-Signature` (Ed25519) is verified with the public key from the MotionTools
+  webhook page (relay variable `MT_WEBHOOK_PUBLIC_KEY`). Unsigned or forged calls are answered 200 but never reach the
+  dashboard. Safe switch-on: "checking" until 20 real signatures matched, then "enforcing".
+- **Only documented, read-only endpoints**: `/api/hailing/bookings`, `/api/hailing/bookings/{id}`, `/api/users`,
+  `/api/users/{id}`, `/api/places/{id}`, `/api/user` — GET only, API token without X-Client-Version. The undocumented
+  `/api/bookings…` paths are gone.
+- **No list polling**: webhooks are the source of truth (MotionTools: subscribe instead of polling lists); the API only
+  fills names, phones and addresses within the hourly budget. An endpoint answered "restricted" is asked again once a day
+  (before: every 30 min).
+- **/health no longer shows rider messages** (name + text were visible to anyone with the link); it shows the count.
+  The messages stay on the logged-in Intercom page.
+- Tested: chaos test with signatures on (dashboard killed, redeployed, frozen 45 s, killed again): 30,695 calls all 200,
+  1,080/1,080 orders, 1,074/1,074 delivered, 218/218 forged calls refused, 0 orders wrongly cancelled; 1,500 live orders
+  at 116 events/s: 0 failures, webhook p99 41 ms, ~700 MB.
+
 ## 8.0 — final: the webhook never fails, no order event is lost
 **Required setup (once):** MotionTools must send to the relay, not to the dashboard. Only then can a dashboard
 restart, crash or freeze never reach MotionTools.
