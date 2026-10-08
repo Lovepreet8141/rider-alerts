@@ -23,6 +23,30 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 8.0 — final: the webhook never fails, no order event is lost
+**Required setup (once):** MotionTools must send to the relay, not to the dashboard. Only then can a dashboard
+restart, crash or freeze never reach MotionTools.
+1. Railway → New → GitHub repo (this repo) → service settings: Start command `uvicorn relay:app --host 0.0.0.0 --port $PORT`,
+   Watch paths `relay.py`, Healthcheck path `/health`, Networking → Generate domain. No variables, no volume.
+2. Check `https://<relay-domain>/health` → `"ok": true`.
+3. MotionTools → Settings → Webhooks → create a NEW webhook: URL `https://<relay-domain>/mt/<same secret as today>`, the same
+   events and the same `customer_id` filter as the current one, Active. Then switch the old webhook off.
+4. The dashboard header shows "· via relay ✓"; an amber banner says "Not protected" while MotionTools still sends directly.
+
+What changed:
+- **Write-ahead log:** every order event is written to disk before the 200 goes out (relay batches and direct calls);
+  a crash a second later loses nothing — the start-up repair rebuilds it, including orders the live board never saw.
+- **Clean stop:** on a deploy the server finishes its queue before it exits.
+- **Mode remembered:** after a restart, events the relay hands over are applied at once (before: ignored for the first
+  seconds until the API probe finished — orders created during the restart could go missing).
+- **Always 200 to MotionTools** on the direct URL too: a wrong secret or a broken body is counted, never an error;
+  GET/HEAD probes answer 200.
+- **Relay:** accepts any body, answers in ~1 ms, hands over what is waiting when it is itself stopped, `/health` shows
+  `waiting`, `oldest_waiting_s`, `last_error`.
+- **Chaos test passed:** 30,704 calls from "MotionTools" at ~150/s while the dashboard was crashed (25 s down),
+  redeployed, frozen for 45 s and crashed again: 30,704 × 200, relay p99 3.9 ms, 1,099 orders created → 1,099 in the
+  database, 1,096 finished → 1,096 delivered. 0 lost.
+
 ## 7.0.2 — the last start-up pauses from /health
 - No forced garbage collection after reports (a full collection on a big heap paused every thread, the event loop
   included, for up to 5 s); long-lived start-up data is frozen out of the collector (`gc.freeze`).

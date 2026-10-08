@@ -155,7 +155,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "7.0.2"
+VERSION = "8.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -885,6 +885,19 @@ def repair_from_events(now: datetime, replayed: dict = None) -> int:
         n += 1
         if n % 500 == 0:
             store.end_batch(); time.sleep(0.05); store.begin_batch()     # commit in chunks, let readers through
+    # orders whose events reached the log but never the live board (server died in between): add them now
+    recent = now - timedelta(hours=36)
+    for bid, r in replayed.items():
+        if bid in targets or r.get("partial"):
+            continue
+        last = r.get("last_event_at") or r.get("created_at")
+        if not last or last < recent:
+            continue
+        r["phase"] = phase_from(r)
+        store.upsert_order(r, now, stacked=False, force=True)
+        if r["phase"] not in ("delivered", "cancelled", "closed"):
+            STATE["orders"].setdefault(bid, r)
+        n += 1
     store.end_batch()
     return n
 
@@ -1121,7 +1134,7 @@ async def sync_loop():
                     if not first:
                         await probe_endpoints(now, quiet=True)
                     if await mt.list_bookings(AREAS, ACTIVE_STATUSES) is not None:
-                        STATE["sync"]["mode"] = "api"
+                        set_mode("api")
                         store.log("info", f"MotionTools bookings endpoint works ({mt.stats['bookings_path']}) — switching to API mode")
                         first = True
                     elif mt.stats.get("detail_path"):
@@ -1151,7 +1164,7 @@ async def sync_loop():
                 await sync_riders(now)
                 ok = await sync_orders(now)
                 if not ok and (api_restricted() or all(mt.blocked(p) for p in ("/api/bookings/active", "/api/bookings", "/api/hailing/bookings"))):
-                    STATE["sync"]["mode"] = "webhook"
+                    set_mode("webhook")
                     STATE["sync"]["last_error"] = None
                     STATE["sync"]["api_retry_at"] = iso(now + timedelta(minutes=30))
                     store.log("error", "MotionTools has this account in restricted API mode — running in WEBHOOK mode "
@@ -1190,6 +1203,14 @@ async def sync_loop():
 
 @app.on_event("shutdown")
 def shutdown():
+    """Railway stops the old server on every deploy: finish what is queued first (all of it is in the event log
+    anyway, this just keeps the live board exact)."""
+    t0 = time.monotonic()
+    while not EVENT_QUEUE.empty() and time.monotonic() - t0 < 15:
+        try:
+            process_event(EVENT_QUEUE.get_nowait())
+        except Exception:
+            pass
     try:
         intercom.ic._flush()                     # the debounced thread file: nothing lost on a restart
     except Exception:
@@ -1199,6 +1220,8 @@ def shutdown():
 @app.on_event("startup")
 async def startup():
     now = datetime.now(UTC)
+    remembered = store.get_settings().get("sync_mode")
+    STATE["sync"]["mode"] = remembered or ("api" if mt.enabled else "webhook")
     try:
         import anyio.to_thread
         anyio.to_thread.current_default_thread_limiter().total_tokens = 16   # 40 worker threads × a DB reader each was memory for nothing
@@ -1240,38 +1263,85 @@ async def startup():
     asyncio.create_task(loop_lag_monitor())
 
 
+def set_mode(m: str):
+    """Webhook vs API mode, remembered across restarts: right after a restart the relay hands over everything it
+    kept — those events must be applied at once, not ignored until the first API probe has finished."""
+    STATE["sync"]["mode"] = m
+    try:
+        if store.get_settings().get("sync_mode") != m:
+            store.set_settings({"sync_mode": m})
+    except Exception:
+        pass
+
+
 # ====================================================================== webhook (wakes the sync)
+def _log_events(items: list):
+    """Write-ahead: every order event is on disk BEFORE MotionTools / the relay gets its 200 — if the server dies a
+    second later, the start-up repair rebuilds the order from this file. GPS points are not logged (90 % of the
+    traffic, and a lost position is replaced by the next one)."""
+    lines = [json.dumps(p, separators=(",", ":")) for p in items if isinstance(p, dict) and str(p.get("event") or "") not in GPS_EVENTS]
+    if not lines:
+        return
+    try:
+        with open(event_file(datetime.now(UTC)), "a") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:                                        # a full disk must never cost a delivery
+        log.warning("could not write the event log: %s", e)
+
+
+def _accept(items: list, via: str):
+    s = STATE["sync"]
+    now_iso = iso(datetime.now(UTC))
+    for p in items:
+        if isinstance(p, dict):
+            p["_logged"] = True
+            try:
+                EVENT_QUEUE.put_nowait(p)
+            except asyncio.QueueFull:
+                WEBHOOK_STATS["dropped"] += 1
+    s["webhook_events"] += len(items)
+    s["last_webhook"] = now_iso
+    s["silent_min"], s["webhook_silent"] = 0, False
+    WEBHOOK_STATS[f"{via}_last"] = now_iso
+    WEBHOOK_STATS[f"{via}_events"] = WEBHOOK_STATS.get(f"{via}_events", 0) + len(items)
+
+
+def _secret_ok(secret: str) -> bool:
+    if secrets.compare_digest(secret, PATH_SECRET):
+        return True
+    WEBHOOK_STATS["rejected"] += 1
+    WEBHOOK_STATS["last_rejected_path"] = secret[:12] + "…"
+    if WEBHOOK_STATS["rejected"] in (1, 10, 100, 1000):
+        store.log("error", f"{WEBHOOK_STATS['rejected']} webhook call(s) with a wrong URL secret were ignored — fix the URL in MotionTools")
+    return False
+
+
+@app.api_route("/mt/{secret}", methods=["GET", "HEAD"])
+def webhook_probe(secret: str):
+    return {"ok": True}                                          # MotionTools / Railway checks: never an error
+
+
 @app.post("/mt/{secret}")
 async def webhook(secret: str, request: Request):
-    """Answers MotionTools in microseconds and queues the event.  MotionTools blocks a webhook after 250 failed
-    deliveries in a row (timeouts count), so this handler must never wait for the database or the event loop —
-    all processing happens in event_worker()."""
-    if not secrets.compare_digest(secret, PATH_SECRET):
-        WEBHOOK_STATS["rejected"] += 1
-        WEBHOOK_STATS["last_rejected_path"] = secret[:12] + "…"
-        if WEBHOOK_STATS["rejected"] in (1, 10, 100, 1000):
-            store.log("error", f"{WEBHOOK_STATS['rejected']} webhook call(s) rejected — the URL secret does not match WEBHOOK_PATH_SECRET "
-                               "(MotionTools counts these as failed deliveries and will block the webhook)")
-        raise HTTPException(404)
+    """MotionTools calls this directly (without the relay). ALWAYS answers 200 at once: MotionTools blocks a webhook
+    after 250 failed deliveries in a row, and a wrong secret or a broken body must never count as one."""
+    if not _secret_ok(secret):
+        return {"ok": True}
     try:
         p = await request.json()
     except Exception:
-        p = {}
-    s = STATE["sync"]
-    s["webhook_events"] += 1
-    s["last_webhook"] = iso(datetime.now(UTC))
-    s["silent_min"], s["webhook_silent"] = 0, False
-    try:
-        EVENT_QUEUE.put_nowait(p)
-    except asyncio.QueueFull:
-        WEBHOOK_STATS["dropped"] += 1
+        return {"ok": True}
+    items = p if isinstance(p, list) else [p]
+    _log_events(items)
+    _accept(items, "direct")
     return {"ok": True}
 
 
 @app.post("/mt/{secret}/batch")
 async def webhook_batch(secret: str, request: Request):
-    """Events forwarded by relay.py (the always-on webhook catcher): a list, in MotionTools' order.  Answers 503 when
-    the queue is too full, so the relay keeps them and retries instead of anything being lost."""
+    """Events forwarded by relay.py (the always-on webhook catcher), in MotionTools' order. The 200 comes only after
+    the events are written to the event log, so a crash right after loses nothing. 503 (queue full) or 404 (wrong
+    secret) → the relay keeps them and retries."""
     if not secrets.compare_digest(secret, PATH_SECRET):
         WEBHOOK_STATS["rejected"] += 1
         raise HTTPException(404)
@@ -1283,29 +1353,19 @@ async def webhook_batch(secret: str, request: Request):
         items = [items]
     if EVENT_QUEUE.qsize() + len(items) > EVENT_QUEUE.maxsize - 1000:
         raise HTTPException(503, "busy — retry")
-    s = STATE["sync"]
-    for p in items:
-        if isinstance(p, dict):
-            EVENT_QUEUE.put_nowait(p)
-    s["webhook_events"] += len(items)
-    s["last_webhook"] = iso(datetime.now(UTC))
-    s["silent_min"], s["webhook_silent"] = 0, False
+    _log_events(items)
+    _accept(items, "relay")
     WEBHOOK_STATS["relay_batches"] = WEBHOOK_STATS.get("relay_batches", 0) + 1
-    WEBHOOK_STATS["relay_last"] = s["last_webhook"]
     return {"ok": True, "queued": len(items), "queue": EVENT_QUEUE.qsize()}
 
 
 def process_event(p: dict):
     """One queued webhook event: raw log, projector, enrichment."""
-    if str(p.get("event") or "") not in GPS_EVENTS:
-        try:
-            with open(event_file(datetime.now(UTC)), "a") as f:
-                f.write(json.dumps(p) + "\n")
-        except Exception as e:                                    # a full disk must never cost an event or a delivery
-            log.warning("could not write the event log: %s", e)
+    if not p.pop("_logged", False):
+        _log_events([p])                                          # (already on disk when it came through a webhook)
     if len(STATE["raw_samples"].get("events", [])) < 12:
         STATE["raw_samples"].setdefault("events", []).append(p)
-    if STATE["sync"]["mode"] == "webhook":
+    if STATE["sync"]["mode"] == "webhook" or not mt.stats.get("bookings_path"):   # until the API is PROVEN to work, events are the truth
         name = projector.apply(p)
         STATE["sync"]["events"][name] = STATE["sync"]["events"].get(name, 0) + 1
         DIRTY["events"] += 1                                      # alerts are re-evaluated by evaluate_loop (every 2 s)
