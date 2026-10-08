@@ -416,8 +416,10 @@ class Projector:
             elif ev == "etas_recalculated":
                 o["eta_at"] = now
                 for s in d.get("unfinished_stops_info") or []:
-                    kind = "pickup" if "pick" in str(s.get("type", "")).lower() else "dropoff"
+                    kind = str(s.get("type") or "").lower()          # docs: pickup | dropoff | task | return
                     o["stop_types"][str(s.get("id"))] = kind
+                    if kind not in ("pickup", "dropoff"):
+                        continue                                  # a task / return stop's ETA is not the customer's
                     eta = ts(s.get("eta"))
                     if eta:
                         o["eta_restaurant" if kind == "pickup" else "eta_customer"] = eta
@@ -455,12 +457,19 @@ class Projector:
                     else:
                         o["at_customer_at"] = o["at_customer_at"] or now
                         o["delivered_at"] = o["delivered_at"] or now
+                        if o.get("cancelled") and str(o.get("cancel_reason") or "").startswith("delivery failed"):
+                            o["cancelled"] = False                # an earlier failed attempt, delivered after all
+                            o["cancel_reason"] = ""
                         self.note(o, now, "delivered", o.get("rider_id"), who)
                 elif ev == "stop_failed":
+                    # docs: outcome = skip_recovery | reattempt_later | reattempt_now | return_later | return_now,
+                    # failure_reason.key = recipient_unavailable, location_closed, … — a re-attempt is NOT the end
                     self.note(o, now, "pickup_failed" if kind == "pickup" else "delivery_failed", o.get("rider_id"), who)
-                    if kind == "dropoff":
+                    fr = d.get("failure_reason") if isinstance(d.get("failure_reason"), dict) else {}
+                    why = str(fr.get("key") or "").replace("_", " ")
+                    if kind == "dropoff" and not str(d.get("outcome") or "").startswith("reattempt"):
                         o["cancelled"] = True
-                        o["cancel_reason"] = "delivery failed"
+                        o["cancel_reason"] = "delivery failed" + (f" — {why}" if why else "")
             elif ev == "driver_location_updated":
                 self.seen(d.get("driver_id") or o.get("rider_id"), now)
                 loc = d.get("driver_location") or {}
@@ -558,6 +567,11 @@ class Projector:
                     self.dispatched(o, now)
                     self.set_rider(o, d.get("driver_id"), "", now)
                     self.finish(o, now)
+            elif ev == "force_unassigned":
+                for o in bookings:                        # the dispatcher took the tour away from this rider
+                    if o.get("rider_id") and (not d.get("driver_id") or o["rider_id"] == d.get("driver_id")):
+                        self.release(o, now, "unassigned")
+                        self.finish(o, now)
             elif ev == "driver_location_updated":
                 for o in bookings:
                     o["rider_lat"], o["rider_lng"] = d.get("lat"), d.get("lng")

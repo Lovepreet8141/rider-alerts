@@ -278,10 +278,10 @@ class MotionTools:
             if now - self.restricted_at.get(key, now) >= RESTRICTED_RECHECK:
                 self.blocked_paths.pop(key, None)
         tests = [(ME_PATH, ME_PATH, []),
-                 ("/api/hailing/bookings", "/api/hailing/bookings", [("limit", "1")]),
+                 ("/api/hailing/bookings", "/api/hailing/bookings", [("limit", "1"), ("view", "minimal")]),
                  (USERS_PATH, USERS_PATH, enc_filters({"role": "driver"}) + [("limit", "1")])]
         if booking_id:
-            tests += [(t, t.format(id=booking_id), [("view", "standard")]) for t in DETAIL_PATHS]
+            tests += [(t, t.format(id=booking_id), [("view", "minimal")]) for t in DETAIL_PATHS]   # access check only: lightest view
         if place_id:
             tests.append((PLACE_PATH, PLACE_PATH.format(id=place_id), []))
         if user_id:

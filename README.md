@@ -23,6 +23,19 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 8.2 — every webhook field read the way docs.motiontools.io defines it
+- **Failed delivery that MotionTools will re-attempt** (`stop_failed` with outcome `reattempt_now/later`) stays live; only
+  `skip_recovery` / `return_*` close it as cancelled, with MotionTools' reason ("delivery failed — recipient unavailable").
+  A later successful drop-off turns it into delivered. Before, every failed attempt counted as cancelled for good.
+- **ETA to the customer** comes only from the drop-off stop — a `task` or `return` stop's ETA no longer overwrites it.
+- **`tour.force_unassigned`** (dispatcher takes a tour away from a rider) now removes the rider from the order
+  ("taken away by dispatcher" in the order story).
+- Endpoint checks use `view=minimal` (docs: "prefer the compact or minimal view to keep load on the backend minimal");
+  the booking detail keeps `standard` because only it has the event timeline and the rider's position.
+- Restaurant address from the place endpoint's `street / number / zip_code / city`.
+- /health → `events_by_type`: how many events of each kind arrived (counts only) — shows at a glance whether MotionTools
+  sends rider (driver.*) and tour (tour.*) events to the webhook.
+
 ## 8.1 — MotionTools' API and webhook rules, all kept (checked against MotionTools' openapi.json)
 - **Repeated deliveries change nothing.** MotionTools delivers webhooks "at least once". Every event id is remembered
   (≈ 1½ days, also across restarts), and a repeat is ignored and counted in /health → `webhook.repeats`. Before, a late

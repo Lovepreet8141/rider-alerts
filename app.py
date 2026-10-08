@@ -188,7 +188,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "8.1"
+VERSION = "8.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -738,9 +738,8 @@ async def enrich_place(pid: str) -> bool:
     lat, lng = p.get("lat", loc.get("lat")), p.get("lng", loc.get("lng"))
     if lat is not None and lng is not None:
         projector.set_place_ll(pid, lat, lng)
-    addr = p.get("formatted_address") or p.get("address") or ""
-    if isinstance(addr, dict):
-        addr = " ".join(str(x) for x in [addr.get("street"), addr.get("house_number"), addr.get("zip_code"), addr.get("city")] if x)
+    # docs (ShowPlace): street, number, zip_code, city
+    addr = " ".join(str(x) for x in [p.get("street"), p.get("number"), p.get("zip_code"), p.get("city")] if x)
     if name:
         projector.set_place(pid, name)
         store.log("info", f"restaurant named from MotionTools: {name}" + (f" ({addr})" if addr else ""))
@@ -3163,7 +3162,8 @@ async def health():                                           # async: answers e
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
             "sync": {k: s[k] for k in ("last_ok", "last_error", "runs", "orders_seen", "riders_seen", "backfilled", "webhook_events", "last_snapshot",
                                        "last_webhook", "silent_min", "webhook_silent", "mode")},
-            "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize()}, "api": mt.stats}
+            "webhook": {**WEBHOOK_STATS, "queue": EVENT_QUEUE.qsize()}, "api": mt.stats,
+            "events_by_type": dict(sorted(STATE["sync"]["events"].items(), key=lambda kv: -kv[1])[:30])}
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
