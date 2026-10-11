@@ -23,6 +23,38 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0 — the smart rider bot (training pack + AI)
+**What changed for riders**
+- Answers come from the Quickzi training pack: one clear next step, simple words, no username greeting, never "the order
+  will be cancelled", never a customer's name or address.
+- **Phone rule:** "call from the app" first → "check your own number in the app profile" → only when calling through the
+  app does not work, the bot sends the customer's NUMBER — only to the rider the order is assigned to, only while it is
+  live. A customer who just doesn't answer: keep calling 10 min, then a teammate takes over automatically.
+- **Food not ready:** asks how many more minutes; up to 10 → "please wait" (and asks again when the time is up); more,
+  20 min waited in total (from the MotionTools data), or the rider insists → a teammate decides.
+- New situations: order not at the restaurant / taken by another rider, item missing, Liefercode refused, address not
+  found, app call not working, customer refuses, accident (→ "call 112 if anyone is hurt").
+- "?", "Hlooo", "Reply me bro": ONE short "still with you" (max every 5 min), and the team gets an urgent note.
+
+**How it understands**
+- Messages within 6 seconds are read together (`BOT_BURST_SECONDS`): "Tkbt6q · Hlo · Brother, he is not giving the code" =
+  order TKBT6Q, Liefercode problem → one answer, not three.
+- **AI (brain.py):** Claude Haiku 4.5 reads the burst + the order status (no customer data) and returns the situation,
+  order number, minutes waited / still needed, cancel wish, the rider's language and a one-line English summary.
+  Keyword rules (improved with the real chats) take over when the AI is off, unsure or unreachable.
+- **Answers in the rider's language:** the approved text is translated (same meaning, nothing added). Off-switch on the
+  Intercom page. Team notes stay in English with the AI summary on top.
+- Cost: about 0.3 cents per rider question (Haiku 4.5: $1 / $5 per million tokens) — about $3 a day at 1,000 questions.
+  Today's calls and cost: Intercom page → Bot brain, and /health → "ai".
+
+**Intercom page → Bot brain:** wait limits (10 / 20 min), hand-over time for unreachable customers (10 min),
+"answer in the rider's language", and free-text team notes the AI reads. All answer texts are editable (one field,
+simple English). Texts edited for v8 are reset once (they described the old customer card).
+
+**Safety:** the bot is OFF on a new install until the master switch is turned on. Tested: the real chats of 11 Oct
+(with and without AI), 300 riders × 3 messages at once (one answer each, event loop never stalled > 51 ms), smoke,
+repeats, webhook fields and the signed chaos test.
+
 ## 8.3 — checked against MotionTools' announcements (changelog + all deprecations)
 - A booking whose drop-off FAILED now completes automatically in MotionTools (announcement 2026-07-01, "failed stops are
   terminal"); that final `done` no longer counts as a delivery.

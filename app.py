@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -32,7 +33,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from events import DISPATCHED, SEEN_MAX, Projector, event_key
 from mt import ACTIVE_STATUSES, LIST_PATHS, PLACE_PATH, USER_PATH, MotionTools
-from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, classify, render_query
+import brain
+from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, TEXTS_VERSION, classify, classify_burst, render_query
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, leg_stillness, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
 import store as store_mod
 from store import Store, day_key, day_start
@@ -188,7 +190,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "8.3"
+VERSION = "9.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1878,6 +1880,9 @@ def _automations_payload() -> dict:
             "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
             "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
             "master": ic_master(settings),
+            "bot": {"wait_more": settings.get("bot_wait_more") or "10", "wait_total": settings.get("bot_wait_total") or "20",
+                    "unreach_min": settings.get("bot_unreach_min") or "10", "translate": settings.get("bot_translate", "1") == "1",
+                    "ai_notes": settings.get("ai_notes") or "", "ai": brain.stats()},
             "received": list(intercom.ic.webhooks)[:60],
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(200), "quiet_hours": "", "daily_cap": 0}
 
@@ -1977,15 +1982,17 @@ async def api_classify(request: Request):
     """Intercom page: 'what would the dashboard understand?' — type a rider message, see the intent."""
     body = await request.json() or {}
     text = str(body.get("text") or "")
-    i, via = classify(text, bool(body.get("photo"))), "keywords"
-    if i == "other" and ANTHROPIC_KEY:
-        try:
-            g = await smart_intent(text, None)
-            if g:
-                i, via = g, "Claude"
-        except Exception as e:
-            return {"intent": i, "label": f"{INTENT_LABEL.get(i, i)} (Claude error: {str(e)[:80]})"}
-    return {"intent": i, "label": f"{INTENT_LABEL.get(i, i)} — via {via}"}
+    msgs = [m.strip() for m in re.split(r"\n| \| ", text) if m.strip()] or [text]
+    i, via, ai = classify_burst(msgs, bool(body.get("photo"))), "keywords", {}
+    if brain.enabled():
+        ai = await _understand(msgs, "", "")
+        if ai.get("situation") and ai.get("confidence", 0) >= brain.MIN_CONFIDENCE:
+            i, via = ai["situation"], f"AI {round(ai['confidence'] * 100)}%"
+        elif not ai:
+            via += f" (AI not reachable: {brain.STATS.get('last_error') or 'no answer'})"
+    extra = f" · {ai['summary']}" if ai.get("summary") else ""
+    extra += f" · answers in {ai['reply_language']}" if ai.get("reply_language") and ai["reply_language"] != "English" else ""
+    return {"intent": i, "label": f"{INTENT_LABEL.get(i, i)} — via {via}{extra}"}
 
 
 @app.post("/api/automations", dependencies=[Depends(require_login)])
@@ -2007,6 +2014,17 @@ async def api_automations_set(request: Request):
     for k, v in (body.get("master") or {}).items():
         if k in ("bot", "rules"):
             vals[f"ic_{k}"] = "1" if v else "0"
+    bot = body.get("bot") or {}
+    for k, lo, hi in (("wait_more", 1, 30), ("wait_total", 5, 60), ("unreach_min", 3, 30)):
+        if k in bot:
+            try:
+                vals[f"bot_{k}"] = str(max(lo, min(hi, int(bot[k]))))
+            except Exception:
+                pass
+    if "translate" in bot:
+        vals["bot_translate"] = "1" if bot["translate"] else "0"
+    if isinstance(bot.get("ai_notes"), str):
+        vals["ai_notes"] = bot["ai_notes"].strip()[:1500]
     if "close" in body:
         vals["intercom_auto_close"] = "1" if body.get("close") else ""
         intercom.ic.auto_close = bool(body.get("close"))
@@ -2287,45 +2305,32 @@ def _rider_recent_order(rid: str):
     return mine[0] if mine else None
 
 
-ANTHROPIC_KEY = env("ANTHROPIC_API_KEY", "")
-SMART_CACHE: dict = {}
-SMART_INTENTS = ("not_ready", "closed", "no_order", "cant_deliver", "customer_unreachable", "customer_phone", "customer_find",
-                 "customer_problem", "forgot_finish", "damaged", "remove_order", "ack", "excuse", "urgent", "other")
+ANTHROPIC_KEY = brain.API_KEY          # the bot's AI (brain.py): Claude Haiku reads rider messages, translates the answers
 
 
-async def smart_intent(text: str, o, prev: str = "") -> str:
-    """Optional (ANTHROPIC_API_KEY set in Railway): a message the keyword rules can't place is classified by Claude —
-    any language, any spelling. Only picks one of the known situations; never writes the reply itself."""
-    if not ANTHROPIC_KEY or not (text or "").strip():
+def _ai_ctx(o) -> str:
+    """What the AI may know about the order: status and timing only — never the customer's name, phone or address."""
+    if not o:
         return ""
-    key = (text.strip().lower()[:200], (o or {}).get("phase"), prev[:80])
-    if key in SMART_CACHE:
-        return SMART_CACHE[key]
-    import httpx
-    ctx = f"Rider's current order status: {PHASE_LABEL.get(o['phase'], o['phase'])}" if o else "Rider has no live order."
-    if prev:
-        ctx += f"\nHis previous message was: \"{prev[:200]}\""
-    prompt = (f"A food-delivery rider wrote this to dispatch support:\n\"{text[:500]}\"\n{ctx}\n\n"
-              f"Which ONE situation is it? Answer with exactly one of: {', '.join(SMART_INTENTS)}.\n"
-              "not_ready=restaurant food not ready; closed=restaurant closed; no_order=restaurant has no such order/another rider took it; "
-              "cant_deliver=rider can't do the delivery; customer_unreachable=can't reach/contact customer; customer_phone=wants customer number; "
-              "customer_find=can't find address/entrance; customer_problem=customer refuses/complains; forgot_finish=order must be completed/closed in the app, photo upload fails; "
-              "damaged=order damaged; remove_order=wants the order removed/unassigned/cancelled from him; ack=ok/thanks/arrived; excuse=delay explanation; urgent=accident/injury/police; other=anything else.")
-    async with httpx.AsyncClient(timeout=8) as cli:
-        r = await cli.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                           json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]})
-        word = [w.strip(".,:;!\"'`*") for w in "".join(b.get("text", "") for b in (r.json().get("content") or [])).strip().lower().split()[0:1]]
-    res = word[0] if word and word[0] in SMART_INTENTS and word[0] != "other" else ""
-    SMART_CACHE[key] = res
-    if len(SMART_CACHE) > 500:
-        SMART_CACHE.pop(next(iter(SMART_CACHE)))
-    return res
+    bits = [f"order {o.get('ref') or '?'}", PHASE_LABEL.get(o.get("phase"), o.get("phase") or "")]
+    now = datetime.now(UTC)
+    if o.get("at_restaurant_at") and not o.get("picked_up_at"):
+        bits.append(f"rider at the restaurant for {int((now - o['at_restaurant_at']).total_seconds() // 60)} min")
+    if o.get("at_customer_at") and not o.get("delivered_at"):
+        bits.append(f"rider at the customer for {int((now - o['at_customer_at']).total_seconds() // 60)} min")
+    if o.get("restaurant"):
+        bits.append(f"restaurant: {o['restaurant']}")
+    return ", ".join(b for b in bits if b)
+
+
+async def _understand(msgs: list, ctx: str, asked: str) -> dict:
+    return await brain.understand(msgs, ctx, asked, extra=store.get_settings().get("ai_notes") or "")
 
 
 def ic_master(settings: dict = None) -> dict:
     """Intercom page → master switches. bot = the dashboard answers rider queries; rules = automatic rule messages."""
     st = settings or store.get_settings()
-    return {"bot": st.get("ic_bot", "1") == "1", "rules": st.get("ic_rules", "1") == "1"}
+    return {"bot": st.get("ic_bot", "0") == "1", "rules": st.get("ic_rules", "1") == "1"}   # a new install: the bot is OFF until switched on
 
 
 def auto_cities_enabled(settings: dict = None) -> set:
@@ -2359,13 +2364,20 @@ def _order_ctx(o) -> str:
     return f"Order {o.get('ref')} · {PHASE_LABEL.get(o['phase'], o['phase'])}{since} · {o.get('restaurant') or ''} → {o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip()
 
 
-def customer_card_data(o: dict) -> dict:
-    phone = (o.get("customer_phone") or "").strip()
-    notes = (o.get("customer_notes") or "").strip()
-    addr = f"{o.get('customer_addr') or ''} {o.get('customer_zip') or ''}".strip() or "–"
-    link = f"https://maps.google.com/?q={o['drop_lat']},{o['drop_lng']}" if o.get("drop_lat") is not None and o.get("drop_lng") is not None else ""
-    return {"ref": o.get("ref") or "", "customer_name": f"{o['customer_name']} · " if o.get("customer_name") else "", "phone": phone or "siehe App | see the app",
-            "address": addr, "notes_line": f"📝 {notes}\n" if notes else "", "map_line": f"🗺️ {link}\n" if link else "", "phone_known": bool(phone)}
+def customer_phone_of(o) -> str:
+    return (o.get("customer_phone") or "").strip() if o else ""
+
+
+async def _fetch_phone(o) -> str:
+    """The number is not in the order yet: one read of the booking (MotionTools API, if open) before giving up."""
+    if not o:
+        return ""
+    if not o.get("customer_phone"):
+        try:
+            await enrich_order(o["id"], datetime.now(UTC), bg=False)
+        except Exception:
+            pass
+    return customer_phone_of(o)
 
 
 BOT_SENT: list = []        # (time, first 60 chars) of what the dashboard itself wrote — to tell a teammate's reply from ours
@@ -2418,7 +2430,7 @@ async def rider_waiting(conv: str, since: float) -> bool:
     return True
 
 
-async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, **fmt):
+async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, lang: str = "", **fmt):
     settings = store.get_settings()
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
     base = {"ref": (o or {}).get("ref") or "", "restaurant": (o or {}).get("restaurant") or "the restaurant", "name": name}
@@ -2426,6 +2438,8 @@ async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, *
     text = render_query(_query_text(key, settings), **base)
     if closer_key:
         text = (text + "\n" + render_query(_query_text(closer_key, settings), **base)).strip()
+    if lang and settings.get("bot_translate", "1") == "1":
+        text = await brain.translate(text, lang)          # the approved text in the rider's language (same meaning)
     now = datetime.now(UTC)
     aid = store.auto_log(now, key, rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), text, "pending" if intercom.ic.enabled else "dry")
     if intercom.ic.enabled:
@@ -2481,45 +2495,91 @@ def _order_by_ref(text: str):
     return None
 
 
-flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_replied_since, "order_by_ref": _order_by_ref, "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order, "smart": smart_intent, "send": _flow_send, "forward": _flow_forward, "log": _flow_log, "riders_on": _riders_on,
-              "others": _others, "customer_card": customer_card_data, "settings": store.get_settings}
+flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_replied_since, "order_by_ref": _order_by_ref,
+              "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order,
+              "understand": _understand, "order_ctx": _ai_ctx, "send": _flow_send, "forward": _flow_forward, "log": _flow_log,
+              "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone,
+              "settings": store.get_settings}
 
-CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem")
+
+def _migrate_texts():
+    """v9 rewrote the bot's answers (training pack). Texts edited for the old flows would talk about cards and German /
+    English pairs that no longer exist — they are reset once, so the new answers are live."""
+    s = store.get_settings()
+    if s.get("bot_texts_version") == TEXTS_VERSION:
+        return
+    old = {k: "" for k, v in s.items() if k.startswith("auto_text:q:") and v}
+    store.set_settings({**old, "bot_texts_version": TEXTS_VERSION})
+    if old:
+        store.log("info", f"bot answers updated to the v{TEXTS_VERSION} texts ({len(old)} edited texts from the old version reset)")
+
+
+_migrate_texts()
+CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem", "call_failed")
+BURST_WAIT = float(env("BOT_BURST_SECONDS", "6") or 6)   # messages within these seconds are read together
+BURSTS: dict = {}
 
 
 RIDER_LOCKS: dict = {}
 
 
 async def handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
-    """One rider's messages are answered one after another (a question and a quick '?' arrive together — the '?' must
-    see what the bot did with the question)."""
+    """Riders send several short messages in a row ("Tkbt6q", "Hlo", "Brother, he is not giving the code"): everything
+    that arrives within BURST_WAIT seconds is read and answered together — one answer, not one per message."""
     if not ic_master()["bot"]:
         intercom.ic.note_in(conversation_id, STATE["riders"].get(rid, {}).get("name") or rid, text or "📷 photo",
                             "bot is OFF (Intercom → master switch) — left for the team", rider_id=rid)
         return
-    lock = RIDER_LOCKS.setdefault(rid, asyncio.Lock())
+    b = BURSTS.get(conversation_id)
+    if b is None or b["rid"] != rid:
+        b = BURSTS[conversation_id] = {"rid": rid, "msgs": [], "photo": False, "tags": None, "in_auto": False, "task": None}
+    if (text or "").strip():
+        b["msgs"].append(text.strip())
+    b["photo"] = b["photo"] or has_photo
+    b["tags"] = tags or b["tags"]
+    b["in_auto"] = b["in_auto"] or in_auto
+    if b["task"] is not None:
+        b["task"].cancel()                                # still collecting: wait for the rider to finish typing
+    b["task"] = asyncio.create_task(_burst_fire(conversation_id))
+
+
+async def _burst_fire(conv: str):
+    try:
+        await asyncio.sleep(BURST_WAIT)
+    except asyncio.CancelledError:
+        return
+    b = BURSTS.pop(conv, None)                            # from here on, new messages start a new burst
+    if not b:
+        return
+    lock = RIDER_LOCKS.setdefault(b["rid"], asyncio.Lock())
     async with lock:
-        await _handle_rider_reply(rid, text, conversation_id, in_auto, has_photo, tags)
+        await _handle_rider_reply(b["rid"], "\n".join(b["msgs"]), conv, b["in_auto"], b["photo"], b["tags"], burst=b["msgs"])
 
 
-async def _handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None):
+async def _handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto: bool = False, has_photo: bool = False, tags=None, burst=None):
     """A rider wrote to us (Intercom webhook): the flow engine answers what it can and forwards the rest with context."""
     now = datetime.now(UTC)
     o = _rider_recent_order(rid)
-    intent = classify(text, has_photo, tags)
-    if o is not None and intent in CUSTOMER_INTENTS and not o.get("customer_phone"):
+    msgs = burst or [text]
+    intent = classify_burst(msgs, has_photo, tags)
+    flow = (flows.state.get(rid) or {}).get("flow")
+    if o is not None and (intent in CUSTOMER_INTENTS or flow in ("phone", "unreachable", "find")) and not o.get("customer_phone"):
         try:
-            await enrich_order(o["id"], now, bg=False)
+            await enrich_order(o["id"], now, bg=False)   # the number is ready if calling through the app fails
         except Exception:
             pass
     msgs = intercom.ic.threads.get(rid, {}).get("messages", [])
     last_ops = next((m for m in reversed(msgs) if m.get("from") == "ops"), None)
     last_ops_auto = bool(last_ops and last_ops.get("auto") and now.timestamp() - (last_ops.get("at") or 0) < 3600)
     try:
-        result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags)
-        store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {intent} → {result}")
+        result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags, burst=msgs)
+        understood = flows.last_intent.get(rid, intent)
+        ai = flows.last_ai.get(rid) or {}
+        via = f"AI {round(ai.get('confidence', 0) * 100)}%" if ai.get("situation") == understood else "keywords"
+        store.log("info", f"Intercom reply from {STATE['riders'].get(rid, {}).get('name') or rid}: {understood} ({via}) → {result}")
         intercom.ic.note_in(conversation_id, STATE['riders'].get(rid, {}).get('name') or rid, text or "📷 photo",
-                            f"understood as {flows.last_intent.get(rid, intent)}{' · order ' + (o.get('ref') or '') if o else ' · no recent order found'} → {result}", rider_id=rid)
+                            f"understood as {INTENT_LABEL.get(understood, understood)} ({via}){' · order ' + (o.get('ref') or '') if o else ' · no recent order found'}"
+                            f"{' · ' + ai['summary'] if ai.get('summary') else ''} → {result}", rider_id=rid)
     except Exception as e:
         intercom.ic.note_in(conversation_id, rid, text or "", f"ERROR: {str(e)[:120]} → forwarded to team")
         log.exception("rider reply failed: %s", e)
@@ -3155,7 +3215,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "last_500": STATE.get("last_500"), "claude_classifier": bool(ANTHROPIC_KEY), "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": brain.enabled(), "ai": brain.stats(), "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
