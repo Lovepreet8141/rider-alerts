@@ -55,6 +55,16 @@ def env(name, default=""):
 
 MT_TOKEN = env("MT_API_TOKEN")
 PATH_SECRET = env("WEBHOOK_PATH_SECRET", "change-me")
+MT_WEB_URL = (env("MT_WEB_URL", "https://quickzii.motiontools.io") or "https://quickzii.motiontools.io").rstrip("/")
+
+
+def mt_link(o) -> str:
+    """The order in the MotionTools dashboard: its tour when we know the tour id (tour.created webhook), else the booking."""
+    if not o or not o.get("id"):
+        return ""
+    if o.get("tour_id"):
+        return f"{MT_WEB_URL}/tours/{o['tour_id']}"
+    return f"{MT_WEB_URL}/bookings/{o['id']}"
 DASH_PASSWORD = env("DASHBOARD_PASSWORD")
 DATA_DIR = Path(env("DATA_DIR", ".") or ".")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,7 +200,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.5"
+VERSION = "9.0.6"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1476,7 +1486,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
     stops_done = (1 if o.get("picked_up_at") else 0) + (1 if o.get("delivered_at") else 0)
     last_eta = o.get("eta_customer")
     to_last = mins(now, last_eta) if (live and last_eta and o["phase"] not in ("unassigned", "on_hold")) else None
-    return {"id": o["id"], "ref": o["ref"], "rider": o["rider"] or r.get("name") or "", "rider_id": o["rider_id"], "city": city_of(o), "fleet": o.get("fleet") or store.fleet_map.get(o["rider_id"] or "", ""),
+    return {"id": o["id"], "ref": o["ref"], "mt_url": mt_link(o), "rider": o["rider"] or r.get("name") or "", "rider_id": o["rider_id"], "city": city_of(o), "fleet": o.get("fleet") or store.fleet_map.get(o["rider_id"] or "", ""),
             "dispatched_iso": iso(o.get("dispatched_at")), "stops_total": int(stops_total), "stops_done": stops_done, "to_last_stop_min": int(round(to_last)) if to_last is not None else None,
             "rider_lat": lat if live else None, "rider_lng": lng if live else None, "pick_lat": o.get("pick_lat"), "pick_lng": o.get("pick_lng"),
             "drop_lat": o.get("drop_lat"), "drop_lng": o.get("drop_lng"), "km": round(o["est_distance_m"] / 1000, 1) if isinstance(o.get("est_distance_m"), (int, float)) else None,

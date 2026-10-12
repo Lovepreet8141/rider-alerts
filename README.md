@@ -23,6 +23,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.6 — ↗ MotionTools link next to every order number
+
+* A small ↗ next to the order number (order list, the order panel, the Orders table) opens the order in the MotionTools
+  dashboard in a new tab: the **tour** page when the dashboard knows the tour (from the `tour.created` webhook),
+  otherwise the **booking** page. Base URL: `MT_WEB_URL` (default `https://quickzii.motiontools.io`).
+* Tour ids come only from MotionTools' `tour.created` event, which carries no customer_id — so it needs its own webhook
+  without a filter (same relay URL). Booking events never contain the tour id.
+
 ## 9.0.5 — every button and every "hi" gets an answer
 
 * "Hi", "Salam alaikum", "Hello, I need help", the **Other** button → "Hi! How can I help you? Please tell us in one
