@@ -47,8 +47,14 @@ QUERIES = [
      "Thanks for telling us. Please wait at the restaurant, a teammate is checking with the restaurant what happens with the order now."),
     ("q:closed", "Restaurant closed → photo, a teammate checks",
      "Thanks. Please send us a photo of the entrance, with the opening hours if you can see them. A teammate is checking it now."),
-    ("q:remove_order", "Rider wants the order removed (not because of waiting)",
-     "Understood. A teammate is checking order {ref} now and will tell you what to do. Please wait a moment."),
+    ("q:cancel_reason", "Rider wants to cancel / remove the order → ask the reason first",
+     "Okay. Why do you want to cancel this order? For example: food not ready, restaurant closed, customer not answering, or a problem with your bike or car."),
+    ("q:returned_photo", "Rider gave the order back to the restaurant → photo first",
+     "Thanks for telling us. Please send a photo of the order at the restaurant, so we can see it was handed back. Then a teammate takes care of it."),
+    ("q:returned_thanks", "Photo of the returned order received",
+     "Thanks, got the photo. A teammate is checking it now and will confirm here."),
+    ("q:remove_order", "Reason given → a teammate decides about the order",
+     "Thanks. A teammate is checking order {ref} now and will tell you what to do. Please wait a moment."),
     ("q:phone_app", "Rider asks for the customer's number → call from the app",
      "Please call the customer with the call button on the customer stop in your app. If the call doesn't go through, check that your own phone number in the app profile is correct, then try again."),
     ("q:phone_number", "Calling through the app doesn't work → number, house number and notes (only to the assigned rider)",
@@ -69,8 +75,8 @@ QUERIES = [
      "Please don't leave the food yet and stay with the customer for a moment. A teammate is checking it now and will tell you what to do in a few minutes."),
     ("q:damaged", "Order damaged → photo",
      "Please send us a photo of the order. A teammate will reply in a few minutes."),
-    ("q:cant_deliver", "Rider can't continue → ask the reason",
-     "Thanks for telling us. What's the reason? A teammate will help you in a few minutes."),
+    ("q:cant_deliver", "Rider can't continue → ask the reason first",
+     "Okay, thanks for telling us. What's the reason? For example: food not ready, restaurant closed, customer not answering, or a problem with your bike or car."),
     ("q:urgent", "Accident, injury, police, danger",
      "If anyone is hurt or in danger, call 112 now. A teammate is taking over your chat right now."),
     ("q:handover", "Anything a teammate has to decide",
@@ -171,6 +177,8 @@ BUTTONS = {   # workflow buttons: the label arrives as the rider's message
     "i forgot to finish the order on the app": "forgot_finish", "customer refuses the order": "customer_problem",
     "customer doesn't accept the order": "customer_problem", "other": "other", "i can't do the delivery": "cant_deliver",
     "order is damaged": "damaged", "restaurant closed": "closed",
+    "i cannot make the delivery": "cant_deliver", "i can't make the delivery": "cant_deliver",
+    "i cannot communicate with the client": "customer_unreachable", "i can't communicate with the client": "customer_unreachable",
 }
 NUDGE_VOCAB = {"hello", "helo", "hlo", "hallo", "hi", "hey", "bro", "brother", "bhai", "bhaiya", "sir", "boss", "reply", "me", "pls", "plz",
                "please", "bitte", "anyone", "there", "answer", "antwort", "und", "and", "jetzt", "now", "still", "waiting", "wait", "warte",
@@ -214,10 +222,15 @@ TAG_INTENTS = {
     "customer_problem": "customer_problem", "customer doesn't accept the order": "customer_problem", "customer refuses": "customer_problem", "customer problem": "customer_problem",
     "forgot_finish": "forgot_finish", "forgot": "forgot_finish", "i forgot to finish the order on the app": "forgot_finish", "forgot to complete": "forgot_finish",
     "damaged": "damaged", "order_damaged": "damaged", "order is damaged": "damaged",
-    "other": "other",
+    "other": "other", "returned": "returned", "order_returned": "returned",
 }
 
 
+RETURNED = ("returned the order", "returned it", "returned to the restaurant", "return the order", "gave it back", "given it back", "gave back",
+            "given back", "brought it back", "brought back", "back to the restaurant", "zurückgegeben", "zurueckgegeben", "zurück gebracht",
+            "zurückgebracht", "zurueckgebracht", "zurück ins restaurant", "zurück zum restaurant", "abgegeben im restaurant",
+            "رجعت الطلب", "رجعت الطلبية", "ارجعت الطلب", "أرجعت الطلب", "رجعته للمطعم", "رجعتها للمطعم", "سلمته للمطعم",
+            "geri verdim", "geri götürdüm", "iade ettim", "wapas kar diya", "wapas de diya", "wapis kar diya", "wapis de diya")
 REMOVE = ("remove this order", "remove the order", "remove order", "remove it", "remove esko", "remove isko", "remove krna", "remove krdo", "krdo remove", "remove kar",
           "remove karo", "krdo bhai remove", "kar do remove", "krdo remove", "bhai remove", "hatao", "hata do", "order hata", "take this order", "take the order back", "unassign", "auftrag entfernen", "bestellung entfernen",
           "nimm den auftrag", "auftrag rausnehmen", "storniere", "احذف الطلب", "شيل الطلب", "الغي الطلب", "siparişi kaldır")
@@ -282,6 +295,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "call_failed"
     if _has(low, CANT_WAIT):
         return "not_ready"                                   # "I can't wait" at the restaurant = food late, wants out
+    if _has(low, RETURNED):
+        return "returned"                                   # "I have returned the order. Please cancel" → photo first
     if _has(low, REMOVE):
         return "remove_order"
     if _has(low, ITEM_MISSING) and not _has(low, CUSTOMER):
@@ -296,8 +311,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "forgot_finish"
     if _has_word(low, LIEFERCODE) and (_has(low, LIEFER_CTX) or "liefer" in low):
         return "liefercode"
-    if _has(low, DAMAGED):
-        return "damaged"
+    if _has(low, DAMAGED) and not _has_word(low, VEHICLE):
+        return "damaged"                                # "my bike is broken" is the rider's vehicle, not the food
     if _has(low, REFUSED) and not _has(low, ("restaurant", "مطعم", "المطعم")):
         return "customer_problem"                       # "I called, he says he ordered nothing" — not a phone question
     if _has(low, FIND) and not _has(low, ("restaurant",)):
@@ -330,9 +345,11 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
 
 
 WEAK = ("other", "nudge", "ack", "yes", "no", "excuse")
+SOLVABLE = ("returned", "not_ready", "closed", "no_order", "item_missing", "customer_unreachable", "customer_find", "call_failed", "customer_phone",
+            "liefercode", "customer_problem", "damaged", "forgot_finish")       # a reason the bot has its own steps for
 
 
-PRIORITY = ("urgent", "call_failed", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
+PRIORITY = ("urgent", "call_failed", "returned", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
             "customer_phone", "closed", "damaged", "customer_problem", "not_ready", "remove_order", "cant_deliver")
 
 
@@ -359,7 +376,8 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
                 "customer_find": "can't find the address", "customer_phone": "asked for the customer's number", "call_failed": "can't call through the app",
                 "liefercode": "Liefercode problem", "customer_problem": "customer refuses / problem", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
-                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed"}
+                "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed",
+                "returned": "gave the order back to the restaurant"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
@@ -661,14 +679,14 @@ class RiderFlows:
             if intent in ("yes", "ack"):
                 return "noted (calling from the app)"
         elif flow in ("unreachable", "find"):
-            if intent == "call_failed" or (intent == "customer_phone" and flow == "unreachable"):
-                return await self._number(rid, conv, o)
+            if intent in ("call_failed", "customer_phone", "customer_unreachable", "customer_find") and not st.get("number"):
+                return await self._number(rid, conv, o, flow=flow)   # tips first (older chats), now the number
             if intent in ("ack", "yes", "ready"):
                 return "noted"
             if intent in ("customer_unreachable", "customer_find", "other", "no", "customer_phone", "nudge", "photo", "excuse"):
                 mins = round((time.time() - st.get("since", time.time())) / 60)
                 what = "customer doesn't answer" if flow == "unreachable" else "rider can't find the address"
-                await self._hand_over(rid, conv, o, f"⚠ {what} — {mins} min since our tips")
+                await self._hand_over(rid, conv, o, f"⚠ {what} — {mins} min since {'we sent the number' if st.get('number') else 'our tips'}")
                 return f"{flow}: handed over after {mins} min"
         elif flow == "await_photo":
             kind = st.get("kind", "")
@@ -678,13 +696,22 @@ class RiderFlows:
                     await self._fwd(rid, conv, self._note(rid, f"📷 photo received — {'forgot to finish' if kind == 'forgot' else 'Liefercode missing'}: please finish the order in MotionTools"), o=o)
                     self.clear(rid)
                     return "photo received → team finishes the order"
+                if kind == "returned":
+                    await self._send(rid, conv, "q:returned_thanks", o)
+                    await self._fwd(rid, conv, self._note(rid, f"📷 photo received — order {(o or {}).get('ref', '')} given back to the restaurant: please cancel / decide in MotionTools"), urgent=True, o=o)
+                    self.clear(rid)
+                    return "photo of the returned order → teammate"
                 await self._hand_over(rid, conv, o, f"📷 photo received — {'restaurant closed?' if kind == 'closed' else 'order damaged'}: please decide")
                 return "photo received → handed over"
             if intent in ("yes", "ack", "minutes", "order_ref"):
                 return "waiting for the photo"
         elif flow == "await_reason":
-            await self._hand_over(rid, conv, o, f"⚠ can't continue the delivery — reason given. Other orders: {self._others(rid, o)}")
-            return "reason received → handed over"
+            kind = st.get("kind") or "cant_deliver"
+            if intent in SOLVABLE:                       # "food not ready", "customer doesn't answer" … → that situation's own steps
+                self.clear(rid)
+                return await self._new(rid, conv, o, intent, {**ai, "wants_cancel": True}, text, has_photo, False, False)
+            reason = (ai.get("reason") or "").strip() or kw_reason(text) or text.strip().replace("\n", " / ")[:120]
+            return await self._reason_given(rid, conv, o, kind, reason)
         elif flow == "other_wait":
             if intent in ("other", "ack", "yes", "no", "excuse", "ready", "minutes"):
                 await self._hand_over(rid, conv, o, "✉ rider explained the problem")
@@ -714,7 +741,7 @@ class RiderFlows:
         self.set(rid, "not_ready", "minutes", 6, conv=conv, ref=ref)
         return "asked how many more minutes"
 
-    async def _number(self, rid, conv, o) -> str:
+    async def _number(self, rid, conv, o, flow: str = "unreachable", tips_key: str = "") -> str:
         """Calling through the app doesn't work: the customer's number + street/house number + delivery notes — never the
         name, and only for his own live order."""
         d = self.deps
@@ -729,11 +756,37 @@ class RiderFlows:
             await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
             self.number_sent[o.get("id", "")] = time.time()
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (app call not working)")
-            self.set(rid, "unreachable", "", self._cfg("bot_unreach_min", 10), conv=conv, ref=o.get("ref", ""), number=True)
-            return "app call not working → customer's number sent (his own order)"
-        why = "number not in MotionTools data" if mine else "no live order of his found — check before sending"
-        await self._hand_over(rid, conv, o, f"📞 rider can't call the customer through the app — please send the customer's number ({why})", urgent=True)
-        return f"app call not working → teammate sends the number ({why})"
+            self.set(rid, flow, "", self._cfg("bot_unreach_min", 10), conv=conv, ref=o.get("ref", ""), number=True)
+            return "customer's number + house number + notes sent (his own order)"
+        why = self._why_no_number(rid, o, mine)
+        if tips_key:                                     # no number from the bot: tips now, a teammate sends the number
+            await self._send(rid, conv, tips_key, o)
+            await self._fwd(rid, conv, self._note(rid, f"📞 rider can't reach the customer — number NOT sent automatically ({why}). Please send it."), urgent=True, o=o)
+            self.clear(rid)
+            return f"tips sent + teammate asked to send the number ({why})"
+        await self._hand_over(rid, conv, o, f"📞 rider can't reach the customer — please send the customer's number ({why})", urgent=True)
+        return f"teammate sends the number ({why})"
+
+    @staticmethod
+    def _why_no_number(rid, o, mine) -> str:
+        if o is None:
+            return "no live order found for this rider — which order is it?"
+        ref = o.get("ref") or "the order"
+        if o.get("rider_id") != rid:
+            return f"{ref} is not assigned to this rider in MotionTools"
+        if not mine:
+            return f"{ref} is already {o.get('phase')}"
+        return f"no customer number for {ref} in MotionTools"
+
+    async def _reason_given(self, rid, conv, o, kind, reason) -> str:
+        """The rider told us why he can't continue / wants the order cancelled: a teammate decides, with the reason."""
+        ref = (o or {}).get("ref", "")
+        if kind == "remove_order":
+            await self._hand_over(rid, conv, o, f"🔴 wants {ref or 'the order'} cancelled — reason: {reason}. Please decide in MotionTools",
+                                  urgent=True, key="q:remove_order")
+            return f"wants the order cancelled ({reason}) → handed over"
+        await self._hand_over(rid, conv, o, f"⚠ can't continue the delivery — reason: {reason}. Other orders: {self._others(rid, o)}", urgent=True)
+        return f"can't continue ({reason}) → handed over"
 
     async def _new(self, rid, conv, o, intent, ai, text, has_photo, in_auto, last_ops_auto) -> str:
         d = self.deps
@@ -756,23 +809,31 @@ class RiderFlows:
             await self._fwd(rid, conv, self._note(rid, "⚠ restaurant closed? — photo of the entrance asked"), urgent=True, o=o)
             self.set(rid, "await_photo", "", 10, kind="closed", conv=conv, ref=ref)
             return "restaurant closed → photo asked + team informed"
-        if intent == "remove_order":
-            await self._hand_over(rid, conv, o, f"🔴 wants {ref or 'the order'} removed / taken back — please decide in MotionTools", urgent=True, key="q:remove_order")
-            return "wants the order removed → handed over"
+        if intent == "returned":
+            if has_photo:                               # photo came with the message
+                await self._send(rid, conv, "q:returned_thanks", o)
+                await self._fwd(rid, conv, self._note(rid, f"📷 order {ref} given back to the restaurant (photo sent): please cancel / decide in MotionTools"), urgent=True, o=o)
+                return "returned order with photo → teammate"
+            await self._send(rid, conv, "q:returned_photo", o)
+            self.set(rid, "await_photo", "", 10, kind="returned", conv=conv, ref=ref)
+            return "returned order → photo asked"
+        if intent in ("remove_order", "cant_deliver"):
+            reason = (ai.get("reason") or "").strip() if ai.get("situation") else kw_reason(text)
+            if not reason:
+                await self._send(rid, conv, "q:cancel_reason" if intent == "remove_order" else "q:cant_deliver", o)
+                self.set(rid, "await_reason", "", 5, conv=conv, ref=ref, kind=intent)
+                return "asked the reason"
+            return await self._reason_given(rid, conv, o, intent, reason)
         if intent == "customer_phone":
             await self._send(rid, conv, "q:phone_app", o)
             self.set(rid, "phone", "", 15, conv=conv, ref=ref)
             return "asked to call from the app"
         if intent == "call_failed":
             return await self._number(rid, conv, o)
-        if intent == "customer_unreachable":
-            await self._send(rid, conv, "q:unreachable", o)
-            self.set(rid, "unreachable", "", self._cfg("bot_unreach_min", 10), conv=conv, ref=ref)
-            return "asked to keep calling for 10 min"
-        if intent == "customer_find":
-            await self._send(rid, conv, "q:find_address", o)
-            self.set(rid, "find", "", self._cfg("bot_unreach_min", 10), conv=conv, ref=ref)
-            return "address tips sent"
+        if intent == "customer_unreachable":           # can't reach the customer → number + house number + notes
+            return await self._number(rid, conv, o, flow="unreachable", tips_key="q:unreachable")
+        if intent == "customer_find":                  # can't find the address → number + house number + notes
+            return await self._number(rid, conv, o, flow="find", tips_key="q:find_address")
         if intent == "liefercode":
             await self._send(rid, conv, "q:liefercode", o)
             self.set(rid, "await_photo", "", 15, kind="liefercode", conv=conv, ref=ref)
@@ -794,13 +855,6 @@ class RiderFlows:
             await self._send(rid, conv, "q:damaged", o)
             self.set(rid, "await_photo", "", 10, kind="damaged", conv=conv, ref=ref)
             return "photo of the damage asked"
-        if intent == "cant_deliver":
-            if len(text.split()) >= 5 or (ai.get("summary") and ai.get("confidence", 0) >= 0.7):
-                await self._hand_over(rid, conv, o, f"⚠ can't continue the delivery. Other orders: {self._others(rid, o)}", urgent=True)
-                return "can't continue → handed over"
-            await self._send(rid, conv, "q:cant_deliver", o)
-            self.set(rid, "await_reason", "", 5, conv=conv, ref=ref)
-            return "asked why"
         if intent == "photo":
             await self._fwd(rid, conv, self._note(rid, "📷 photo received without text"), o=o)
             return "photo forwarded"
@@ -929,6 +983,25 @@ class RiderFlows:
             return self.deps["others"](rid, o)
         except Exception:
             return "–"
+
+
+VEHICLE = ("bike", "car", "auto", "fahrrad", "roller", "scooter", "ebike", "motorrad", "moped", "tire", "tyre", "reifen", "السيارة", "الدراجة",
+           "سيارة", "دراجة", "araba", "bisiklet", "gaadi", "gadi")
+REASON_HINTS = ("car", "auto", "bike", "fahrrad", "roller", "scooter", "ebike", "tire", "tyre", "reifen", "platten", "flat", "panne", "akku",
+                "battery", "kaputt", "broke", "broken", "sick", "krank", "ill", "accident", "unfall", "police", "polizei", "far", "weit", "km",
+                "home", "hause", "rain", "regen", "storm", "late", "wait", "waiting", "warte", "warten", "ready", "fertig", "closed",
+                "geschlossen", "customer", "kunde", "kunden", "address", "adresse", "because", "weil", "wegen", "denn", "phone", "handy",
+                "السيارة", "الدراجة", "سيارة", "دراجة", "مريض", "بعيد", "حادث", "المطعم", "الزبون", "العميل", "لأن", "عشان", "بسبب",
+                "araba", "bisiklet", "hasta", "uzak", "çünkü", "kyunki", "kyuki", "gaadi", "gadi")
+
+
+def kw_reason(text: str) -> str:
+    """Keyword view: did the rider say WHY he can't continue / wants to cancel? The button label alone is no reason."""
+    for line in (text or "").split("\n"):
+        low = line.strip().lower()
+        if low and _has_word(low, REASON_HINTS) and not button_intent(line):
+            return line.strip()[:120]
+    return ""
 
 
 _LABEL_LINE = re.compile(r"^[^{}\n]*:\s*\{(\w+)\}[ \t.]*$")

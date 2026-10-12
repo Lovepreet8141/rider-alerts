@@ -190,7 +190,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.2"
+VERSION = "9.0.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2497,7 +2497,9 @@ flows = RiderFlows(store)
 def _order_by_ref(text: str):
     """An order reference anywhere in the rider's message (6–8 letters/digits like 7DDP8F) that we know today."""
     import re as _re
-    for tok in _re.findall(r"\b[A-Z0-9]{5,9}\b", (text or "").upper()):
+    words = _re.findall(r"[A-Z0-9]+", (text or "").upper())
+    joined = [a + b for a, b in zip(words, words[1:]) if 5 <= len(a + b) <= 9 and len(a) <= 5 and len(b) <= 5]   # "6dg 7vy" → 6DG7VY
+    for tok in [w for w in words if 5 <= len(w) <= 9] + joined:
         if not _re.search(r"[A-Z]", tok) or not _re.search(r"\d", tok):
             continue
         hit = next((o for o in list(STATE["orders"].values()) if (o.get("ref") or "").upper() == tok), None)

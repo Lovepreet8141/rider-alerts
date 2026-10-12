@@ -34,7 +34,8 @@ SITUATIONS = {
     "no_order": "restaurant does not have this order, another rider already took it, restaurant won't hand it over",
     "item_missing": "an item of the order is not available, restaurant cancelled or changed part of the order",
     "closed": "restaurant closed, nobody there",
-    "remove_order": "rider wants the order removed / unassigned / cancelled for a reason that is NOT waiting (wrong location, too far, wrong order assigned)",
+    "returned": "rider has given / brought the order back to the restaurant (usually wants it cancelled)",
+    "remove_order": "rider wants the order removed / unassigned / cancelled — with no reason, or a reason that is NOT waiting (wrong location, too far, wrong order assigned)",
     "customer_phone": "rider asks for the customer's phone number (and has not said the app call fails)",
     "call_failed": "rider cannot call the customer through the app: no call button, call fails or drops, cannot hear, number wrong, any calling problem",
     "customer_unreachable": "customer does not answer the phone or does not open the door — the call itself works",
@@ -43,7 +44,7 @@ SITUATIONS = {
     "forgot_finish": "rider forgot to finish the order in the app, photo upload fails, order still open after delivering",
     "customer_problem": "customer refuses the order, complains, says wrong order, did not order",
     "damaged": "food damaged or spilled",
-    "cant_deliver": "rider cannot continue (vehicle broken, sick, too far) — not an emergency",
+    "cant_deliver": "rider cannot continue / cannot make the delivery (with or without a reason: vehicle broken, sick, too far) — not an emergency",
     "urgent": "accident, injury, police, threat, any danger",
     "nudge": "rider only asks for an answer: '?', 'hello', 'reply me', 'brother', 'anyone there'",
     "ack": "ok / thanks / arrived / on my way / done",
@@ -78,6 +79,12 @@ EXAMPLES = [
     (["Customer doesn't accept the Order"], {"situation": "customer_problem", "summary": "Customer refuses the order."}),
     (["Ich habe die Nummer angerufen, und mir wurde gesagt, dass ich nichts bestellt habe."],
      {"situation": "customer_problem", "reply_language": "German", "summary": "Rider called the customer; the person says they ordered nothing."}),
+    (["I have returned the order. Please cancel the order."],
+     {"situation": "returned", "wants_cancel": True, "reason": "order given back to the restaurant", "summary": "Rider gave the order back to the restaurant and wants it cancelled."}),
+    (["I cannot make the delivery"], {"situation": "cant_deliver", "reason": "", "summary": "Rider can't make the delivery, no reason given yet."}),
+    (["Please cancel"], {"situation": "remove_order", "wants_cancel": True, "reason": "", "summary": "Rider wants the order cancelled, no reason given yet."}),
+    (["I can't deliver, my bike has a flat tire"], {"situation": "cant_deliver", "reason": "flat tire", "summary": "Rider can't continue: flat tire."}),
+    (["I cannot communicate with the client"], {"situation": "customer_unreachable", "summary": "Rider can't reach the customer."}),
     (["Hello", "Hlooo", "Reply me bro", "Brother"], {"situation": "nudge", "reply_language": "English", "summary": "Rider is waiting for an answer."}),
     (["المطعم ما جهز الطلب لسا"], {"situation": "not_ready", "reply_language": "Arabic", "summary": "Food not ready yet."}),
     (["العميل لا يرد على الهاتف"], {"situation": "customer_unreachable", "reply_language": "Arabic", "summary": "Customer doesn't answer the phone."}),
@@ -96,6 +103,8 @@ SYSTEM = (
     "Rules:\n"
     "- A wish to cancel because the food is late is not_ready with wants_cancel=true, not remove_order.\n"
     "- call_failed only when the rider says calling itself does not work; a customer who doesn't pick up is customer_unreachable.\n"
+    "- reason: when the rider can't continue or wants to cancel: WHY, in a few English words ('bike broken', 'too far', "
+    "'food not ready'); \"\" when he gives no reason ('Please cancel', 'I cannot make the delivery' alone = no reason).\n"
     "- order_ref: an order number the rider wrote (5-9 letters and digits, like TKBT6Q), in capitals; else \"\".\n"
     "- minutes_waited: minutes the rider says he has ALREADY waited; minutes_needed: minutes the restaurant says it still needs; else null.\n"
     "- reply_language: the language the rider should get the answer in, in English (\"Arabic\", \"German\", \"Turkish\", \"English\"...). "
@@ -104,7 +113,7 @@ SYSTEM = (
     "- confidence: 0.0-1.0, how sure you are about the situation. Unclear or mixed = below 0.5.\n\n"
     "Answer with ONE JSON object only, no other text:\n"
     "{\"situation\": \"...\", \"confidence\": 0.0, \"order_ref\": \"\", \"minutes_waited\": null, \"minutes_needed\": null, "
-    "\"wants_cancel\": false, \"reply_language\": \"English\", \"summary\": \"...\"}\n\n"
+    "\"wants_cancel\": false, \"reason\": \"\", \"reply_language\": \"English\", \"summary\": \"...\"}\n\n"
     "Examples (rider messages → answer):\n" +
     "\n".join(f"{json.dumps(m, ensure_ascii=False)} → {json.dumps({**{'confidence': 0.9}, **a}, ensure_ascii=False)}" for m, a in EXAMPLES)
 )
@@ -188,6 +197,7 @@ def _parse(raw: str) -> dict:
     return {"situation": sit, "confidence": conf, "order_ref": ref if 5 <= len(ref) <= 9 else "",
             "minutes_waited": _int(d.get("minutes_waited")), "minutes_needed": _int(d.get("minutes_needed")),
             "wants_cancel": bool(d.get("wants_cancel")), "reply_language": lang.title() if lang.islower() else lang,
+            "reason": re.sub(r"\s+", " ", str(d.get("reason") or "")).strip()[:120],
             "summary": str(d.get("summary") or "").strip()[:240]}
 
 

@@ -23,6 +23,30 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.4 — the number reaches every rider who can't reach the customer
+
+* A rider who already got the "keep calling" tips and writes again ("he is not responding to calls or the doorbell")
+  now gets the number + house number + notes (was: handed over without the number).
+* When the bot can't send the number itself, the rider gets the tips AND a teammate gets a note to send the number,
+  with the exact why: no live order found for this rider / order not assigned to him / already delivered /
+  no customer number in MotionTools.
+* Order numbers written with a space ("6dg 7vy") are found (6DG7VY).
+* "I have returned the order, please cancel" → the bot asks for a photo of the order at the restaurant; the photo goes
+  to a teammate with "please cancel / decide in MotionTools". No photo in 10 minutes → the team is told.
+
+## 9.0.3 — ask the reason first; number when the customer can't be reached
+
+* **"I cannot make the delivery" / "Please cancel"**: the bot first asks WHY (with examples). The reason decides:
+  food not ready → "how many more minutes?" (the 10/20 rule); customer not answering / address not found → the
+  customer's number; restaurant closed, item missing, damaged … → their own steps; anything else (bike broken, sick,
+  too far) → a teammate, with the reason in the note. No reason within 5 minutes → the team is told.
+  A reason in the first message ("I can't deliver, my car broke down") goes to a teammate at once.
+* **Customer not answering / "I cannot communicate with the client" / address not found**: the bot now sends the
+  customer's number + street/house number + notes straight away (his own live order only), then 10 minutes →
+  a teammate. Still no answer after the number → a teammate (no second number). No number available → the tips.
+* "My bike is broken" is the rider's vehicle, not damaged food.
+* The AI returns a `reason` field (why he can't continue / wants to cancel, "" when none given).
+
 ## 9.0.2 — number + house number + notes when the app call fails
 
 * When a rider can't call the customer through the app, the bot's answer now carries the customer's **number,
