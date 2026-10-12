@@ -23,6 +23,20 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.5 — every button and every "hi" gets an answer
+
+* "Hi", "Salam alaikum", "Hello, I need help", the **Other** button → "Hi! How can I help you? Please tell us in one
+  sentence what happened, plus the order number." Once per chat (was: once per rider every 3 hours, after that the
+  rider only got "a teammate has your case").
+* A contact we can't link to a rider yet → "Hi! How can I help you? Please send the order number …", in his language.
+* All workflow buttons are known as riders see them: I can't go online · The Order is not in Restaurant · order is not
+  ready yet · I can't reach out to the customer · Order is damaged · I can't do the Delivery · I forgot to finish the
+  order on the app · Customer doesn't accept the Order · Other.
+* New: **I can't go online** → screenshot asked → teammate checks the account / shift.
+* A rider who opens a NEW chat with a button or "hi" starts fresh (the old chat's step no longer answers for him).
+* A teammate who wrote in the chat in the last 15 minutes (was 30) keeps the bot out.
+* Arabic short words match as whole words ("السلام" is no "لا").
+
 ## 9.0.4 — the number reaches every rider who can't reach the customer
 
 * A rider who already got the "keep calling" tips and writes again ("he is not responding to calls or the doorbell")

@@ -34,6 +34,7 @@ SITUATIONS = {
     "no_order": "restaurant does not have this order, another rider already took it, restaurant won't hand it over",
     "item_missing": "an item of the order is not available, restaurant cancelled or changed part of the order",
     "closed": "restaurant closed, nobody there",
+    "cant_go_online": "rider cannot go online / log in / start his shift in the rider app (app or account problem, no order involved)",
     "returned": "rider has given / brought the order back to the restaurant (usually wants it cancelled)",
     "remove_order": "rider wants the order removed / unassigned / cancelled — with no reason, or a reason that is NOT waiting (wrong location, too far, wrong order assigned)",
     "customer_phone": "rider asks for the customer's phone number (and has not said the app call fails)",

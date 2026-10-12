@@ -49,6 +49,8 @@ QUERIES = [
      "Thanks. Please send us a photo of the entrance, with the opening hours if you can see them. A teammate is checking it now."),
     ("q:cancel_reason", "Rider wants to cancel / remove the order → ask the reason first",
      "Okay. Why do you want to cancel this order? For example: food not ready, restaurant closed, customer not answering, or a problem with your bike or car."),
+    ("q:cant_go_online", "Rider can't go online in the app → screenshot, a teammate checks",
+     "Thanks for telling us. Please send a screenshot of what the app shows when you try to go online. A teammate will check your account right away."),
     ("q:returned_photo", "Rider gave the order back to the restaurant → photo first",
      "Thanks for telling us. Please send a photo of the order at the restaurant, so we can see it was handed back. Then a teammate takes care of it."),
     ("q:returned_thanks", "Photo of the returned order received",
@@ -83,8 +85,10 @@ QUERIES = [
      "A teammate has your case and will reply here in a few minutes. Please stay where you are."),
     ("q:holding", "Rider is waiting and writes '?', 'hello' … (once every few minutes)",
      "Still with you, a teammate is on it. Thanks for waiting."),
-    ("q:other", "Not clear what the rider needs",
-     "Tell us in one sentence what happened, plus the order number, and we'll help right away."),
+    ("q:other", "Greeting / 'Other' button / not clear → how can I help?",
+     "Hi! How can I help you? Please tell us in one sentence what happened, plus the order number."),
+    ("q:ask_order", "Rider we can't identify yet (no MotionTools link) → how can I help + order number",
+     "Hi! How can I help you? Please send the order number (for example 7DDP8F) and tell us what happened."),
     ("q:order_ref", "Rider sends only an order number",
      "Thanks, I found order {ref} ({status}). What's the problem?"),
     ("q:ack", "Rider confirms an automatic message (ok / arrived / on the way)",
@@ -117,7 +121,7 @@ NOT_READY = ("مش جاهز", "مو جاهز", "ما جاهز", "ما خلص", "
              "already been", "its been", "it's been", "telling 10", "telling 5", "they said 10", "said 10 min", "10 more min", "sagen 10", "schon 10 min", "schon 20 min")
 READY = ("ready now", "jetzt fertig", "ist fertig", "is ready", "order ready", "bestellung fertig", "picked up", "abgeholt", "habs", "hab es", "got it", "have it", "got the order", "habe die bestellung", "on my way now", " ready", " fertig")
 NOT_READY_GUARD = ("not ready", "nicht fertig", "isn't ready", "isnt ready", "no ready", "not yet ready", "noch nicht fertig", "ready nahi")
-FORGOT_CTX = ("order", "bestellung", "auftrag", "app", "finish", "complete", "abschließ", "abschliess", "finaliz", "deliver", "liefer", "mark", "photo", "foto", "bild", "upload")
+FORGOT_CTX = ("order", "bestellung", "auftrag", "app", "finish", "complete", "abschließ", "abschliess", "finaliz", "deliver", "liefer", "mark", "photo", "foto", "bild", "upload", "الطلب", "الطلبية", "التطبيق", "إكمال", "اكمال", "إنهاء", "انهاء", "sipariş", "uygulama")
 FORGOT = ("forgot", "vergessen", "finish the order", "complete the order", "complete this order", "complete order", "complete my order", "finish this order",
           "finish order", "close this order", "end the order", "order complete", "photo not upload", "not getting upload", "not uploading", "can't upload", "cant upload",
           "cannot upload", "upload nahi", "foto geht nicht", "foto lädt nicht", "bild lädt nicht", "auftrag abschließen", "beenden", "abschluss", "abschließen", "abschliessen", "close the order", "mark delivered", "als geliefert",
@@ -179,6 +183,9 @@ BUTTONS = {   # workflow buttons: the label arrives as the rider's message
     "order is damaged": "damaged", "restaurant closed": "closed",
     "i cannot make the delivery": "cant_deliver", "i can't make the delivery": "cant_deliver",
     "i cannot communicate with the client": "customer_unreachable", "i can't communicate with the client": "customer_unreachable",
+    # the "Quickzii (Copy)" workflow buttons, exactly as riders see them
+    "i can't go online": "cant_go_online", "the order is not in restaurant": "no_order", "order is not ready yet": "not_ready",
+    "i can't reach out to the customer": "customer_unreachable", "forgot to complete the order on the app": "forgot_finish",
 }
 NUDGE_VOCAB = {"hello", "helo", "hlo", "hallo", "hi", "hey", "bro", "brother", "bhai", "bhaiya", "sir", "boss", "reply", "me", "pls", "plz",
                "please", "bitte", "anyone", "there", "answer", "antwort", "und", "and", "jetzt", "now", "still", "waiting", "wait", "warte",
@@ -197,10 +204,15 @@ _WORD = re.compile(r"[a-zäöüß]+", re.I)
 
 def _has_word(low: str, words) -> bool:
     """Short tokens (ok, ja, no, han) match whole words only — 'thanks' must not match 'han'."""
+    tokens = None
     for w in words:
         w = w.strip()
         if _WORD.fullmatch(w):
             if re.search(rf"(?<![a-zäöüß]){re.escape(w)}(?![a-zäöüß])", low):
+                return True
+        elif re.fullmatch(r"[^\W\d_]+", w):                # one word in another script (لا, نعم): a whole word, "السلام" is no "لا"
+            tokens = tokens if tokens is not None else set(re.findall(r"[^\W\d_]+", low))
+            if w in tokens:
                 return True
         elif w in low:
             return True
@@ -222,10 +234,15 @@ TAG_INTENTS = {
     "customer_problem": "customer_problem", "customer doesn't accept the order": "customer_problem", "customer refuses": "customer_problem", "customer problem": "customer_problem",
     "forgot_finish": "forgot_finish", "forgot": "forgot_finish", "i forgot to finish the order on the app": "forgot_finish", "forgot to complete": "forgot_finish",
     "damaged": "damaged", "order_damaged": "damaged", "order is damaged": "damaged",
-    "other": "other", "returned": "returned", "order_returned": "returned",
+    "other": "other", "returned": "returned", "order_returned": "returned", "cant_go_online": "cant_go_online", "offline": "cant_go_online",
 }
 
 
+OFFLINE = ("can't go online", "cant go online", "cannot go online", "can not go online", "not going online", "unable to go online",
+           "can't get online", "cannot get online", "can't log in", "cant log in", "cannot log in", "can't login", "cannot login", "app not working",
+           "kann nicht online", "nicht online gehen", "komme nicht online", "kann mich nicht einloggen", "einloggen geht nicht", "login geht nicht",
+           "لا أستطيع الدخول", "ما بقدر ادخل", "ما عم يفتح التطبيق", "لا أستطيع أن أكون متصل", "لا أستطيع الاتصال بالإنترنت", "اونلاين",
+           "online olamıyorum", "online olamiyorum", "giriş yapamıyorum", "online nahi ho", "online nhi ho")
 RETURNED = ("returned the order", "returned it", "returned to the restaurant", "return the order", "gave it back", "given it back", "gave back",
             "given back", "brought it back", "brought back", "back to the restaurant", "zurückgegeben", "zurueckgegeben", "zurück gebracht",
             "zurückgebracht", "zurueckgebracht", "zurück ins restaurant", "zurück zum restaurant", "abgegeben im restaurant",
@@ -251,7 +268,8 @@ def intent_from_tags(tags) -> str:
 
 
 def button_intent(text: str) -> str:
-    return BUTTONS.get(re.sub(r"\s+", " ", (text or "").strip().lower()).rstrip(".!"), "")
+    t = re.sub(r"\s+", " ", (text or "").replace("’", "'").replace("‘", "'").strip().lower()).rstrip(".!")
+    return BUTTONS.get(t, "")
 
 
 NUDGE_PHRASES = ("is anyone there", "anyone there", "anyone here", "is someone there", "jemand da", "ist jemand da", "hallo?", "reply me",
@@ -260,6 +278,22 @@ NUDGE_PHRASES = ("is anyone there", "anyone there", "anyone here", "is someone t
 
 def _squash(word: str) -> str:
     return re.sub(r"(.)\1+", r"\1", word)
+
+
+GREET_WORDS = {"hi", "hii", "hello", "helo", "hlo", "hallo", "hey", "salam", "salaam", "salem", "assalam", "assalamu", "alaikum", "aleikum",
+               "alaykum", "marhaba", "merhaba", "selam", "namaste", "sat", "sri", "akal", "good", "morning", "evening", "afternoon", "guten",
+               "tag", "morgen", "abend", "moin", "servus", "how", "are", "you", "u", "r", "sir", "bro", "brother", "bhai", "boss", "team",
+               "support", "please", "pls", "plz", "i", "need", "help", "hilfe", "kaise", "ho", "kya", "haal", "hai", "ya", "habibi", "akhi",
+               "abi", "yardım", "lütfen", "مرحبا", "السلام", "عليكم", "اهلا", "أهلا", "مساء", "صباح", "الخير", "مساعدة", "ساعدني"}
+
+
+def is_greeting(text: str) -> bool:
+    """'Hi', 'Salam alaikum brother', 'Hello, I need help' — an opener, nothing to act on yet."""
+    t = (text or "").strip().lower()
+    if not t or is_nudge(t):
+        return bool(t)
+    words = re.findall(r"[^\W\d_]+", t)
+    return 0 < len(words) <= 8 and all(_squash(w) in {_squash(g) for g in GREET_WORDS} or w in GREET_WORDS for w in words)
 
 
 def is_nudge(text: str) -> bool:
@@ -295,6 +329,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "call_failed"
     if _has(low, CANT_WAIT):
         return "not_ready"                                   # "I can't wait" at the restaurant = food late, wants out
+    if _has(low, OFFLINE):
+        return "cant_go_online"                             # an app / account problem, not a delivery
     if _has(low, RETURNED):
         return "returned"                                   # "I have returned the order. Please cancel" → photo first
     if _has(low, REMOVE):
@@ -349,7 +385,7 @@ SOLVABLE = ("returned", "not_ready", "closed", "no_order", "item_missing", "cust
             "liefercode", "customer_problem", "damaged", "forgot_finish")       # a reason the bot has its own steps for
 
 
-PRIORITY = ("urgent", "call_failed", "returned", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
+PRIORITY = ("urgent", "call_failed", "returned", "cant_go_online", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
             "customer_phone", "closed", "damaged", "customer_problem", "not_ready", "remove_order", "cant_deliver")
 
 
@@ -377,7 +413,7 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
                 "liefercode": "Liefercode problem", "customer_problem": "customer refuses / problem", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
                 "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed",
-                "returned": "gave the order back to the restaurant"}
+                "returned": "gave the order back to the restaurant", "cant_go_online": "can't go online in the app"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
@@ -402,7 +438,7 @@ class RiderFlows:
 
     HANDOVER_H = 3                      # hours the bot keeps out of a conversation a person is answering
     GRACE_MIN = 5                       # after a forward: minutes a person gets to answer before the bot steps back in
-    TEAMMATE_MIN = 30                   # a teammate wrote in the chat within these minutes → the bot doesn't answer
+    TEAMMATE_MIN = 15                   # a teammate wrote in the chat within these minutes → the bot doesn't answer
     HOLD_GAP = 5 * 60                   # "still with you" at most every 5 minutes per conversation
     TELL_GAP = 10 * 60                  # "a teammate has your case" at most every 10 minutes per conversation
 
@@ -410,7 +446,7 @@ class RiderFlows:
         self.store = store
         self.state: dict = {}
         self.handover: dict = {}        # conversation id -> time it was handed to a person
-        self.asked_other: dict = {}     # rider id -> time we last asked "what happened?"
+        self.asked_other: dict = {}     # "rider|conversation" -> time we last asked "how can I help you?"
         self.sent_keys: dict = {}       # rider id -> {query key: time sent}
         self._last: dict = {}           # rider id -> his last message(s)
         self.named_ref: dict = {}       # rider id -> (order ref he wrote himself, when)
@@ -564,6 +600,10 @@ class RiderFlows:
         elif o is None and rid in self.named_ref and now - self.named_ref[rid][1] < 2 * 3600 and d.get("order_by_ref"):
             o = d["order_by_ref"](self.named_ref[rid][0])   # he told us the order earlier in this chat
         st = self.state.get(rid)
+        if st and st.get("conv") and conv and st["conv"] != conv and (intent_from_tags(tags) or button_intent(msgs[0])
+                                                                      or all(is_greeting(m) for m in msgs)):
+            self.clear(rid)                              # a new chat opened with a button / "hi": a new topic, not the old chat's
+            st = None
         self._last[rid] = " / ".join(msgs)[:400]
         self.last_rider_at.setdefault(conv, now)
         self.conv_rider[conv] = rid
@@ -696,6 +736,9 @@ class RiderFlows:
                     await self._fwd(rid, conv, self._note(rid, f"📷 photo received — {'forgot to finish' if kind == 'forgot' else 'Liefercode missing'}: please finish the order in MotionTools"), o=o)
                     self.clear(rid)
                     return "photo received → team finishes the order"
+                if kind == "online":
+                    await self._hand_over(rid, conv, o, "📷 screenshot received — rider can't go online: please check his account / shift in MotionTools", urgent=True)
+                    return "screenshot (can't go online) → teammate"
                 if kind == "returned":
                     await self._send(rid, conv, "q:returned_thanks", o)
                     await self._fwd(rid, conv, self._note(rid, f"📷 photo received — order {(o or {}).get('ref', '')} given back to the restaurant: please cancel / decide in MotionTools"), urgent=True, o=o)
@@ -809,6 +852,13 @@ class RiderFlows:
             await self._fwd(rid, conv, self._note(rid, "⚠ restaurant closed? — photo of the entrance asked"), urgent=True, o=o)
             self.set(rid, "await_photo", "", 10, kind="closed", conv=conv, ref=ref)
             return "restaurant closed → photo asked + team informed"
+        if intent == "cant_go_online":
+            if has_photo:
+                await self._hand_over(rid, conv, o, "📷 rider can't go online (screenshot sent): please check his account / shift in MotionTools", urgent=True)
+                return "can't go online with screenshot → teammate"
+            await self._send(rid, conv, "q:cant_go_online", o)
+            self.set(rid, "await_photo", "", 10, kind="online", conv=conv, ref=ref)
+            return "can't go online → screenshot asked"
         if intent == "returned":
             if has_photo:                               # photo came with the message
                 await self._send(rid, conv, "q:returned_thanks", o)
@@ -878,10 +928,15 @@ class RiderFlows:
         if in_auto:
             await self._hand_over(rid, conv, o, "✉ reply to an automatic message — needs a person")
             return "handed over"
-        substantive = len(text.split()) >= 5 or bool(ai.get("summary") and ai.get("confidence", 0) >= 0.55)
-        if not substantive and time.time() - self.asked_other.get(rid, 0) > 3 * 3600:
+        lines = [m for m in text.split("\n") if m.strip()] or [""]
+        greeting = all(is_greeting(m) or button_intent(m) == "other" for m in lines)
+        substantive = not greeting and len(text.split()) >= 5
+        akey = f"{rid}|{conv}"
+        if not substantive and time.time() - self.asked_other.get(akey, 0) > 2 * 3600:
+            self.last_bot.pop(conv, None)                # a fresh question: the "said twice" guard is for answers, not for this
+            self.sent_keys.get(rid, {}).pop("q:other", None)
             await self._send(rid, conv, "q:other", o)
-            self.asked_other[rid] = time.time()
+            self.asked_other[akey] = time.time()
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
             return "asked what happened"
         await self._hand_over(rid, conv, o, "✉ needs a person")

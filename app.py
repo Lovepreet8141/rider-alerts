@@ -190,7 +190,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.4"
+VERSION = "9.0.5"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -3181,8 +3181,15 @@ async def _unknown_rider(cid: str, name: str, text: str, conv: str):
             await intercom.ic.escalate(conv, f"⚠ {name}: rider not identified (no MotionTools profile link) and no order number — please answer.\nRider: {text[:300]}")
         return
     UNKNOWN_ASKED[cid] = time.time()
-    msg = ("Damit ich dir sofort helfen kann: schick mir bitte die Bestellnummer (z. B. 7DDP8F). / "
-           "So I can help you right away: please send me the order number (e.g. 7DDP8F).")
+    settings = store.get_settings()
+    msg = render_query(_query_text("q:ask_order", settings))     # "Hi! How can I help you? … order number …"
+    if brain.enabled() and settings.get("bot_translate", "1") == "1":
+        try:
+            lang = (await brain.understand([text]) or {}).get("reply_language") or ""
+            if lang:
+                msg = await brain.translate(msg, lang)
+        except Exception:
+            pass
     BOT_SENT.append((time.time(), _norm(msg)))
     if intercom.ic.enabled:
         try:
