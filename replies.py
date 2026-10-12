@@ -65,7 +65,7 @@ QUERIES = [
     ("q:photo_thanks", "Photo received for a finish / Liefercode case",
      "Thanks, got the photo. A teammate is finishing it now, you can take your next order."),
     ("q:customer_refuses", "Customer refuses the order",
-     "Please don't leave the food yet. What did the customer say: wrong order, something missing, or didn't order? A teammate will reply in a few minutes."),
+     "Please don't leave the food yet and stay with the customer for a moment. A teammate is checking it now and will tell you what to do in a few minutes."),
     ("q:damaged", "Order damaged → photo",
      "Please send us a photo of the order. A teammate will reply in a few minutes."),
     ("q:cant_deliver", "Rider can't continue → ask the reason",
@@ -137,6 +137,10 @@ FIND = ("can't find", "cant find", "cannot find", "finde nicht", "find nicht", "
 PHONE = ("تلفون", "تليفون", "هاتف", "الهاتف", "موبايل", "جوال", "الرقم", "number", "nummer", "phone", "telefon", "handy", "contact", "kontakt", "رقم", "numara", "telefon numarası", "call", "anrufen", "mobile")
 CUSTOMER = ("customer", "kunde", "kundin", "client", "refuse", "ablehn", "doesn't accept", "does not accept", "not accept", "nicht annehmen", "nimmt nicht",
             "wants to cancel", "will nicht", "didn't order", "did not order", "nicht bestellt", "العميل", "الزبون", "müşteri", "musteri", "grahak")
+REFUSED = ("didn't order", "did not order", "didnt order", "never ordered", "not ordered", "nicht bestellt", "nichts bestellt", "keine bestellung aufgegeben",
+           "refuse", "verweiger", "ablehn", "doesn't accept", "does not accept", "won't accept", "nicht annehmen", "nimmt nicht an",
+           "will die bestellung nicht", "doesn't want the order", "does not want the order", "لم يطلب", "ما طلب", "مو طالب", "رفض", "sipariş vermedim",
+           "sipariş vermemiş", "kabul etmiyor")
 ACK = ("arrived", "angekommen", "at location", "im here", "i'm here", "i am here", "bin da", "bin hier", "on the way", "on my way", "unterwegs", "coming",
        "komme", "moving", "fahre", "fahre los", "thanks", "thank you", "danke", "done", "delivered", "geliefert", "ausgeliefert", "started", "gestartet",
        "all good", "alles gut", "no problem", "kein problem", "im moving", "i'm moving", "going", "jetzt")
@@ -293,6 +297,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "liefercode"
     if _has(low, DAMAGED):
         return "damaged"
+    if _has(low, REFUSED) and not _has(low, ("restaurant", "مطعم", "المطعم")):
+        return "customer_problem"                       # "I called, he says he ordered nothing" — not a phone question
     if _has(low, FIND) and not _has(low, ("restaurant",)):
         return "customer_find"
     if _has(low, UNREACH) and not _has(low, ("restaurant", "staff", "personal")):
@@ -377,6 +383,7 @@ class RiderFlows:
 
     HANDOVER_H = 3                      # hours the bot keeps out of a conversation a person is answering
     GRACE_MIN = 5                       # after a forward: minutes a person gets to answer before the bot steps back in
+    TEAMMATE_MIN = 30                   # a teammate wrote in the chat within these minutes → the bot doesn't answer
     HOLD_GAP = 5 * 60                   # "still with you" at most every 5 minutes per conversation
     TELL_GAP = 10 * 60                  # "a teammate has your case" at most every 10 minutes per conversation
 
@@ -436,6 +443,17 @@ class RiderFlows:
             return await hr(conv, t)
         except Exception:
             return True
+
+    async def teammate_on_it(self, conv: str) -> bool:
+        """A teammate wrote in this chat in the last TEAMMATE_MIN minutes (not via a forward of ours): it's his chat now.
+        Intercom unreachable → False (the bot answers as usual)."""
+        hr = self.deps.get("human_replied_since")
+        if not hr or not conv:
+            return False
+        try:
+            return bool(await hr(conv, time.time() - self.TEAMMATE_MIN * 60))
+        except Exception:
+            return False
 
     def set(self, rid: str, flow: str, step: str = "", minutes: float = 0, **extra):
         now = time.time()
@@ -516,7 +534,7 @@ class RiderFlows:
     async def on_message(self, rid: str, text: str, conv: str, in_auto: bool = False, has_photo: bool = False, last_ops_auto: bool = False,
                          tags=None, burst=None) -> str:
         d = self.deps
-        msgs = [m for m in (burst or [text]) if (m or "").strip()] or [text or ""]
+        msgs = [m.strip() for m in (burst or [text]) if isinstance(m, str) and m.strip()] or [text if isinstance(text, str) else ""]
         joined = "\n".join(msgs)
         now = time.time()
         o = d["order_for"](rid)
@@ -562,6 +580,13 @@ class RiderFlows:
             intent = "order_ref"
         self.last_intent[rid] = intent
         d["log"](rid, o, f"reply:{intent}", joined[:300] or "📷 photo")
+
+        # ---- a teammate is already talking to this rider (he took the chat himself): the bot stays out
+        if intent != "urgent" and not self.handed_over(conv) and await self.teammate_on_it(conv):
+            if intent == "call_failed":
+                await self.deps["forward"](rid, conv, self._note(rid, f"📞 rider can't call the customer through the app — please send the customer's number ({(o or {}).get('ref', '')})"), urgent=True, o=o)
+            self.clear(rid)
+            return "silent — a teammate is already answering this chat"
 
         # ---- nudges: one short answer, not one per message
         if intent == "nudge":

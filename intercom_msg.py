@@ -651,7 +651,15 @@ class Intercom:
         try:
             if not await self.resolve_admin():
                 return False
-            if team_id:
+            holder = ""
+            try:                                          # a teammate already has this chat → leave it with him, just add the note
+                c = await self.call("GET", f"/conversations/{conversation_id}")
+                holder = str(c.get("admin_assignee_id") or "")
+            except HTTPException:
+                pass
+            if holder and holder not in ("0", str(self.admin)):
+                pass
+            elif team_id:
                 await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "team", "admin_id": self.admin, "assignee_id": team_id})
             else:
                 # "0" clears teammate AND team (leaves the automation inbox), then the sending teammate takes it

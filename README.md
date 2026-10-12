@@ -23,6 +23,20 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.1 — fix: the bot crashed on every real rider message
+
+* **Crash fixed**: rider messages that came in through the Intercom webhook (riders who already had a chat history)
+  failed with `'dict' object has no attribute 'strip'` and were forwarded with an "automation error" note, unanswered.
+  The stored chat was passed to the bot instead of the rider's messages. Regression test drives the real webhook path.
+* **Teammate already in the chat** (wrote there in the last 30 min): the bot stays silent. Only "can't call through
+  the app" adds an internal note, and an accident / danger message still gets the 112 answer.
+* **Forwarding no longer takes a chat away from a teammate**: if a teammate has the conversation, the bot only adds
+  its note and re-opens it; it re-assigns only chats nobody has.
+* The bot's own earlier answers are recognised also after a restart and when Intercom returns them HTML-escaped,
+  so they are never mistaken for a teammate.
+* "Customer says he ordered nothing" → customer refuses (it was read as a phone question). Answer text: stay with the
+  customer, a teammate is checking.
+
 ## 9.0 — the smart rider bot (training pack + AI)
 **What changed for riders**
 - Answers come from the Quickzi training pack: one clear next step, simple words, no username greeting, never "the order

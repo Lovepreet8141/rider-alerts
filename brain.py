@@ -76,6 +76,8 @@ EXAMPLES = [
      {"situation": "liefercode", "order_ref": "TKBT6Q", "reply_language": "English", "summary": "Customer won't give the Liefercode (order TKBT6Q)."}),
     (["I forgot to finish the order on the app"], {"situation": "forgot_finish", "summary": "Rider forgot to finish the order in the app."}),
     (["Customer doesn't accept the Order"], {"situation": "customer_problem", "summary": "Customer refuses the order."}),
+    (["Ich habe die Nummer angerufen, und mir wurde gesagt, dass ich nichts bestellt habe."],
+     {"situation": "customer_problem", "reply_language": "German", "summary": "Rider called the customer; the person says they ordered nothing."}),
     (["Hello", "Hlooo", "Reply me bro", "Brother"], {"situation": "nudge", "reply_language": "English", "summary": "Rider is waiting for an answer."}),
     (["المطعم ما جهز الطلب لسا"], {"situation": "not_ready", "reply_language": "Arabic", "summary": "Food not ready yet."}),
     (["العميل لا يرد على الهاتف"], {"situation": "customer_unreachable", "reply_language": "Arabic", "summary": "Customer doesn't answer the phone."}),

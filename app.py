@@ -190,7 +190,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0"
+VERSION = "9.0.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2384,16 +2384,22 @@ BOT_SENT: list = []        # (time, first 60 chars) of what the dashboard itself
 
 
 def _norm(t: str) -> str:
+    import html as _html_mod
     import re as _re
-    return _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", t or "")).strip().lower()[:60]
+    t = _html_mod.unescape(_re.sub(r"<[^>]+>", " ", t or ""))          # Intercom sends isn&#39;t, we sent isn't
+    return _re.sub(r"[^\w]+", " ", t).strip().lower()[:60]
 
 
 async def human_replied_since(conv: str, since: float) -> bool:
-    """Did a teammate (not the dashboard, not the Intercom workflow bot) write in this conversation since `since`?"""
+    """Did a teammate (not the dashboard's bot, not the Intercom workflow bot) write in this conversation since `since`?"""
     if not intercom.ic.enabled or not conv:
         return False
     c = await intercom.ic.call("GET", f"/conversations/{conv}")
     ours = {b for _, b in BOT_SENT}
+    rid = flows.conv_rider.get(conv, "")
+    for m in (intercom.ic.threads.get(rid, {}).get("messages", []) if rid else []):   # bot answers from before a restart
+        if isinstance(m, dict) and m.get("from") == "ops" and m.get("auto"):
+            ours.add(_norm(m.get("body") or ""))
     for p in ((c.get("conversation_parts") or {}).get("conversation_parts")) or []:
         if p.get("part_type") != "comment" or (p.get("author") or {}).get("type") != "admin":
             continue
@@ -2568,8 +2574,8 @@ async def _handle_rider_reply(rid: str, text: str, conversation_id: str, in_auto
             await enrich_order(o["id"], now, bg=False)   # the number is ready if calling through the app fails
         except Exception:
             pass
-    msgs = intercom.ic.threads.get(rid, {}).get("messages", [])
-    last_ops = next((m for m in reversed(msgs) if m.get("from") == "ops"), None)
+    thread = intercom.ic.threads.get(rid, {}).get("messages", [])          # stored chat (dicts) — not the burst (texts)
+    last_ops = next((m for m in reversed(thread) if isinstance(m, dict) and m.get("from") == "ops"), None)
     last_ops_auto = bool(last_ops and last_ops.get("auto") and now.timestamp() - (last_ops.get("at") or 0) < 3600)
     try:
         result = await flows.on_message(rid, text, conversation_id, in_auto=in_auto, has_photo=has_photo, last_ops_auto=last_ops_auto, tags=tags, burst=msgs)
