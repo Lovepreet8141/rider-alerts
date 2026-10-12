@@ -13,7 +13,8 @@ How it works
 
 Rules from the training pack
   * Customer phone: first the call button in the app, then "check your own number in the app profile". Only when
-    calling through the app does not work, the bot sends the customer's NUMBER (never name or address) — and only to
+    calling through the app does not work, the bot sends the customer's number, street + house number and the
+    customer's delivery notes (never the customer's name) — and only to
     the rider the order is assigned to. A customer who simply doesn't answer: keep calling for 10 minutes, then a
     teammate takes over.
   * Restaurant late: ask how many more minutes; up to 10 more → please wait; more, or 20 minutes waited in total →
@@ -50,8 +51,8 @@ QUERIES = [
      "Understood. A teammate is checking order {ref} now and will tell you what to do. Please wait a moment."),
     ("q:phone_app", "Rider asks for the customer's number → call from the app",
      "Please call the customer with the call button on the customer stop in your app. If the call doesn't go through, check that your own phone number in the app profile is correct, then try again."),
-    ("q:phone_number", "Calling through the app doesn't work → the customer's number (only to the assigned rider)",
-     "Here's the customer's number: {phone}\nPlease call now and keep trying for up to 10 minutes. Write here if nobody answers."),
+    ("q:phone_number", "Calling through the app doesn't work → number, house number and notes (only to the assigned rider)",
+     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and keep trying for up to 10 minutes. Write here if nobody answers."),
     ("q:unreachable", "Customer doesn't answer / open → keep calling 10 minutes",
      "Thanks for trying. Please keep calling from the app and wait at the door for up to 10 minutes. If there's still no answer, write here how long you waited and we'll tell you what to do."),
     ("q:find_address", "Rider can't find the address",
@@ -714,7 +715,8 @@ class RiderFlows:
         return "asked how many more minutes"
 
     async def _number(self, rid, conv, o) -> str:
-        """Calling through the app doesn't work: the customer's number — only the number, only for his own live order."""
+        """Calling through the app doesn't work: the customer's number + street/house number + delivery notes — never the
+        name, and only for his own live order."""
         d = self.deps
         mine = o is not None and o.get("rider_id") == rid and o.get("phase") not in ("delivered", "cancelled", "closed")
         phone = d["customer_phone"](o) if mine and d.get("customer_phone") else ""
@@ -724,7 +726,7 @@ class RiderFlows:
             except Exception:
                 phone = ""
         if mine and phone and self.on("q:phone_number"):
-            await self._send(rid, conv, "q:phone_number", o, phone=phone)
+            await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
             self.number_sent[o.get("id", "")] = time.time()
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (app call not working)")
             self.set(rid, "unreachable", "", self._cfg("bot_unreach_min", 10), conv=conv, ref=o.get("ref", ""), number=True)
@@ -929,11 +931,29 @@ class RiderFlows:
             return "–"
 
 
+_LABEL_LINE = re.compile(r"^[^{}\n]*:\s*\{(\w+)\}[ \t.]*$")
+
+
+def delivery_details(o) -> dict:
+    """For a rider who can't reach the customer through the app: street + house number (no city, no zip) and the
+    customer's delivery notes (floor, bell, entrance …). Never the customer's name."""
+    o = o or {}
+    street = str(o.get("customer_addr") or "").split(",")[0].strip()
+    notes = re.sub(r"\s+", " ", str(o.get("customer_notes") or "")).strip()[:300]
+    name = str(o.get("customer_name") or "").strip()
+    if name and notes == name:
+        notes = ""                                       # a "note" that is only the name is not a delivery note
+    return {"address": street, "notes": notes}
+
+
 def render_query(template: str, **fmt) -> str:
-    """Fill a query text; missing values become empty; tidy double spaces and empty lines."""
+    """Fill a query text; missing values become empty; tidy double spaces and empty lines. A line that is only
+    'Label: {value}' is left out when that value is empty ("Customer's notes:" with no notes)."""
     class _D(dict):
         def __missing__(self, k):
             return ""
+    template = "\n".join(ln for ln in template.split("\n")
+                         if not ((m := _LABEL_LINE.match(ln)) and not str(fmt.get(m.group(1)) or "").strip()))
     out = template.format_map(_D(**fmt))
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"\n{2,}", "\n", out)

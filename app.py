@@ -190,7 +190,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.1"
+VERSION = "9.0.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2436,16 +2436,29 @@ async def rider_waiting(conv: str, since: float) -> bool:
     return True
 
 
+KEEP_AS_IS = ("phone", "address", "notes", "ref")      # never translated: sent exactly as MotionTools has them
+
+
 async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, lang: str = "", **fmt):
     settings = store.get_settings()
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
     base = {"ref": (o or {}).get("ref") or "", "restaurant": (o or {}).get("restaurant") or "the restaurant", "name": name}
     base.update(fmt)
-    text = render_query(_query_text(key, settings), **base)
+    template = _query_text(key, settings)
     if closer_key:
-        text = (text + "\n" + render_query(_query_text(closer_key, settings), **base)).strip()
+        template = template + "\n" + _query_text(closer_key, settings)
+    text = render_query(template, **base)
     if lang and settings.get("bot_translate", "1") == "1":
-        text = await brain.translate(text, lang)          # the approved text in the rider's language (same meaning)
+        # the approved text in the rider's language (same meaning). Number, street, notes and order number are put in
+        # AFTER translating, so they arrive exactly as in MotionTools (a street name must never be translated).
+        keep = [(k, str(base[k])) for k in KEEP_AS_IS if "{" + k + "}" in template and str(base.get(k) or "").strip()]
+        marked = render_query(template, **{**base, **{k: f"[[{n}]]" for n, (k, _) in enumerate(keep)}})
+        need = [n for n in range(len(keep)) if f"[[{n}]]" in marked]
+        out = await brain.translate(marked, lang)
+        if out != marked and all(f"[[{n}]]" in out for n in need):
+            for n, (_, v) in enumerate(keep):
+                out = out.replace(f"[[{n}]]", v)
+            text = out                                    # else: the English text (translation failed or lost a value)
     now = datetime.now(UTC)
     aid = store.auto_log(now, key, rid, name, (o or {}).get("id", ""), (o or {}).get("ref", ""), text, "pending" if intercom.ic.enabled else "dry")
     if intercom.ic.enabled:

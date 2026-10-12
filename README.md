@@ -23,6 +23,16 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.2 — number + house number + notes when the app call fails
+
+* When a rider can't call the customer through the app, the bot's answer now carries the customer's **number,
+  street + house number and the customer's delivery notes** (floor, bell, entrance). Never the name, never city/zip,
+  and still only to the rider the live order is assigned to.
+* Number, street, notes and order number are put in **after** translating, so they arrive exactly as in MotionTools
+  (a street name is never translated). If a translation loses one of them, the rider gets the English text instead.
+* No notes on the order → the "Customer's notes" line is left out (no empty label).
+* Check where your bookings carry the notes: dashboard → `/api/debug/booking-shape` (shows field names only).
+
 ## 9.0.1 — fix: the bot crashed on every real rider message
 
 * **Crash fixed**: rider messages that came in through the Intercom webhook (riders who already had a chat history)
