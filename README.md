@@ -23,6 +23,19 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.11 — "don't mark it delivered" + handover photo check
+
+* The Liefercode is the last 2 digits of the customer's phone number, so the number message now says:
+  "only mark the order as delivered when you hand the food to the customer. If you can't find or reach the customer,
+  do NOT mark it as delivered. Write here … We need a photo of the food handover to the customer."
+* Can't FIND the customer → the number message says how to look: entrance and building (more than one entrance),
+  the customer's name from the app on the doorbells, ask the neighbours. Follow-ups: "keep looking for N minutes".
+* Every "keep trying / keep looking" message repeats: don't mark it delivered without handing it over.
+* Check: an order marked delivered AFTER we sent its customer's number → within a minute the rider is asked for a
+  photo of the handover, the team gets a note (the chat is not moved), the order is flagged on the dashboard. Photo
+  received → thanks + note. No photo in 10 minutes → red team alert + flag "no handover photo". The photo counts
+  even while a teammate has the chat.
+
 ## 9.0.10 — no second question for a known order · cities A–Z
 
 * When the bot already knows the rider's order, "Hi / Other / photo" get "How can I help you?" / "What is it about?"

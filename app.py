@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.10"
+VERSION = "9.0.11"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2548,6 +2548,7 @@ flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_repli
               "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order,
               "understand": _understand, "order_ctx": _ai_ctx, "send": _flow_send, "forward": _flow_forward, "log": _flow_log,
               "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone, "note": _flow_note,
+              "order_by_id": lambda oid: STATE["orders"].get(oid) or store.order(oid),
               "settings": store.get_settings}
 
 

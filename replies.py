@@ -69,13 +69,21 @@ QUERIES = [
     ("q:phone_app", "Rider asks for the customer's number → call from the app",
      "Please call the customer with the call button on the customer stop in your app. If the call doesn't go through, check that your own phone number in the app profile is correct, then try again."),
     ("q:phone_number", "Calling through the app doesn't work → number, house number and notes (only to the assigned rider)",
-     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and wait there for at least 10 minutes: keep calling, ring the bell, ask the neighbours about the customer, and check that you are at the right address (some buildings have more than one entrance). If nobody answers after 10 minutes, write here."),
+     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and wait there for at least 10 minutes: keep calling, ring the bell, ask the neighbours, check the entrance.\nImportant: only mark the order as delivered when you hand the food to the customer. If you can't find or reach the customer, do NOT mark it as delivered. Write here and we'll tell you what to do. We need a photo of the food handover to the customer."),
+    ("q:phone_number_find", "Rider can't FIND the customer → number + how to find him (only to the assigned rider)",
+     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nTo find the customer: check the entrance and the building (some have more than one entrance), look for the customer's name from your app on the doorbells, and ask the neighbours if you can. Call the customer and wait there for at least 10 minutes.\nImportant: only mark the order as delivered when you hand the food to the customer. If you can't find or reach the customer, do NOT mark it as delivered. Write here and we'll tell you what to do. We need a photo of the food handover to the customer."),
     ("q:keep_trying", "Number already sent, rider writes again → keep trying for the minutes left (never the number twice)",
-     "Please keep trying for {left} more minutes: call the customer, ring the bell, ask the neighbours and check the entrance. If nobody answers by then, a teammate will tell you what to do with the order."),
+     "Please keep trying for {left} more minutes: call the customer, ring the bell, ask the neighbours and check the entrance. Don't mark the order as delivered without handing it over. If nobody answers by then, a teammate will tell you what to do with the order."),
+    ("q:keep_trying_find", "Can't find the customer, number already sent → keep looking for the minutes left",
+     "Please keep looking for {left} more minutes: check the entrances and the building, look for the customer's name on the doorbells, ask the neighbours and keep calling. Don't mark the order as delivered without handing it over. If you still can't find the customer, a teammate will tell you what to do."),
+    ("q:proof_photo", "Order marked delivered after we sent the customer's number → handover photo",
+     "We see order {ref} is marked as delivered. Please send us a photo of the food handover to the customer now."),
+    ("q:proof_thanks", "Handover photo received",
+     "Thanks, got the photo."),
     ("q:unreachable", "Customer doesn't answer / open → keep calling 10 minutes",
      "Thanks for trying. Please keep calling from the app and wait at the door for up to 10 minutes. If there's still no answer, write here how long you waited and we'll tell you what to do."),
     ("q:find_address", "Rider can't find the address",
-     "Thanks. Please check the delivery notes and the map pin in your app, then call the customer from the app to ask for the entrance. Tell us what you see there: street, house number, entrance."),
+     "Thanks. Please check the delivery notes and the map pin in your app, check the entrance and the building, look for the customer's name from your app on the doorbells and ask the neighbours if you can. Call the customer from the app. Don't mark the order as delivered without handing it over — write here if you can't find the customer."),
     ("q:liefercode", "Customer doesn't give the Liefercode",
      "Please ask the customer to open the Lieferando app or the order email, the code is shown there. If they still can't give it, send us a photo of the handover and the order number."),
     ("q:forgot_finish", "Forgot to finish the order in the app",
@@ -500,6 +508,7 @@ class RiderFlows:
         self.told: dict = {}            # conversation id -> when the rider was last told "a teammate has it" / "still with you"
         self.number_sent: dict = {}     # "conversation|order id" -> when the customer's number went to the rider (once per chat)
         self.kept: dict = {}            # "conversation|order id" -> when we last said "keep trying"
+        self.num_info: dict = {}        # "conversation|order id" -> {rid, kind (unreachable/find), proof_asked, proof_done}
         self.deps: dict = {}
         self._load()
 
@@ -510,7 +519,11 @@ class RiderFlows:
             self.state = json.loads(s.get("rider_flows") or "{}")
             self.handover = json.loads(s.get("rider_handover") or "{}")
             self.lang = json.loads(s.get("rider_lang") or "{}")
-            self.number_sent = json.loads(s.get("rider_numbers") or "{}")
+            nums = json.loads(s.get("rider_numbers") or "{}")
+            if "sent" in nums and isinstance(nums.get("sent"), dict):
+                self.number_sent, self.num_info = nums.get("sent") or {}, nums.get("info") or {}
+            else:
+                self.number_sent = {k: v for k, v in nums.items() if isinstance(v, (int, float))}   # 9.0.9 format
         except Exception:
             self.state = {}
 
@@ -518,9 +531,10 @@ class RiderFlows:
         try:
             self.handover = {c: t for c, t in self.handover.items() if time.time() - t < self.HANDOVER_H * 3600}
             self.number_sent = {k: t for k, t in self.number_sent.items() if time.time() - t < 4 * 3600}
+            self.num_info = {k: v for k, v in self.num_info.items() if k in self.number_sent}
             self.store.set_settings({"rider_flows": json.dumps(self.state)[:60000], "rider_handover": json.dumps(self.handover)[:30000],
                                      "rider_lang": json.dumps(dict(list(self.lang.items())[-3000:]))[:60000],
-                                     "rider_numbers": json.dumps(self.number_sent)[:60000]})
+                                     "rider_numbers": json.dumps({"sent": self.number_sent, "info": self.num_info})[:120000]})
         except Exception:
             pass
 
@@ -594,7 +608,7 @@ class RiderFlows:
         if not self.on(key):
             return False
         last = self.sent_keys.setdefault(f"{rid}|{conv}", {})
-        if key in last and time.time() - last[key] < 30 * 60 and key not in HANDOVER_KEYS and key not in ("q:phone_number", "q:keep_trying"):
+        if key in last and time.time() - last[key] < 30 * 60 and key not in HANDOVER_KEYS and key not in ("q:phone_number", "q:phone_number_find", "q:keep_trying", "q:keep_trying_find"):
             await self._fwd(rid, conv, f"🔁 rider is not helped by our automatic answer ({key[2:].replace('_', ' ')}) — please reply personally.", o=o)
             return False
         last[key] = time.time()
@@ -655,6 +669,10 @@ class RiderFlows:
         self.conv_rider[conv] = rid
         if st:
             st["conv"], st["last"] = conv, msgs[-1][:120]
+
+        # ---- the handover photo we asked for: counts even when a teammate is in the chat
+        if has_photo and st and st.get("flow") == "await_photo" and st.get("kind") == "proof":
+            return await self._in_flow(rid, conv, o, st, "photo", {}, joined, True)
 
         # ---- understanding: buttons as they are; obvious one-word cases by keywords; everything else by the AI
         kw = classify_burst(msgs, has_photo, tags)
@@ -783,6 +801,15 @@ class RiderFlows:
         elif flow == "await_photo":
             kind = st.get("kind", "")
             if intent == "photo" or has_photo:
+                if kind == "proof":
+                    await self._send(rid, conv, "q:proof_thanks", o)
+                    info = self._note(rid, f"📷 handover photo received for {st.get('ref') or (o or {}).get('ref', '')} (marked delivered after we sent the number) — please check it")
+                    await (self.deps["note"](rid, conv, info, o=o) if self.deps.get("note") else self._fwd(rid, conv, info, o=o))
+                    for k, v in self.num_info.items():
+                        if k.startswith(f"{conv}|") and v.get("proof_asked"):
+                            v["proof_done"] = time.time()
+                    self.clear(rid)
+                    return "handover photo received → team note"
                 if kind in ("forgot", "liefercode"):
                     await self._send(rid, conv, "q:photo_thanks", o)
                     await self._fwd(rid, conv, self._note(rid, f"📷 photo received — {'forgot to finish' if kind == 'forgot' else 'Liefercode missing'}: please finish the order in MotionTools"), o=o)
@@ -798,7 +825,7 @@ class RiderFlows:
                     return "photo of the returned order → teammate"
                 await self._hand_over(rid, conv, o, f"📷 photo received — {'restaurant closed?' if kind == 'closed' else 'order damaged'}: please decide")
                 return "photo received → handed over"
-            if intent in ("yes", "ack", "minutes", "order_ref"):
+            if intent in ("yes", "ack", "minutes", "order_ref") or (kind == "proof" and intent in ("other", "no", "excuse", "nudge")):
                 return "waiting for the photo"
         elif flow == "await_reason":
             kind = st.get("kind") or "cant_deliver"
@@ -851,8 +878,8 @@ class RiderFlows:
             except Exception:
                 phone = ""
         if mine and phone and self.on("q:phone_number"):
-            await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
-            self._mark_sent(conv, o)
+            await self._send(rid, conv, "q:phone_number_find" if flow == "find" else "q:phone_number", o, phone=phone, **delivery_details(o))
+            self._mark_sent(conv, o, rid, flow)
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (app call not working)")
             self.set(rid, flow, "", self._cfg("bot_unreach_min", 10), conv=conv, ref=o.get("ref", ""), number=True)
             return "customer's number + house number + notes sent (his own order)"
@@ -881,7 +908,7 @@ class RiderFlows:
                 phone = ""
         if mine and phone and self.on("q:phone_number"):
             await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
-            self._mark_sent(conv, o)
+            self._mark_sent(conv, o, rid, "unreachable")
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (teammate on the chat)")
             info = self._note(rid, f"📞 the bot sent the customer's number for {o.get('ref')} — rider couldn't reach the customer")
             await (d["note"](rid, conv, info, o=o) if d.get("note") else d["forward"](rid, conv, info, o=o))   # a note — the chat stays where it is
@@ -892,8 +919,10 @@ class RiderFlows:
     def _sent_at(self, conv, o) -> float:
         return self.number_sent.get(f"{conv}|{(o or {}).get('id', '')}", 0) if o else 0
 
-    def _mark_sent(self, conv, o):
-        self.number_sent[f"{conv}|{o.get('id', '')}"] = time.time()
+    def _mark_sent(self, conv, o, rid="", kind="unreachable"):
+        k = f"{conv}|{o.get('id', '')}"
+        self.number_sent[k] = time.time()
+        self.num_info[k] = {"rid": rid, "kind": kind, "ref": o.get("ref", "")}
         self._save()
 
     async def _after_number(self, rid, conv, o, sent_at: float, person: bool = False) -> str:
@@ -914,11 +943,12 @@ class RiderFlows:
             return f"noted — rider keeps trying ({math.ceil(wait - mins)} min left)"
         self.kept[key] = time.time()
         left = max(1, math.ceil(wait - mins))
-        await self._send(rid, conv, "q:keep_trying", o, left=left)
+        find = (self.num_info.get(key) or {}).get("kind") == "find"
+        await self._send(rid, conv, "q:keep_trying_find" if find else "q:keep_trying", o, left=left)
         if not person:                                   # the timer hands over exactly 10 minutes after the number
             st = self.state.get(rid)
             if not st or st.get("flow") not in ("unreachable", "find"):
-                st = self.set(rid, "unreachable", "", wait - mins, conv=conv, ref=ref, number=True)
+                st = self.set(rid, "find" if find else "unreachable", "", wait - mins, conv=conv, ref=ref, number=True)
             st["since"], st["number"] = sent_at, True
             self._save()
         return f"number already sent → keep trying ({left} min left)"
@@ -1068,6 +1098,7 @@ class RiderFlows:
     async def tick(self, now: datetime):
         d = self.deps
         t = now.timestamp()
+        await self._proof_check(t)
         # riders left waiting in a forwarded conversation: nobody answered for 7 min → "still with you" + urgent note
         for conv, since in list(self.last_rider_at.items()):
             if t - since > 3 * 3600:
@@ -1120,6 +1151,14 @@ class RiderFlows:
                         self.last_ai.pop(rid, None)
                         self._last.pop(rid, None)
                         await self._hand_over(rid, conv, o, f"⏱ {o.get('ref')}: {what} after {round((t - st.get('since', t)) / 60)} min — please decide", urgent=True)
+                elif flow == "await_photo" and st.get("kind") == "proof" and until and t >= until:
+                    if not await self._closed_by_team(rid, conv, st):
+                        po = d["order_by_id"](st.get("oid")) if d.get("order_by_id") and st.get("oid") else o
+                        if po is not None:
+                            po["query_flag"] = "no handover photo"
+                        await self._fwd(rid, conv, self._note(rid, f"🔴 {st.get('ref')}: NO handover photo 10 min after it was marked delivered (we had sent the customer's number) — please check this order"),
+                                        urgent=True, o=po)
+                    self.clear(rid)
                 elif flow in ("await_photo", "await_reason") and until and t >= until:
                     if not await self._closed_by_team(rid, conv, st):
                         what = "photo" if flow == "await_photo" else "reason"
@@ -1129,6 +1168,40 @@ class RiderFlows:
                     self.clear(rid)
             except Exception:
                 pass
+
+    async def _proof_check(self, t: float):
+        """The Liefercode is the last 2 digits of the customer's number: an order marked delivered after we sent that
+        number gets a handover-photo request at once, a note for the team, and a red flag if no photo comes."""
+        d = self.deps
+        if not d.get("order_by_id"):
+            return
+        for key, sent in list(self.number_sent.items()):
+            info = self.num_info.get(key)
+            if not info or info.get("proof_asked") or not info.get("rid") or t - sent > 3 * 3600:
+                continue
+            conv, oid = key.split("|", 1)
+            try:
+                o = d["order_by_id"](oid)
+            except Exception:
+                o = None
+            if not o or o.get("phase") != "delivered":
+                continue
+            dl = o.get("delivered_at")
+            dl_ts = dl.timestamp() if hasattr(dl, "timestamp") else t
+            info["proof_asked"] = t
+            if dl_ts < sent - 60:
+                continue                                 # delivered before the number went out — nothing to check
+            rid = info["rid"]
+            mins = max(0, round((dl_ts - sent) / 60))
+            o["query_flag"] = "delivered after the customer's number — handover photo asked"
+            try:
+                await self._send(rid, conv, "q:proof_photo", o)
+                self.set(rid, "await_photo", "", 10, kind="proof", conv=conv, ref=o.get("ref", ""), oid=oid)
+                note = self._note(rid, f"⚠ {o.get('ref')} marked as delivered {mins} min after we sent the customer's number — handover photo asked")
+                await (d["note"](rid, conv, note, o=o) if d.get("note") else d["forward"](rid, conv, note, o=o))
+            except Exception:
+                pass
+            self._save()
 
     # ---- timer actions: never into a conversation a teammate already closed / answered
     async def _closed_by_team(self, rid, conv, st) -> bool:
