@@ -55,7 +55,8 @@ class Projector:
         self.state, self.store, self.tracker, self.areas = state, store, tracker, areas
         self.keep_finished = keep_finished     # replay mode: finished orders stay in state so their story can be copied
         self.lead_min = 45                     # see Rules.release_lead_min (kept in sync by the server)
-        self.tours: dict = {}          # tour_id -> [booking_id]
+        self.tours: dict = {}          # tour_id -> [booking_id]   (in memory, newest 20 000 tours)
+        self.tour_of: dict = {}        # booking_id -> its latest tour_id (also when the tour came before the booking)
         self.busy_at: dict = {}        # driver_id -> time the driver last became busy (≈ accepted an order)
         self.places: dict = {}         # place_id -> restaurant name (editable in Settings / filled from the API)
         self.place_ll: dict = {}       # place_id -> (lat, lng): from the place API, a booking detail, or where a rider arrived
@@ -102,6 +103,8 @@ class Projector:
                     pass
             elif k.startswith("tour:"):
                 self.tours[k[5:]] = v.split(",")
+                for b in self.tours[k[5:]]:
+                    self.tour_of[b] = k[5:]
             elif k.startswith("phone:"):
                 self.phones[k[6:]] = v
 
@@ -515,7 +518,13 @@ class Projector:
             if ev == "created":
                 ids = d.get("dispatched_booking_ids") or []
                 self.tours[tid] = [ids] if isinstance(ids, str) else list(ids)
-                self.store.set_settings({f"tour:{tid}": ",".join(self.tours[tid])})
+                for bid in self.tours[tid]:                                  # newest tour of a booking wins (merged tours)
+                    self.tour_of.pop(bid, None)
+                    self.tour_of[bid] = tid
+                while len(self.tours) > 20000:                               # memory only — one per tour, all day long
+                    self.tours.pop(next(iter(self.tours)))
+                while len(self.tour_of) > 40000:
+                    self.tour_of.pop(next(iter(self.tour_of)))
                 st = str(d.get("status") or "")
                 for bid in self.tours[tid]:
                     if bid in self.state["orders"]:

@@ -62,8 +62,10 @@ def mt_link(o) -> str:
     """The order in the MotionTools dashboard: its tour when we know the tour id (tour.created webhook), else the booking."""
     if not o or not o.get("id"):
         return ""
-    if o.get("tour_id"):
-        return f"{MT_WEB_URL}/tours/{o['tour_id']}"
+    tid = o.get("tour_id") or projector.tour_of.get(o["id"])        # tour.created may arrive before the booking
+    if tid:
+        o["tour_id"] = tid
+        return f"{MT_WEB_URL}/tours/{tid}"
     return f"{MT_WEB_URL}/bookings/{o['id']}"
 DASH_PASSWORD = env("DASHBOARD_PASSWORD")
 DATA_DIR = Path(env("DATA_DIR", ".") or ".")
@@ -200,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.6"
+VERSION = "9.0.8"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)

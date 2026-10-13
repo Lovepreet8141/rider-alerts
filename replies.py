@@ -49,6 +49,12 @@ QUERIES = [
      "Thanks. Please send us a photo of the entrance, with the opening hours if you can see them. A teammate is checking it now."),
     ("q:cancel_reason", "Rider wants to cancel / remove the order → ask the reason first",
      "Okay. Why do you want to cancel this order? For example: food not ready, restaurant closed, customer not answering, or a problem with your bike or car."),
+    ("q:no_new_orders", "Rider gets no new orders → check online / zone, a teammate checks the account",
+     "Thanks for telling us. Please check that you are online in the app and inside your delivery zone. A teammate is checking your account now."),
+    ("q:compensation", "Rider asks for compensation / extra pay (detour, extra km, long wait)",
+     "Thanks for letting us know. A teammate will check it and get back to you here."),
+    ("q:photo_what", "Photo without text → what is it about?",
+     "Thanks for the photo. What is it about? Please tell us in one sentence, plus the order number."),
     ("q:cant_go_online", "Rider can't go online in the app → screenshot, a teammate checks",
      "Thanks for telling us. Please send a screenshot of what the app shows when you try to go online. A teammate will check your account right away."),
     ("q:returned_photo", "Rider gave the order back to the restaurant → photo first",
@@ -166,7 +172,7 @@ CALL_FAILED = ("can't call", "cannot call", "cant call", "can not call", "call b
                "call cut", "app call", "call from the app", "call in the app", "anruf geht nicht", "kann nicht anrufen", "kann ihn nicht anrufen",
                "kann sie nicht anrufen", "anrufen geht nicht", "anruf funktioniert nicht", "anruftaste", "call nahi ho", "call nahi lag", "call nhi",
                "لا أستطيع الاتصال", "ما بقدر اتصل", "ما عم يزبط الاتصال", "الاتصال لا يعمل", "arayamıyorum", "arama olmuyor")
-LIEFERCODE = ("liefercode", "liefer code", "delivery code", "the code", "code", "kodu", "كود", "الرمز", "رمز")
+LIEFERCODE = ("liefercode", "liefer code", "delivery code", "the code", "code", "kodu", "كود", "الرمز", "رمز", "pin", "pincode", "pin code")
 CANT_WAIT = ("can't wait", "cant wait", "cannot wait", "can not wait", "kann nicht warten", "kann nicht mehr warten", "no more waiting", "too long", "zu lange",
              "long wait", "waiting too long", "warte schon", "ما بقدر انتظر", "لا أستطيع الانتظار", "intezaar nahi", "wait nahi")
 CANCEL = ("cancel", "stornier", "الغاء", "إلغاء", "الغي", "iptal")
@@ -235,9 +241,22 @@ TAG_INTENTS = {
     "forgot_finish": "forgot_finish", "forgot": "forgot_finish", "i forgot to finish the order on the app": "forgot_finish", "forgot to complete": "forgot_finish",
     "damaged": "damaged", "order_damaged": "damaged", "order is damaged": "damaged",
     "other": "other", "returned": "returned", "order_returned": "returned", "cant_go_online": "cant_go_online", "offline": "cant_go_online",
+    "no_new_orders": "no_new_orders", "compensation": "compensation",
 }
 
 
+NO_NEW = ("not receiving any order", "not receiving orders", "not receiving order", "no orders coming", "not getting any order",
+          "not getting orders", "don't get any order", "dont get any order", "don't get orders", "dont get orders", "i get no orders",
+          "no new orders", "why no orders", "why am i not getting", "keine aufträge", "keine auftraege", "bekomme keine aufträge",
+          "bekomme keine bestellungen", "kriege keine aufträge", "kriege keine bestellungen", "keine neuen bestellungen",
+          "ما عم يجيني طلبات", "ما عم يجيني ولا طلب", "ما في طلبات", "لا تصلني طلبات", "لا يصلني طلبات", "لا أستلم طلبات",
+          "ما يجيني طلب", "sipariş gelmiyor", "siparis gelmiyor", "order nahi aa raha", "order nahi aa rahe", "order nhi aa raha")
+COMPENSATION = ("compensation", "compensate", "kompensation", "entschädigung", "entschaedigung", "vergütung", "verguetung",
+                "extra km", "extra kilometer", "km more", "more km", "kilometers more", "more kilometers", "mehr kilometer",
+                "zusätzliche kilometer", "extra pay", "extra money", "pay me", "bezahlung", "extra geld", "تعويض", "مسافة إضافية",
+                "كيلومتر إضافي", "ekstra ödeme", "ek ödeme", "tazminat", "extra paise")
+ROAD = ("road", "street", "straße", "strasse", "weg", "route", "bridge", "brücke", "bruecke", "gesperrt", "festival", "baustelle",
+        "construction", "الطريق", "الشارع", "yol", "sokak")
 OFFLINE = ("can't go online", "cant go online", "cannot go online", "can not go online", "not going online", "unable to go online",
            "can't get online", "cannot get online", "can't log in", "cant log in", "cannot log in", "can't login", "cannot login", "app not working",
            "kann nicht online", "nicht online gehen", "komme nicht online", "kann mich nicht einloggen", "einloggen geht nicht", "login geht nicht",
@@ -329,6 +348,10 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "call_failed"
     if _has(low, CANT_WAIT):
         return "not_ready"                                   # "I can't wait" at the restaurant = food late, wants out
+    if _has(low, COMPENSATION):
+        return "compensation"                               # "road closed, 2.5 km more, please compensate" — pay, not a closed restaurant
+    if _has(low, NO_NEW):
+        return "no_new_orders"                              # "why am I not receiving any orders?" — account / zone, not a missing order
     if _has(low, OFFLINE):
         return "cant_go_online"                             # an app / account problem, not a delivery
     if _has(low, RETURNED):
@@ -339,13 +362,14 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "item_missing"
     if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)) and not _has(low, PHONE):
         return "no_order"
-    if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")):
+    if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")) and not _has_word(low, ROAD):
         return "closed"
     if _has(low, READY) and not _has(low, NOT_READY_GUARD):
         return "ready"
     if _has(low, FORGOT) and _has(low, FORGOT_CTX):
         return "forgot_finish"
-    if _has_word(low, LIEFERCODE) and (_has(low, LIEFER_CTX) or "liefer" in low):
+    if _has_word(low, LIEFERCODE) and (_has(low, LIEFER_CTX) or "liefer" in low) \
+            and not _has(low, ("map pin", "pin on the map", "location pin", "pin location", "standort", "karte")):
         return "liefercode"
     if _has(low, DAMAGED) and not _has_word(low, VEHICLE):
         return "damaged"                                # "my bike is broken" is the rider's vehicle, not the food
@@ -381,6 +405,7 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
 
 
 WEAK = ("other", "nudge", "ack", "yes", "no", "excuse")
+NUMBER_INTENTS = ("call_failed", "customer_phone", "customer_unreachable")
 SOLVABLE = ("returned", "not_ready", "closed", "no_order", "item_missing", "customer_unreachable", "customer_find", "call_failed", "customer_phone",
             "liefercode", "customer_problem", "damaged", "forgot_finish")       # a reason the bot has its own steps for
 
@@ -413,11 +438,12 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
                 "liefercode": "Liefercode problem", "customer_problem": "customer refuses / problem", "forgot_finish": "forgot to finish in the app",
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
                 "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed",
-                "returned": "gave the order back to the restaurant", "cant_go_online": "can't go online in the app"}
+                "returned": "gave the order back to the restaurant", "cant_go_online": "can't go online in the app",
+                "no_new_orders": "gets no new orders", "compensation": "asks for compensation / extra pay"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
-HANDOVER_KEYS = ("q:handover", "q:handover_restaurant", "q:holding", "q:no_order", "q:item_missing", "q:remove_order", "q:urgent",
+HANDOVER_KEYS = ("q:no_new_orders", "q:compensation", "q:handover", "q:handover_restaurant", "q:holding", "q:no_order", "q:item_missing", "q:remove_order", "q:urgent",
                  "q:customer_refuses", "q:photo_thanks", "q:not_ready_check")
 
 
@@ -548,14 +574,15 @@ class RiderFlows:
         not helped by it — a person takes over instead of the bot repeating itself."""
         if not self.on(key):
             return False
-        last = self.sent_keys.setdefault(rid, {})
+        last = self.sent_keys.setdefault(f"{rid}|{conv}", {})
         if key in last and time.time() - last[key] < 30 * 60 and key not in HANDOVER_KEYS and key != "q:phone_number":
             await self._fwd(rid, conv, f"🔁 rider is not helped by our automatic answer ({key[2:].replace('_', ' ')}) — please reply personally.", o=o)
             return False
         last[key] = time.time()
         await self.deps["send"](rid, conv, key, o, lang=self.lang.get(rid, ""), **fmt)
         self.last_bot[conv] = (key, time.time())
-        if key in ("q:handover", "q:handover_restaurant", "q:holding", "q:urgent", "q:no_order", "q:item_missing", "q:remove_order"):
+        if key in ("q:handover", "q:handover_restaurant", "q:holding", "q:urgent", "q:no_order", "q:item_missing", "q:remove_order",
+                   "q:no_new_orders", "q:compensation"):
             self.told[conv] = time.time()
         if key != "q:holding":
             self.last_rider_at.pop(conv, None)          # the rider got an answer — nobody is waiting any more
@@ -642,8 +669,10 @@ class RiderFlows:
 
         # ---- a teammate is already talking to this rider (he took the chat himself): the bot stays out
         if intent != "urgent" and not self.handed_over(conv) and await self.teammate_on_it(conv):
-            if intent == "call_failed":
-                await self.deps["forward"](rid, conv, self._note(rid, f"📞 rider can't call the customer through the app — please send the customer's number ({(o or {}).get('ref', '')})"), urgent=True, o=o)
+            if intent in NUMBER_INTENTS:                 # the rider is at the door: the number can't wait for a teammate
+                r = await self._number_while_person(rid, conv, o)
+                self.clear(rid)
+                return r
             self.clear(rid)
             return "silent — a teammate is already answering this chat"
 
@@ -663,9 +692,8 @@ class RiderFlows:
                 if intent == "urgent":
                     await self._fwd(rid, conv, self._note(rid, "🔴 URGENT"), urgent=True, o=o)
                     return "urgent note added (person already on it)"
-                if intent == "call_failed":
-                    await self._fwd(rid, conv, self._note(rid, f"📞 rider can't call the customer through the app — please send the customer's number ({(o or {}).get('ref', '')})"), urgent=True, o=o)
-                    return "note: rider needs the number (person already on it)"
+                if intent in NUMBER_INTENTS:
+                    return await self._number_while_person(rid, conv, o)
                 self.clear(rid)
                 return "silent — a person is answering this conversation"
             self.handover.pop(conv, None)               # forwarded, but nobody answered: the bot takes it back
@@ -810,6 +838,26 @@ class RiderFlows:
         await self._hand_over(rid, conv, o, f"📞 rider can't reach the customer — please send the customer's number ({why})", urgent=True)
         return f"teammate sends the number ({why})"
 
+    async def _number_while_person(self, rid, conv, o) -> str:
+        """A teammate has the chat, but the rider can't reach the customer now: the bot sends the number (his own live
+        order) and tells the team; if it can't, the team gets the note with the why."""
+        d = self.deps
+        mine = o is not None and o.get("rider_id") == rid and o.get("phase") not in ("delivered", "cancelled", "closed")
+        phone = d["customer_phone"](o) if mine and d.get("customer_phone") else ""
+        if mine and not phone and d.get("fetch_phone"):
+            try:
+                phone = await d["fetch_phone"](o)
+            except Exception:
+                phone = ""
+        if mine and phone and self.on("q:phone_number"):
+            await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
+            self.number_sent[o.get("id", "")] = time.time()
+            d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (teammate on the chat)")
+            await d["forward"](rid, conv, self._note(rid, f"📞 the bot sent the customer's number for {o.get('ref')} — rider couldn't reach the customer"), o=o)
+            return "number sent while a teammate has the chat (team told)"
+        await d["forward"](rid, conv, self._note(rid, f"📞 rider needs the customer's number — {self._why_no_number(rid, o, mine)}. Please send it."), urgent=True, o=o)
+        return "note: rider needs the number"
+
     @staticmethod
     def _why_no_number(rid, o, mine) -> str:
         if o is None:
@@ -874,10 +922,8 @@ class RiderFlows:
                 self.set(rid, "await_reason", "", 5, conv=conv, ref=ref, kind=intent)
                 return "asked the reason"
             return await self._reason_given(rid, conv, o, intent, reason)
-        if intent == "customer_phone":
-            await self._send(rid, conv, "q:phone_app", o)
-            self.set(rid, "phone", "", 15, conv=conv, ref=ref)
-            return "asked to call from the app"
+        if intent == "customer_phone":                 # asks for the number → number + house number + notes (his own order)
+            return await self._number(rid, conv, o, flow="unreachable", tips_key="q:phone_app")
         if intent == "call_failed":
             return await self._number(rid, conv, o)
         if intent == "customer_unreachable":           # can't reach the customer → number + house number + notes
@@ -905,9 +951,16 @@ class RiderFlows:
             await self._send(rid, conv, "q:damaged", o)
             self.set(rid, "await_photo", "", 10, kind="damaged", conv=conv, ref=ref)
             return "photo of the damage asked"
-        if intent == "photo":
-            await self._fwd(rid, conv, self._note(rid, "📷 photo received without text"), o=o)
-            return "photo forwarded"
+        if intent == "photo":                          # a photo alone says nothing yet — ask, don't park the chat with the team
+            await self._send(rid, conv, "q:photo_what", o)
+            self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
+            return "photo without text → asked what it is about"
+        if intent == "no_new_orders":
+            await self._hand_over(rid, conv, o, "📵 rider gets no new orders — please check his account / zone / online status in MotionTools", key="q:no_new_orders")
+            return "no new orders → teammate checks the account"
+        if intent == "compensation":
+            await self._hand_over(rid, conv, o, "💶 rider asks for compensation (extra distance / pay) — please check", key="q:compensation")
+            return "compensation request → teammate"
         if intent == "order_ref" and o is not None:
             await self._send(rid, conv, "q:order_ref", o, status=d["status_of"](o) if d.get("status_of") else o.get("phase", ""))
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
@@ -934,7 +987,7 @@ class RiderFlows:
         akey = f"{rid}|{conv}"
         if not substantive and time.time() - self.asked_other.get(akey, 0) > 2 * 3600:
             self.last_bot.pop(conv, None)                # a fresh question: the "said twice" guard is for answers, not for this
-            self.sent_keys.get(rid, {}).pop("q:other", None)
+            self.sent_keys.get(f"{rid}|{conv}", {}).pop("q:other", None)
             await self._send(rid, conv, "q:other", o)
             self.asked_other[akey] = time.time()
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)

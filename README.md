@@ -23,6 +23,26 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.8 — six real chats from 13 Oct answered right
+
+* "Why am I not receiving any orders?" → check online / zone + a teammate checks the account (was: "the restaurant
+  doesn't have this order").
+* "Send me the customer's phone number" → the number + house number + notes straight away (his own live order).
+* "Road closed, 2.5 km detour, please compensate" → a teammate checks the compensation (was: "photo of the entrance" —
+  a closed road is not a closed restaurant).
+* "He can't find a PIN" → Liefercode help ("PIN" = Liefercode; a map pin is not).
+* Photo without text → "What is it about?" (was: forwarded, and the rider's next question got no answer).
+* A rider at the door who can't reach the customer gets the number even while a teammate has the chat; the teammate
+  gets a note. Everything else in that chat stays with the teammate.
+* The "said twice → a person takes over" guard counts per chat, so a new chat can get the same question again.
+
+## 9.0.7 — ↗ opens the tour
+
+* With the `tour.created` webhook (no filter, same relay URL) the ↗ opens the order's **tour**; the newest tour wins
+  when MotionTools merges orders into one tour, and it also works when the tour event arrives before the booking.
+* Tour → booking links are kept in memory (newest 20 000 tours), no longer written to the settings table (that table is
+  read on every rider message — thousands of tours a day would slow it down).
+
 ## 9.0.6 — ↗ MotionTools link next to every order number
 
 * A small ↗ next to the order number (order list, the order panel, the Orders table) opens the order in the MotionTools
