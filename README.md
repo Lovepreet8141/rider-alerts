@@ -23,6 +23,25 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.10 — no second question for a known order · cities A–Z
+
+* When the bot already knows the rider's order, "Hi / Other / photo" get "How can I help you?" / "What is it about?"
+  WITHOUT "plus the order number" (new texts q:other_known, q:photo_what_known).
+* City lists sorted alphabetically (German order, Ä/Ö/Ü in place): the city menu at the top, the Intercom page
+  "Cities for the rules", Settings → city names. New cities slot in at the right place.
+
+## 9.0.9 — the customer's number only once per chat
+
+* The number (+ house number + notes) goes to a rider **once per order per chat** — on every path, also while a
+  teammate has the chat, and also after a restart (remembered 4 hours).
+* The number message now says: wait there at least 10 minutes, keep calling, ring the bell, ask the neighbours, check
+  you are at the right address (some buildings have more than one entrance).
+* Rider writes again ("can't call", "what if he's not there?") → "Please keep trying for N more minutes: call, bell,
+  neighbours, entrance" — at most once every 3 minutes, never the number again.
+* 10 minutes after the number → a teammate decides (also when the rider stays silent).
+* "The number is wrong / someone else answers" → a teammate at once.
+* Information notes ("the bot sent the number") no longer re-assign or re-open the chat.
+
 ## 9.0.8 — six real chats from 13 Oct answered right
 
 * "Why am I not receiving any orders?" → check online / zone + a teammate checks the account (was: "the restaurant

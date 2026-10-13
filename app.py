@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.8"
+VERSION = "9.0.10"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -2479,6 +2479,22 @@ async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, l
         store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
 
 
+async def _flow_note(rid: str, conv: str, note: str, o=None) -> bool:
+    """An internal note for the team that changes nothing else: no re-assignment, no re-opening (information only)."""
+    name = STATE["riders"].get(rid, {}).get("name") or "Rider"
+    full = f"ℹ {name}: {note}\n{_order_ctx(o)}"
+    BOT_SENT.append((time.time(), _norm(full))); del BOT_SENT[:-300]
+    if not intercom.ic.enabled or not conv:
+        return False
+    try:
+        if not await intercom.ic.resolve_admin():
+            return False
+        await intercom.ic.call("POST", f"/conversations/{conv}/reply", {"message_type": "note", "type": "admin", "admin_id": intercom.ic.admin, "body": _ic_html(full)})
+        return True
+    except Exception:
+        return False
+
+
 async def _flow_forward(rid: str, conv: str, note: str, urgent: bool = False, o=None):
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
     full = f"{'🔴 ' if urgent else '⚠ '}{name}: {note}\n{_order_ctx(o)}"
@@ -2531,7 +2547,7 @@ def _order_by_ref(text: str):
 flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_replied_since, "order_by_ref": _order_by_ref,
               "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order,
               "understand": _understand, "order_ctx": _ai_ctx, "send": _flow_send, "forward": _flow_forward, "log": _flow_log,
-              "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone,
+              "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone, "note": _flow_note,
               "settings": store.get_settings}
 
 
@@ -3137,7 +3153,7 @@ def export_events(n: int = 300):
                              headers={"Content-Disposition": 'attachment; filename="motiontools-events.jsonl"'})
 
 
-from intercom_msg import make_router as _intercom_router  # noqa: E402
+from intercom_msg import make_router as _intercom_router, _html as _ic_html  # noqa: E402
 def _rider_for_intercom(rid: str) -> dict:
     r = dict(STATE["riders"].get(rid) or {})
     r["intercom"] = store.get_settings().get(f"intercom:{rid}", "")     # email / contact id typed in Settings

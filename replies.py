@@ -24,6 +24,7 @@ Rules from the training pack
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -53,8 +54,10 @@ QUERIES = [
      "Thanks for telling us. Please check that you are online in the app and inside your delivery zone. A teammate is checking your account now."),
     ("q:compensation", "Rider asks for compensation / extra pay (detour, extra km, long wait)",
      "Thanks for letting us know. A teammate will check it and get back to you here."),
-    ("q:photo_what", "Photo without text → what is it about?",
+    ("q:photo_what", "Photo without text → what is it about? (order not known yet)",
      "Thanks for the photo. What is it about? Please tell us in one sentence, plus the order number."),
+    ("q:photo_what_known", "Photo without text → what is it about? (we already know his order)",
+     "Thanks for the photo. What is it about? Please tell us in one sentence."),
     ("q:cant_go_online", "Rider can't go online in the app → screenshot, a teammate checks",
      "Thanks for telling us. Please send a screenshot of what the app shows when you try to go online. A teammate will check your account right away."),
     ("q:returned_photo", "Rider gave the order back to the restaurant → photo first",
@@ -66,7 +69,9 @@ QUERIES = [
     ("q:phone_app", "Rider asks for the customer's number → call from the app",
      "Please call the customer with the call button on the customer stop in your app. If the call doesn't go through, check that your own phone number in the app profile is correct, then try again."),
     ("q:phone_number", "Calling through the app doesn't work → number, house number and notes (only to the assigned rider)",
-     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and keep trying for up to 10 minutes. Write here if nobody answers."),
+     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and wait there for at least 10 minutes: keep calling, ring the bell, ask the neighbours about the customer, and check that you are at the right address (some buildings have more than one entrance). If nobody answers after 10 minutes, write here."),
+    ("q:keep_trying", "Number already sent, rider writes again → keep trying for the minutes left (never the number twice)",
+     "Please keep trying for {left} more minutes: call the customer, ring the bell, ask the neighbours and check the entrance. If nobody answers by then, a teammate will tell you what to do with the order."),
     ("q:unreachable", "Customer doesn't answer / open → keep calling 10 minutes",
      "Thanks for trying. Please keep calling from the app and wait at the door for up to 10 minutes. If there's still no answer, write here how long you waited and we'll tell you what to do."),
     ("q:find_address", "Rider can't find the address",
@@ -93,6 +98,8 @@ QUERIES = [
      "Still with you, a teammate is on it. Thanks for waiting."),
     ("q:other", "Greeting / 'Other' button / not clear → how can I help?",
      "Hi! How can I help you? Please tell us in one sentence what happened, plus the order number."),
+    ("q:other_known", "Greeting / 'Other' button → how can I help? (we already know his order — no order number asked)",
+     "Hi! How can I help you? Please tell us in one sentence what happened."),
     ("q:ask_order", "Rider we can't identify yet (no MotionTools link) → how can I help + order number",
      "Hi! How can I help you? Please send the order number (for example 7DDP8F) and tell us what happened."),
     ("q:order_ref", "Rider sends only an order number",
@@ -241,7 +248,7 @@ TAG_INTENTS = {
     "forgot_finish": "forgot_finish", "forgot": "forgot_finish", "i forgot to finish the order on the app": "forgot_finish", "forgot to complete": "forgot_finish",
     "damaged": "damaged", "order_damaged": "damaged", "order is damaged": "damaged",
     "other": "other", "returned": "returned", "order_returned": "returned", "cant_go_online": "cant_go_online", "offline": "cant_go_online",
-    "no_new_orders": "no_new_orders", "compensation": "compensation",
+    "no_new_orders": "no_new_orders", "compensation": "compensation", "wrong_number": "wrong_number",
 }
 
 
@@ -251,6 +258,11 @@ NO_NEW = ("not receiving any order", "not receiving orders", "not receiving orde
           "bekomme keine bestellungen", "kriege keine aufträge", "kriege keine bestellungen", "keine neuen bestellungen",
           "ما عم يجيني طلبات", "ما عم يجيني ولا طلب", "ما في طلبات", "لا تصلني طلبات", "لا يصلني طلبات", "لا أستلم طلبات",
           "ما يجيني طلب", "sipariş gelmiyor", "siparis gelmiyor", "order nahi aa raha", "order nahi aa rahe", "order nhi aa raha")
+WRONG_NUMBER = ("wrong number", "number is wrong", "number wrong", "number is not correct", "not the right number", "number doesn't exist",
+                "number does not exist", "not in service", "out of service", "someone else answers", "another person answers",
+                "falsche nummer", "nummer ist falsch", "nummer existiert nicht", "nicht vergeben", "kein anschluss", "nummer stimmt nicht",
+                "الرقم غلط", "الرقم خطأ", "الرقم خاطئ", "الرقم غير صحيح", "الرقم مو صحيح", "الرقم غير موجود", "numara yanlış", "numara yanlis",
+                "galat number", "number galat")
 COMPENSATION = ("compensation", "compensate", "kompensation", "entschädigung", "entschaedigung", "vergütung", "verguetung",
                 "extra km", "extra kilometer", "km more", "more km", "kilometers more", "more kilometers", "mehr kilometer",
                 "zusätzliche kilometer", "extra pay", "extra money", "pay me", "bezahlung", "extra geld", "تعويض", "مسافة إضافية",
@@ -348,6 +360,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "call_failed"
     if _has(low, CANT_WAIT):
         return "not_ready"                                   # "I can't wait" at the restaurant = food late, wants out
+    if _has(low, WRONG_NUMBER):
+        return "wrong_number"                               # the number we sent doesn't work — calling it again won't help
     if _has(low, COMPENSATION):
         return "compensation"                               # "road closed, 2.5 km more, please compensate" — pay, not a closed restaurant
     if _has(low, NO_NEW):
@@ -405,12 +419,12 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
 
 
 WEAK = ("other", "nudge", "ack", "yes", "no", "excuse")
-NUMBER_INTENTS = ("call_failed", "customer_phone", "customer_unreachable")
+NUMBER_INTENTS = ("call_failed", "customer_phone", "customer_unreachable")      # (once per chat — after that: keep trying)
 SOLVABLE = ("returned", "not_ready", "closed", "no_order", "item_missing", "customer_unreachable", "customer_find", "call_failed", "customer_phone",
             "liefercode", "customer_problem", "damaged", "forgot_finish")       # a reason the bot has its own steps for
 
 
-PRIORITY = ("urgent", "call_failed", "returned", "cant_go_online", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
+PRIORITY = ("urgent", "wrong_number", "call_failed", "returned", "cant_go_online", "no_order", "item_missing", "liefercode", "forgot_finish", "customer_find", "customer_unreachable",
             "customer_phone", "closed", "damaged", "customer_problem", "not_ready", "remove_order", "cant_deliver")
 
 
@@ -439,7 +453,8 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
                 "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
                 "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed",
                 "returned": "gave the order back to the restaurant", "cant_go_online": "can't go online in the app",
-                "no_new_orders": "gets no new orders", "compensation": "asks for compensation / extra pay"}
+                "no_new_orders": "gets no new orders", "compensation": "asks for compensation / extra pay",
+                "wrong_number": "the customer's number is wrong / not in service"}
 
 
 # ----------------------------------------------------------------------------- the flow engine
@@ -483,7 +498,8 @@ class RiderFlows:
         self.last_bot: dict = {}        # conversation id -> (key, time) of our last answer — context for the AI
         self.lang: dict = {}            # rider id -> language he gets answers in
         self.told: dict = {}            # conversation id -> when the rider was last told "a teammate has it" / "still with you"
-        self.number_sent: dict = {}     # order id -> when its customer number went to the rider
+        self.number_sent: dict = {}     # "conversation|order id" -> when the customer's number went to the rider (once per chat)
+        self.kept: dict = {}            # "conversation|order id" -> when we last said "keep trying"
         self.deps: dict = {}
         self._load()
 
@@ -494,14 +510,17 @@ class RiderFlows:
             self.state = json.loads(s.get("rider_flows") or "{}")
             self.handover = json.loads(s.get("rider_handover") or "{}")
             self.lang = json.loads(s.get("rider_lang") or "{}")
+            self.number_sent = json.loads(s.get("rider_numbers") or "{}")
         except Exception:
             self.state = {}
 
     def _save(self):
         try:
             self.handover = {c: t for c, t in self.handover.items() if time.time() - t < self.HANDOVER_H * 3600}
+            self.number_sent = {k: t for k, t in self.number_sent.items() if time.time() - t < 4 * 3600}
             self.store.set_settings({"rider_flows": json.dumps(self.state)[:60000], "rider_handover": json.dumps(self.handover)[:30000],
-                                     "rider_lang": json.dumps(dict(list(self.lang.items())[-3000:]))[:60000]})
+                                     "rider_lang": json.dumps(dict(list(self.lang.items())[-3000:]))[:60000],
+                                     "rider_numbers": json.dumps(self.number_sent)[:60000]})
         except Exception:
             pass
 
@@ -575,7 +594,7 @@ class RiderFlows:
         if not self.on(key):
             return False
         last = self.sent_keys.setdefault(f"{rid}|{conv}", {})
-        if key in last and time.time() - last[key] < 30 * 60 and key not in HANDOVER_KEYS and key != "q:phone_number":
+        if key in last and time.time() - last[key] < 30 * 60 and key not in HANDOVER_KEYS and key not in ("q:phone_number", "q:keep_trying"):
             await self._fwd(rid, conv, f"🔁 rider is not helped by our automatic answer ({key[2:].replace('_', ' ')}) — please reply personally.", o=o)
             return False
         last[key] = time.time()
@@ -751,6 +770,11 @@ class RiderFlows:
                 return await self._number(rid, conv, o, flow=flow)   # tips first (older chats), now the number
             if intent in ("ack", "yes", "ready"):
                 return "noted"
+            if intent == "wrong_number":
+                await self._hand_over(rid, conv, o, f"📞 {(o or {}).get('ref', '')}: the customer's number seems wrong / not in service — please check", urgent=True)
+                return "wrong number → teammate"
+            if st.get("number") and intent in ("customer_unreachable", "customer_find", "call_failed", "customer_phone", "other", "no", "excuse"):
+                return await self._after_number(rid, conv, o, self._sent_at(conv, o) or st.get("since", time.time()))
             if intent in ("customer_unreachable", "customer_find", "other", "no", "customer_phone", "nudge", "photo", "excuse"):
                 mins = round((time.time() - st.get("since", time.time())) / 60)
                 what = "customer doesn't answer" if flow == "unreachable" else "rider can't find the address"
@@ -816,6 +840,9 @@ class RiderFlows:
         """Calling through the app doesn't work: the customer's number + street/house number + delivery notes — never the
         name, and only for his own live order."""
         d = self.deps
+        sent = self._sent_at(conv, o)
+        if sent:                                         # the number is already in this chat — never twice
+            return await self._after_number(rid, conv, o, sent)
         mine = o is not None and o.get("rider_id") == rid and o.get("phase") not in ("delivered", "cancelled", "closed")
         phone = d["customer_phone"](o) if mine and d.get("customer_phone") else ""
         if mine and not phone and d.get("fetch_phone"):
@@ -825,7 +852,7 @@ class RiderFlows:
                 phone = ""
         if mine and phone and self.on("q:phone_number"):
             await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
-            self.number_sent[o.get("id", "")] = time.time()
+            self._mark_sent(conv, o)
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (app call not working)")
             self.set(rid, flow, "", self._cfg("bot_unreach_min", 10), conv=conv, ref=o.get("ref", ""), number=True)
             return "customer's number + house number + notes sent (his own order)"
@@ -842,6 +869,9 @@ class RiderFlows:
         """A teammate has the chat, but the rider can't reach the customer now: the bot sends the number (his own live
         order) and tells the team; if it can't, the team gets the note with the why."""
         d = self.deps
+        sent = self._sent_at(conv, o)
+        if sent:
+            return await self._after_number(rid, conv, o, sent, person=True)
         mine = o is not None and o.get("rider_id") == rid and o.get("phase") not in ("delivered", "cancelled", "closed")
         phone = d["customer_phone"](o) if mine and d.get("customer_phone") else ""
         if mine and not phone and d.get("fetch_phone"):
@@ -851,12 +881,47 @@ class RiderFlows:
                 phone = ""
         if mine and phone and self.on("q:phone_number"):
             await self._send(rid, conv, "q:phone_number", o, phone=phone, **delivery_details(o))
-            self.number_sent[o.get("id", "")] = time.time()
+            self._mark_sent(conv, o)
             d["log"](rid, o, "reply:number_sent", f"customer number sent for {o.get('ref')} (teammate on the chat)")
-            await d["forward"](rid, conv, self._note(rid, f"📞 the bot sent the customer's number for {o.get('ref')} — rider couldn't reach the customer"), o=o)
+            info = self._note(rid, f"📞 the bot sent the customer's number for {o.get('ref')} — rider couldn't reach the customer")
+            await (d["note"](rid, conv, info, o=o) if d.get("note") else d["forward"](rid, conv, info, o=o))   # a note — the chat stays where it is
             return "number sent while a teammate has the chat (team told)"
         await d["forward"](rid, conv, self._note(rid, f"📞 rider needs the customer's number — {self._why_no_number(rid, o, mine)}. Please send it."), urgent=True, o=o)
         return "note: rider needs the number"
+
+    def _sent_at(self, conv, o) -> float:
+        return self.number_sent.get(f"{conv}|{(o or {}).get('id', '')}", 0) if o else 0
+
+    def _mark_sent(self, conv, o):
+        self.number_sent[f"{conv}|{o.get('id', '')}"] = time.time()
+        self._save()
+
+    async def _after_number(self, rid, conv, o, sent_at: float, person: bool = False) -> str:
+        """The number is already in this chat and the rider still can't reach the customer. Never the number again:
+        keep trying until 10 minutes after the number (call, bell, neighbours, entrance), then a teammate decides.
+        person=True: a teammate has the chat — "keep trying" at most, the decision stays with him."""
+        wait = self._cfg("bot_unreach_min", 10)
+        mins = (time.time() - sent_at) / 60
+        ref = (o or {}).get("ref", "")
+        if mins >= wait:
+            if person:
+                return f"silent — number sent {round(mins)} min ago, the teammate decides"
+            await self._hand_over(rid, conv, o, f"⏱ {ref}: customer still unreachable — number sent {round(mins)} min ago, rider kept trying. Please decide",
+                                  urgent=True)
+            return f"customer unreachable {round(mins)} min after the number → teammate"
+        key = f"{conv}|{(o or {}).get('id', '')}"
+        if time.time() - self.kept.get(key, 0) < 3 * 60:
+            return f"noted — rider keeps trying ({math.ceil(wait - mins)} min left)"
+        self.kept[key] = time.time()
+        left = max(1, math.ceil(wait - mins))
+        await self._send(rid, conv, "q:keep_trying", o, left=left)
+        if not person:                                   # the timer hands over exactly 10 minutes after the number
+            st = self.state.get(rid)
+            if not st or st.get("flow") not in ("unreachable", "find"):
+                st = self.set(rid, "unreachable", "", wait - mins, conv=conv, ref=ref, number=True)
+            st["since"], st["number"] = sent_at, True
+            self._save()
+        return f"number already sent → keep trying ({left} min left)"
 
     @staticmethod
     def _why_no_number(rid, o, mine) -> str:
@@ -952,9 +1017,12 @@ class RiderFlows:
             self.set(rid, "await_photo", "", 10, kind="damaged", conv=conv, ref=ref)
             return "photo of the damage asked"
         if intent == "photo":                          # a photo alone says nothing yet — ask, don't park the chat with the team
-            await self._send(rid, conv, "q:photo_what", o)
+            await self._send(rid, conv, "q:photo_what_known" if o is not None else "q:photo_what", o)   # known order: don't ask for it
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
             return "photo without text → asked what it is about"
+        if intent == "wrong_number":
+            await self._hand_over(rid, conv, o, f"📞 {ref}: the customer's number seems wrong / not in service — please check", urgent=True)
+            return "wrong number → teammate"
         if intent == "no_new_orders":
             await self._hand_over(rid, conv, o, "📵 rider gets no new orders — please check his account / zone / online status in MotionTools", key="q:no_new_orders")
             return "no new orders → teammate checks the account"
@@ -987,8 +1055,9 @@ class RiderFlows:
         akey = f"{rid}|{conv}"
         if not substantive and time.time() - self.asked_other.get(akey, 0) > 2 * 3600:
             self.last_bot.pop(conv, None)                # a fresh question: the "said twice" guard is for answers, not for this
-            self.sent_keys.get(f"{rid}|{conv}", {}).pop("q:other", None)
-            await self._send(rid, conv, "q:other", o)
+            for k in ("q:other", "q:other_known"):
+                self.sent_keys.get(f"{rid}|{conv}", {}).pop(k, None)
+            await self._send(rid, conv, "q:other_known" if o is not None else "q:other", o)   # known order: don't ask for it
             self.asked_other[akey] = time.time()
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
             return "asked what happened"
