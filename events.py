@@ -220,11 +220,12 @@ class Projector:
             self.store.upsert_rider(rid, r["name"] or "Rider", r.get("phone", ""), True, r.get("lat"), r.get("lng"),
                                     [o["id"] for o in self.state["orders"].values() if o["rider_id"] == rid], now)
 
-    def gps(self, rid, lat, lng, now, order_id=None):
+    def gps(self, rid, lat, lng, now, order_id=None, stream=False):
+        """stream=True only for the GPS events (driver_location_updated) — the live feed the movement rules need."""
         if rid and lat is not None and lng is not None:
             r = self.rider(rid)
             r["lat"], r["lng"] = lat, lng
-            self.tracker.push(rid, lat, lng, now)
+            self.tracker.push(rid, lat, lng, now, stream=stream)
             self.store.record_position(rid, lat, lng, order_id, now)
 
     TEXT_FIELDS = ("ref", "area", "area_name", "restaurant_phone", "customer_addr", "customer_phone", "customer_zip",
@@ -479,7 +480,7 @@ class Projector:
                 loc = d.get("driver_location") or {}
                 self.set_rider(o, d.get("driver_id"), d.get("driver_name"), now) if d.get("driver_id") and not o["rider_id"] else None
                 o["rider_lat"], o["rider_lng"] = loc.get("lat"), loc.get("lng")
-                self.gps(d.get("driver_id") or o["rider_id"], loc.get("lat"), loc.get("lng"), now, bid)
+                self.gps(d.get("driver_id") or o["rider_id"], loc.get("lat"), loc.get("lng"), now, bid, stream=True)
                 return name                                   # position only — nothing to store on the order
             self.finish(o, now)
             return name
@@ -586,6 +587,6 @@ class Projector:
                 for o in bookings:
                     o["rider_lat"], o["rider_lng"] = d.get("lat"), d.get("lng")
                     self.seen(o["rider_id"], now)
-                    self.gps(o["rider_id"], d.get("lat"), d.get("lng"), now, o["id"])
+                    self.gps(o["rider_id"], d.get("lat"), d.get("lng"), now, o["id"], stream=True)
             return name
         return name

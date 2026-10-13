@@ -23,6 +23,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.0.12 — no "not moving" without a live GPS feed
+
+* "Not moving" (and "no GPS" / "wrong direction") alerts and their rider messages now need a LIVE GPS feed:
+  booking.driver_location_updated / tour.driver_location_updated events. One-off positions (tour started, rider went
+  online) are still stored but no longer count as a feed — before, a rider who started a tour looked "not moving"
+  a few minutes after the pickup because simply no new position arrived (Göttingen, 13 Oct: pickup 16:54, message 17:00).
+* To get "not moving" back: add booking.driver_location_updated to the MotionTools webhook (same customer_id filter).
+
 ## 9.0.11 — "don't mark it delivered" + handover photo check
 
 * The Liefercode is the last 2 digits of the customer's phone number, so the number message now says:

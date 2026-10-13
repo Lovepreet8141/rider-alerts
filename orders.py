@@ -350,11 +350,14 @@ class RiderTracker:
         self.best: dict[tuple, tuple] = {}   # (rider, target_stop_key) -> (min_dist, at)
         self.pushes: dict[str, deque] = {}   # rider -> times a position was reported (even if unchanged)
 
-    def push(self, rider_id: str, lat, lng, now: datetime):
+    def push(self, rider_id: str, lat, lng, now: datetime, stream: bool = True):
+        """stream=False: a one-off position (tour started, rider went online). It is kept as a position, but it does NOT
+        prove a live GPS feed — "not moving" from one-off positions would just mean "no new position came"."""
         if rider_id is None or lat is None or lng is None:
             return
-        p = self.pushes.setdefault(rider_id, deque(maxlen=200))
-        p.append(now)
+        if stream:
+            p = self.pushes.setdefault(rider_id, deque(maxlen=200))
+            p.append(now)
         h = self.hist.setdefault(rider_id, deque(maxlen=60))
         if h and h[-1][1] == lat and h[-1][2] == lng:
             return                                    # identical fix = no new information
