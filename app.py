@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.0.12"
+VERSION = "9.1.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1311,6 +1311,7 @@ async def startup():
     asyncio.create_task(city_names_loop())
     asyncio.create_task(intercom_match_loop())
     asyncio.create_task(loop_lag_monitor())
+    asyncio.create_task(slack_loop())
 
 
 def set_mode(m: str):
@@ -1452,6 +1453,52 @@ async def event_worker():
 # ====================================================================== API
 def hm(dt):
     return dt.astimezone(BERLIN).strftime("%H:%M") if dt else None
+
+
+from slack_notify import SlackNotifier  # noqa: E402
+slack = SlackNotifier(store, mt_link, city_of, hm)
+
+
+async def slack_loop():
+    """Priority restaurants → Slack (new order · no rider after N min · cancelled), checked every 20 seconds."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await slack.tick(list(STATE["orders"].values()), datetime.now(UTC))
+        except Exception as e:
+            log.warning("slack loop: %s", e)
+        await asyncio.sleep(20)
+
+
+@app.get("/api/slack", dependencies=[Depends(require_login)])
+def api_slack():
+    return slack.status(list(STATE["orders"].values()))
+
+
+@app.post("/api/slack", dependencies=[Depends(require_login)])
+async def api_slack_save(request: Request):
+    b = await request.json() or {}
+    names = "\n".join(n.strip() for n in str(b.get("restaurants") or "").splitlines() if n.strip())[:4000]
+    try:
+        mins = str(max(1, min(120, int(b.get("no_rider_min") or 5))))
+    except (TypeError, ValueError):
+        mins = "5"
+    ev = ",".join(e for e in ("new", "norider", "cancel") if e in (b.get("events") or []))
+    store.set_settings({"slack_restaurants": names, "slack_no_rider_min": mins, "slack_events": ev})
+    return slack.status(list(STATE["orders"].values()))
+
+
+@app.post("/api/slack/test", dependencies=[Depends(require_login)])
+async def api_slack_test():
+    if not slack_notify_webhook():
+        return {"ok": False, "error": "SLACK_WEBHOOK_URL is not set in Railway (web service → Variables)"}
+    ok = await slack.send("✅ Quickzi dashboard is connected — orders of your priority restaurants will appear here.")
+    return {"ok": ok, "error": "" if ok else slack.stats.get("last_error", "")}
+
+
+def slack_notify_webhook() -> bool:
+    import slack_notify
+    return bool(slack_notify.WEBHOOK)
 
 
 PHASE_START = {"unassigned": "dispatched_at", "accepted": "accepted_at", "to_restaurant": "started_at", "at_restaurant": "at_restaurant_at",
@@ -2479,6 +2526,17 @@ async def _flow_send(rid: str, conv: str, key: str, o, closer_key: str = None, l
         store.auto_update(aid, "sent" if m["status"] == "sent" else "failed", m.get("error", ""))
 
 
+async def _conv_closed(conv: str) -> bool:
+    """Is this Intercom chat closed (a teammate finished it)? On any doubt: False."""
+    if not intercom.ic.enabled or not conv:
+        return False
+    try:
+        c = await intercom.ic.call("GET", f"/conversations/{conv}")
+    except Exception:
+        return False
+    return (c.get("state") or "") == "closed" or c.get("open") is False
+
+
 async def _flow_note(rid: str, conv: str, note: str, o=None) -> bool:
     """An internal note for the team that changes nothing else: no re-assignment, no re-opening (information only)."""
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
@@ -2547,7 +2605,7 @@ def _order_by_ref(text: str):
 flows.deps = {"rider_waiting": rider_waiting, "human_replied_since": human_replied_since, "order_by_ref": _order_by_ref,
               "status_of": lambda o: PHASE_LABEL.get(o.get("phase"), o.get("phase") or ""), "order_for": _rider_recent_order,
               "understand": _understand, "order_ctx": _ai_ctx, "send": _flow_send, "forward": _flow_forward, "log": _flow_log,
-              "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone, "note": _flow_note,
+              "riders_on": _riders_on, "others": _others, "customer_phone": customer_phone_of, "fetch_phone": _fetch_phone, "note": _flow_note, "conv_closed": _conv_closed,
               "order_by_id": lambda oid: STATE["orders"].get(oid) or store.order(oid),
               "settings": store.get_settings}
 
@@ -3272,7 +3330,7 @@ async def health():                                           # async: answers e
     s = STATE["sync"]
     return {"ok": True, "version": VERSION, "city": CITY, "live_orders": len(STATE["orders"]), "riders_known": len(STATE["riders"]),
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
-            "last_500": STATE.get("last_500"), "claude_classifier": brain.enabled(), "ai": brain.stats(), "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
+            "last_500": STATE.get("last_500"), "claude_classifier": brain.enabled(), "ai": brain.stats(), "slack": {k: v for k, v in slack.status([]).items() if k not in ("names", "matching_now")}, "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,

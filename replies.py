@@ -1193,11 +1193,20 @@ class RiderFlows:
                 continue                                 # delivered before the number went out — nothing to check
             rid = info["rid"]
             mins = max(0, round((dl_ts - sent) / 60))
-            o["query_flag"] = "delivered after the customer's number — handover photo asked"
+            closed = False
+            if d.get("conv_closed"):
+                try:
+                    closed = await d["conv_closed"](conv)    # the team closed the chat: don't re-open it with a message
+                except Exception:
+                    closed = False
+            ask = self.on("q:proof_photo") and not closed
+            o["query_flag"] = "delivered after the customer's number — " + ("handover photo asked" if ask else "please check")
             try:
-                await self._send(rid, conv, "q:proof_photo", o)
-                self.set(rid, "await_photo", "", 10, kind="proof", conv=conv, ref=o.get("ref", ""), oid=oid)
-                note = self._note(rid, f"⚠ {o.get('ref')} marked as delivered {mins} min after we sent the customer's number — handover photo asked")
+                if ask:
+                    await self._send(rid, conv, "q:proof_photo", o)
+                    self.set(rid, "await_photo", "", 10, kind="proof", conv=conv, ref=o.get("ref", ""), oid=oid)
+                why = "handover photo asked" if ask else ("chat closed by the team — no message to the rider" if closed else "please check")
+                note = self._note(rid, f"⚠ {o.get('ref')} marked as delivered {mins} min after we sent the customer's number — {why}")
                 await (d["note"](rid, conv, note, o=o) if d.get("note") else d["forward"](rid, conv, note, o=o))
             except Exception:
                 pass

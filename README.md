@@ -23,6 +23,25 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.0 — Slack messages for priority restaurants (new file: slack_notify.py)
+
+* Settings → "Slack — priority restaurants": one restaurant per line (part of the name is enough, ®/™ ignored).
+  For their orders the dashboard posts to ONE Slack channel of your own team:
+  🆕 new order (ref, restaurant, city, planned delivery / pre-order time, MotionTools ↗ link) ·
+  ⚠️ no rider after N minutes (default 5) · ❌ cancelled (with the reason). Each once per order, also after a restart.
+  No customer data. Checked every 20 seconds.
+* Setup: Slack → api.slack.com/apps → Create app → Incoming Webhooks → On → Add New Webhook → pick the channel →
+  copy the URL → Railway (web) → Variables → SLACK_WEBHOOK_URL. "Send test message" checks it.
+* Never use a channel shared with MotionTools (Slack Connect) — the dashboard never contacts MotionTools.
+* /health → "slack": webhook set, posted today, failed, last error.
+
+## 9.0.13 — handover-photo request can be switched off · closed chats stay closed
+
+* Intercom page → bot answers → "Order marked delivered after we sent the customer's number → handover photo" → On off:
+  the rider gets no second message; the team still gets a note "marked as delivered N min after we sent the number —
+  please check" and the order keeps its dashboard flag. No "NO handover photo" alert (no photo was asked).
+* If the team already closed the chat, the bot never re-opens it with the photo request — team note only.
+
 ## 9.0.12 — no "not moving" without a live GPS feed
 
 * "Not moving" (and "no GPS" / "wrong direction") alerts and their rider messages now need a LIVE GPS feed:
