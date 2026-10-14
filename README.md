@@ -23,6 +23,15 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.1 — Slack messages carry the order's timeline
+
+* Every Slack message now shows: Received (when the order arrived in our system) · Dispatched (offered to riders) ·
+  Pickup ~ / Picked up · Planned delivery (in N min), then the rider with his acceptance time, or "Waiting for a rider",
+  and the distance when MotionTools sends it.
+* 🆕 waits until MotionTools dispatches the order, so the dispatch time is in it. That is usually seconds,
+  at most ~4 min. Pre-orders are posted at once as "🆕 Pre-order … On hold (not dispatched yet)".
+* ❌ shows the cancel time, the timeline and the rider. ⚠️ shows how many minutes are left until the planned delivery.
+
 ## 9.1.0 — Slack messages for priority restaurants (new file: slack_notify.py)
 
 * Settings → "Slack — priority restaurants": one restaurant per line (part of the name is enough, ®/™ ignored).
