@@ -23,6 +23,13 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.2 — no more yellow notes in Intercom
+
+* The bot no longer writes internal notes into rider chats (🔴 "rider waiting … — please reply now", ⚠ hand-overs,
+  ℹ information). The team reads the chat itself. Hand-overs work as before: the chat is assigned to you and re-opened,
+  so it still shows up in your inbox — just without the note.
+* Settings → Intercom → Bot brain → "internal notes in Intercom" switches them back on (off by default).
+
 ## 9.1.1 — Slack messages carry the order's timeline
 
 * Every Slack message now shows: Received (when the order arrived in our system) · Dispatched (offered to riders) ·

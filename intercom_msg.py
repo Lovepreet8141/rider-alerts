@@ -60,6 +60,7 @@ class Intercom:
         self.threads: dict = self._load()
         self.status = {"checked": 0, "ok": False, "admin_name": "", "error": ""}
         self.hint_lookup = None          # rider id -> Intercom email / contact id typed in Settings
+        self.notes_on = lambda: True     # internal notes in the chat (the dashboard sets this from Settings → Bot brain)
         self._link_attr = None           # resolved lazily: the "Worker dashboard profile link" attribute
         self.on_match = None             # (rider_id, contact) -> remember the Intercom username for the dashboard
         self.rider_known = None          # rider_id -> bool (is this a MotionTools rider id the dashboard knows?)
@@ -645,7 +646,7 @@ class Intercom:
 
     async def escalate(self, conversation_id: str, note: str, team_id: str = "") -> bool:
         """A rider's reply needs a human: hand the conversation to the main inbox (a team if given, otherwise the
-        sending teammate's own inbox), re-open it and leave an internal note so the dispatcher sees why."""
+        sending teammate's own inbox), re-open it and — if notes are switched on — leave an internal note why."""
         if not conversation_id or not self.enabled:
             return False
         try:
@@ -666,7 +667,7 @@ class Intercom:
                 await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": "0"})
                 await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "assignment", "type": "admin", "admin_id": self.admin, "assignee_id": self.admin})
             await self.call("POST", f"/conversations/{conversation_id}/parts", {"message_type": "open", "type": "admin", "admin_id": self.admin})
-            if note:
+            if note and self.notes_on():
                 await self.call("POST", f"/conversations/{conversation_id}/reply", {"message_type": "note", "type": "admin", "admin_id": self.admin, "body": _html(note)})
             return True
         except HTTPException:

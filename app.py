@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.1.1"
+VERSION = "9.1.2"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1941,6 +1941,7 @@ def _automations_payload() -> dict:
             "master": ic_master(settings),
             "bot": {"wait_more": settings.get("bot_wait_more") or "10", "wait_total": settings.get("bot_wait_total") or "20",
                     "unreach_min": settings.get("bot_unreach_min") or "10", "translate": settings.get("bot_translate", "1") == "1",
+                    "notes": settings.get("bot_notes", "0") == "1",
                     "ai_notes": settings.get("ai_notes") or "", "ai": brain.stats()},
             "received": list(intercom.ic.webhooks)[:60],
             "mode": "live" if intercom.ic.enabled else "dry-run", "recent": store.auto_recent(200), "quiet_hours": "", "daily_cap": 0}
@@ -2082,6 +2083,8 @@ async def api_automations_set(request: Request):
                 pass
     if "translate" in bot:
         vals["bot_translate"] = "1" if bot["translate"] else "0"
+    if "notes" in bot:
+        vals["bot_notes"] = "1" if bot["notes"] else "0"
     if isinstance(bot.get("ai_notes"), str):
         vals["ai_notes"] = bot["ai_notes"].strip()[:1500]
     if "close" in body:
@@ -2541,9 +2544,9 @@ async def _flow_note(rid: str, conv: str, note: str, o=None) -> bool:
     """An internal note for the team that changes nothing else: no re-assignment, no re-opening (information only)."""
     name = STATE["riders"].get(rid, {}).get("name") or "Rider"
     full = f"ℹ {name}: {note}\n{_order_ctx(o)}"
-    BOT_SENT.append((time.time(), _norm(full))); del BOT_SENT[:-300]
-    if not intercom.ic.enabled or not conv:
+    if not intercom.ic.enabled or not conv or not _ic_notes_on():
         return False
+    BOT_SENT.append((time.time(), _norm(full))); del BOT_SENT[:-300]
     try:
         if not await intercom.ic.resolve_admin():
             return False
@@ -3294,6 +3297,15 @@ intercom.ic.on_unknown = lambda cid, name, text, conv="": asyncio.create_task(_u
 intercom.ic.rider_from_text = _rider_from_text
 intercom.ic.auto_team_name = store.get_settings().get("intercom_auto_team", "")
 intercom.ic.auto_close = store.get_settings().get("intercom_auto_close") == "1"
+
+
+def _ic_notes_on() -> bool:
+    """Settings → Bot brain → "internal notes in Intercom". OFF by default: the team reads the chat itself;
+    hand-overs still assign and re-open the conversation, just without the yellow note."""
+    return store.get_settings().get("bot_notes", "0") == "1"
+
+
+intercom.ic.notes_on = _ic_notes_on
 
 
 @app.post("/api/intercom/match-riders", dependencies=[Depends(require_login)])
