@@ -117,7 +117,7 @@ class SlackNotifier:
             t.append("On hold (not dispatched yet)")
         if o.get("picked_up_at"):
             t.append(f"Picked up {self.hm(o['picked_up_at'])}")
-        elif o.get("eta_restaurant") and not cancelled and o.get("rider_id"):
+        elif o.get("eta_restaurant") and not cancelled:              # on hold: when the food is planned to be ready
             t.append(f"Pickup ~{self.hm(o['eta_restaurant'])}")
         plan = self._plan(o)
         if plan:
@@ -151,9 +151,11 @@ class SlackNotifier:
             ph = o.get("phase")
             if "new" in c["events"] and not p.get("new") and fresh and ph not in ("cancelled", "delivered", "closed"):
                 pre = self._pre_order(o, now)
-                # wait until MotionTools offers the order to riders, so the message carries the dispatch time
-                # (usually seconds; at most ~4 min). Pre-orders are posted at once — they stay on hold for a long time.
-                ready = o.get("dispatched_at") or pre or (o.get("created_at") and now - o["created_at"] >= timedelta(minutes=4))
+                # post as soon as the order arrives — only wait for MotionTools' first ETAs (seconds after creation)
+                # so pickup / planned delivery are in the message; never longer than 1 minute. An order still
+                # "On hold" (food preparation, pre-order) says so; ⚠️ later carries its dispatch time.
+                has_eta = self._plan(o) or o.get("eta_restaurant")
+                ready = has_eta or o.get("dispatched_at") or (o.get("created_at") and now - o["created_at"] >= timedelta(minutes=1))
                 if ready:
                     text = (f"🆕 {'Pre-order' if pre else 'New order'} — {self._line(o)}\n"
                             f"{self._times(o, now)}\n{self._rider(o)}{self._km(o)}")

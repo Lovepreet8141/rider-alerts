@@ -23,6 +23,14 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.3 — Slack 🆕 right when the order arrives
+
+* 🆕 no longer waits for MotionTools to dispatch the order (that made it 2–4 min late, e.g. TW343W: food preparation,
+  on hold 16:47 → auto-dispatch 16:57). It is posted within ~20 seconds of arrival, as soon as MotionTools' first ETAs
+  are in (never later than 1 min).
+* The message says "Dispatched HH:MM" when the order was dispatched at once, otherwise "On hold (not dispatched yet)"
+  with the pickup time (food ready). ⚠️ no rider still carries the dispatch time.
+
 ## 9.1.2 — no more yellow notes in Intercom
 
 * The bot no longer writes internal notes into rider chats (🔴 "rider waiting … — please reply now", ⚠ hand-overs,
