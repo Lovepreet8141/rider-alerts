@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.1.4"
+VERSION = "9.1.5"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1483,8 +1483,12 @@ async def api_slack_save(request: Request):
         mins = str(max(1, min(120, int(b.get("no_rider_min") or 5))))
     except (TypeError, ValueError):
         mins = "5"
-    ev = ",".join(e for e in ("new", "norider", "cancel") if e in (b.get("events") or []))
-    store.set_settings({"slack_restaurants": names, "slack_no_rider_min": mins, "slack_events": ev})
+    try:
+        rest = str(max(1, min(120, int(b.get("rest_min") or 10))))
+    except (TypeError, ValueError):
+        rest = "10"
+    ev = ",".join(e for e in ("new", "norider", "rest", "cancel") if e in (b.get("events") or []))
+    store.set_settings({"slack_restaurants": names, "slack_no_rider_min": mins, "slack_rest_min": rest, "slack_events": ev})
     return slack.status(list(STATE["orders"].values()))
 
 

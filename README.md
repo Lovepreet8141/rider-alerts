@@ -23,6 +23,13 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.5 — Slack: rider accepted but not at the restaurant
+
+* New Slack message for priority restaurants: 🕐 a rider ACCEPTED the order but is still not at the restaurant
+  10 min later (rider, when he accepted, his ETA at the restaurant, the order's timeline). Once per rider: if another
+  rider takes the order over, he gets his own 10 minutes. Orders nobody accepted stay with ⚠️ no rider.
+* Settings → Slack: "🕐 rider accepted but not at the restaurant after [10] min" (on; minutes adjustable).
+
 ## 9.1.4 — short number message · no "marked as delivered" message · 3 misreads fixed
 
 * The customer's-number message is short now (number, street + house number, the customer's notes, then):

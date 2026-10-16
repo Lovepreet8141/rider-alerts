@@ -5,7 +5,8 @@
     MotionTools: the dashboard never contacts MotionTools.
   * Which orders: a restaurant name containing one of the names in the list (case and ®/™ ignored),
     e.g. "REWE" matches "REWE Markt Göttingen".
-  * What: 🆕 new order · ⚠️ no rider after N minutes · ❌ cancelled — each once per order. No customer data.
+  * What: 🆕 new order · ⚠️ no rider after N minutes · 🕐 rider accepted but not at the restaurant N minutes later ·
+    ❌ cancelled — each once per order. No customer data.
     Every message carries the timeline: Received (arrived in our system) · Dispatched (offered to riders) ·
     Pickup · Planned delivery, plus the rider (and when he accepted) and the distance when known.
 """
@@ -41,6 +42,11 @@ class SlackNotifier:
             self.posted = json.loads(store.get_settings().get("slack_posted") or "{}")
         except Exception:
             self.posted = {}
+        s = store.get_settings()                  # 9.1.5, once: the new "no rider at the restaurant" message starts switched on
+        if s.get("slack_events") and s.get("mig_slack_rest") != "1" and "rest" not in s["slack_events"].split(","):
+            store.set_settings({"slack_events": s["slack_events"] + ",rest", "mig_slack_rest": "1"})
+        elif s.get("mig_slack_rest") != "1":
+            store.set_settings({"mig_slack_rest": "1"})
 
     # ---- settings
     def cfg(self) -> dict:
@@ -50,8 +56,12 @@ class SlackNotifier:
             norider = max(1, int(s.get("slack_no_rider_min") or 5))
         except ValueError:
             norider = 5
-        events = set((s.get("slack_events") or "new,norider,cancel").split(","))
-        return {"names": names, "no_rider_min": norider, "events": events, "on": bool(WEBHOOK) and bool(names)}
+        try:
+            rest = max(1, int(s.get("slack_rest_min") or 10))
+        except ValueError:
+            rest = 10
+        events = set((s.get("slack_events") or "new,norider,rest,cancel").split(","))
+        return {"names": names, "no_rider_min": norider, "rest_min": rest, "events": events, "on": bool(WEBHOOK) and bool(names)}
 
     def match(self, restaurant: str, names: list) -> str:
         r = _norm(restaurant)
@@ -166,7 +176,18 @@ class SlackNotifier:
                 if c["no_rider_min"] <= waited < 180:
                     if await self.send(f"⚠️ No rider for {int(waited)} min — {self._line(o)}\n{self._times(o, now)}"):
                         p["norider"] = time.time(); self._dirty = True
-            if "cancel" in c["events"] and not p.get("cancel") and ph == "cancelled" and (p.get("new") or p.get("norider")):
+            # a rider ACCEPTED the order but is still not at the restaurant N min later (once per rider: a new rider who
+            # takes the order over gets his own N minutes)
+            rkey = f"rest:{o.get('rider_id')}"
+            if ("rest" in c["events"] and o.get("rider_id") and o.get("accepted_at") and not p.get(rkey)
+                    and not o.get("at_restaurant_at") and not o.get("picked_up_at") and ph in ("accepted", "to_restaurant")):
+                waited = (now - o["accepted_at"]).total_seconds() / 60
+                if c["rest_min"] <= waited < 180:
+                    eta = f" · his ETA at the restaurant {self.hm(o['eta_restaurant'])}" if o.get("eta_restaurant") else ""
+                    if await self.send(f"🕐 Not at the restaurant {int(waited)} min after accepting — {self._line(o)}\n"
+                                       f"Rider {o.get('rider') or '?'} accepted {self.hm(o['accepted_at'])}{eta}\n{self._times(o, now)}"):
+                        p[rkey] = time.time(); self._dirty = True
+            if "cancel" in c["events"] and not p.get("cancel") and ph == "cancelled" and any(p.get(k) for k in p if k != "cancel"):
                 why = o.get("cancel_reason") or ""
                 text = (f"❌ Cancelled {self.hm(now)} — {self._line(o)}\n{self._times(o, now, cancelled=True)}"
                         + (f" · Rider {o['rider']}" if o.get("rider") else "") + (f"\nReason: {why}" if why else ""))
@@ -187,6 +208,6 @@ class SlackNotifier:
             if n:
                 seen.setdefault(o.get("restaurant"), 0)
                 seen[o.get("restaurant")] += 1
-        return {"webhook_set": bool(WEBHOOK), "names": c["names"], "no_rider_min": c["no_rider_min"], "events": sorted(c["events"]),
+        return {"webhook_set": bool(WEBHOOK), "names": c["names"], "no_rider_min": c["no_rider_min"], "rest_min": c["rest_min"], "events": sorted(c["events"]),
                 "matching_now": sorted(({"restaurant": k, "orders": v} for k, v in seen.items()), key=lambda x: -x["orders"])[:30],
                 **self.stats}
