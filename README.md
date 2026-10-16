@@ -23,6 +23,19 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.1.4 — short number message · no "marked as delivered" message · 3 misreads fixed
+
+* The customer's-number message is short now (number, street + house number, the customer's notes, then):
+  "Call, ring the bell, ask the neighbours. Wait there 10 min. ⚠️ Don't mark it delivered without handing the food to
+  the customer. No answer? Write us here." The keep-trying follow-ups are shorter too.
+* "We see order X is marked as delivered. Please send us a photo…" is switched OFF (once, also where it was saved as on).
+  Settings → Intercom → answers → "q:proof_photo" switches it back on.
+* A photo with "Delivered" / "code 02" (or of an order that is already delivered) → "Thanks, got the photo." instead of
+  "What is it about?" (or no answer at all).
+* "Two orders at the same restaurant — please combine them" → "A teammate is checking if you can take both orders"
+  (was read as "restaurant closed" because of the German word "zu").
+* "The order takes half an hour because of traffic" after pickup → "Thanks, noted." (was read as "food not ready").
+
 ## 9.1.3 — Slack 🆕 right when the order arrives
 
 * 🆕 no longer waits for MotionTools to dispatch the order (that made it 2–4 min late, e.g. TW343W: food preparation,

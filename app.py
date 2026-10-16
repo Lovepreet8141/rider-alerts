@@ -34,7 +34,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from events import DISPATCHED, SEEN_MAX, Projector, event_key
 from mt import ACTIVE_STATUSES, LIST_PATHS, PLACE_PATH, USER_PATH, MotionTools
 import brain
-from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, TEXTS_VERSION, classify, classify_burst, render_query
+from replies import RiderFlows, QUERIES, QUERY_DEFAULT, INTENT_LABEL, TEXTS_VERSION, DEFAULT_OFF, classify, classify_burst, render_query
 from orders import BERLIN, UTC, RiderTracker, Rules, evaluate, hhmm, iso, leg_stillness, mins, on_time, parse_booking, phase_from, phase_minutes, planned_at, restaurant_waits, ts
 import store as store_mod
 from store import Store, day_key, day_start
@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.1.3"
+VERSION = "9.1.4"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1932,7 +1932,7 @@ def _automations_payload() -> dict:
                        "cities": sorted(rule_cities_enabled(k, settings)), **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in AUTOMATIONS],
             "intercom": {"enabled": intercom.ic.enabled, "ok": st.get("ok"), "admin": st.get("admin_name"), "error": st.get("error"), "region": intercom.ic.region,
                          "host": intercom.ic.base, "token_len": len(intercom.ic.token), "token_hint": (intercom.ic.token[:4] + "…") if intercom.ic.token else "", "admin_id": intercom.ic.admin, "link_attr": intercom.ic._link_attr or "", "auto_team": (intercom.ic._auto_team or ("", ""))[1], "auto_team_name": intercom.ic.auto_team_name, "auto_close": intercom.ic.auto_close},
-            "queries": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}", "1") == "1",
+            "queries": [{"key": k, "trigger": t, "message": settings.get(f"auto_text:{k}") or m, "default": m, "on": settings.get(f"auto:{k}", "0" if k in DEFAULT_OFF else "1") == "1",
                          **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in QUERIES],
             "cities": {"all": sorted({city_of(o) for o in list(STATE["orders"].values()) if city_of(o)} | set(store.city_map.values()) if hasattr(store, "city_map") else set()),
                        "on": sorted(auto_cities_enabled(settings))},
@@ -2626,6 +2626,19 @@ def _migrate_texts():
 
 
 _migrate_texts()
+
+
+def _migrate_short_number():
+    """9.1.4, once: the short number / keep-trying texts become active (an older saved copy is dropped) and the
+    "we see order X is marked as delivered — send a photo" message is switched off. Both can be changed again in Settings."""
+    s = store.get_settings()
+    if s.get("mig_short_number") == "1":
+        return
+    keys = ("q:phone_number", "q:phone_number_find", "q:keep_trying", "q:keep_trying_find")
+    store.set_settings({**{f"auto_text:{k}": "" for k in keys}, "auto:q:proof_photo": "", "mig_short_number": "1"})
+
+
+_migrate_short_number()
 CUSTOMER_INTENTS = ("customer_unreachable", "customer_phone", "customer_find", "customer_problem", "call_failed")
 BURST_WAIT = float(env("BOT_BURST_SECONDS", "6") or 6)   # messages within these seconds are read together
 BURSTS: dict = {}

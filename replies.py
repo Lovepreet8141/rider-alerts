@@ -69,14 +69,14 @@ QUERIES = [
     ("q:phone_app", "Rider asks for the customer's number → call from the app",
      "Please call the customer with the call button on the customer stop in your app. If the call doesn't go through, check that your own phone number in the app profile is correct, then try again."),
     ("q:phone_number", "Calling through the app doesn't work → number, house number and notes (only to the assigned rider)",
-     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nPlease call now and wait there for at least 10 minutes: keep calling, ring the bell, ask the neighbours, check the entrance.\nImportant: only mark the order as delivered when you hand the food to the customer. If you can't find or reach the customer, do NOT mark it as delivered. Write here and we'll tell you what to do. We need a photo of the food handover to the customer."),
+     "Customer's number: {phone}\nAddress: {address}\nNotes: {notes}\nCall, ring the bell, ask the neighbours. Wait there 10 min.\n⚠️ Don't mark it delivered without handing the food to the customer. No answer? Write us here."),
     ("q:phone_number_find", "Rider can't FIND the customer → number + how to find him (only to the assigned rider)",
-     "Here's the customer's number: {phone}\nAddress: {address}\nCustomer's notes: {notes}\nTo find the customer: check the entrance and the building (some have more than one entrance), look for the customer's name from your app on the doorbells, and ask the neighbours if you can. Call the customer and wait there for at least 10 minutes.\nImportant: only mark the order as delivered when you hand the food to the customer. If you can't find or reach the customer, do NOT mark it as delivered. Write here and we'll tell you what to do. We need a photo of the food handover to the customer."),
+     "Customer's number: {phone}\nAddress: {address}\nNotes: {notes}\nCheck all entrances and the names on the doorbells, ask the neighbours. Call and wait there 10 min.\n⚠️ Don't mark it delivered without handing the food to the customer. Can't find them? Write us here."),
     ("q:keep_trying", "Number already sent, rider writes again → keep trying for the minutes left (never the number twice)",
-     "Please keep trying for {left} more minutes: call the customer, ring the bell, ask the neighbours and check the entrance. Don't mark the order as delivered without handing it over. If nobody answers by then, a teammate will tell you what to do with the order."),
+     "Please keep trying {left} more min: call, ring the bell, ask the neighbours.\n⚠️ Don't mark it delivered without handing the food over. No answer by then? A teammate will tell you what to do."),
     ("q:keep_trying_find", "Can't find the customer, number already sent → keep looking for the minutes left",
-     "Please keep looking for {left} more minutes: check the entrances and the building, look for the customer's name on the doorbells, ask the neighbours and keep calling. Don't mark the order as delivered without handing it over. If you still can't find the customer, a teammate will tell you what to do."),
-    ("q:proof_photo", "Order marked delivered after we sent the customer's number → handover photo",
+     "Please keep looking {left} more min: all entrances, the doorbell names, the neighbours, and keep calling.\n⚠️ Don't mark it delivered without handing the food over. Still not found? A teammate will tell you what to do."),
+    ("q:proof_photo", "Order marked delivered after we sent the customer's number → ask for a handover photo (off by default)",
      "We see order {ref} is marked as delivered. Please send us a photo of the food handover to the customer now."),
     ("q:proof_thanks", "Handover photo received",
      "Thanks, got the photo."),
@@ -100,6 +100,8 @@ QUERIES = [
      "Okay, thanks for telling us. What's the reason? For example: food not ready, restaurant closed, customer not answering, or a problem with your bike or car."),
     ("q:urgent", "Accident, injury, police, danger",
      "If anyone is hurt or in danger, call 112 now. A teammate is taking over your chat right now."),
+    ("q:combine", "Rider has two orders at the same restaurant and wants both → a teammate decides",
+     "Thanks. A teammate is checking if you can take both orders and will reply here."),
     ("q:handover", "Anything a teammate has to decide",
      "A teammate has your case and will reply here in a few minutes. Please stay where you are."),
     ("q:holding", "Rider is waiting and writes '?', 'hello' … (once every few minutes)",
@@ -127,7 +129,7 @@ YES = ("ok", "okay", "oke", "ja", "yes", "yeah", "yep", "sure", "fine", "alles k
 NO = ("nein", "no ", "nope", "nicht warten", "not wait", "can't wait", "cant wait", "cannot wait", "kann nicht warten", "cancel", "stornier",
       "zurückgeben", "zurueckgeben", "hand back", "give back", "leave", "gehe jetzt", "i go", "ich gehe", "nahi", "nai", "لا ", "لا أستطيع", "hayır", "hayir", "yok")
 URGENT = ("unfall", "accident", "verletzt", "injur", "hurt", "polizei", "police", "crash", "ambulance", "krankenwagen", "hospital", "krankenhaus")
-CLOSED = ("لا يوجد احد في المطعم", "لا يوجد أحد في المطعم", "nobody at the restaurant", "no one at the restaurant", "niemand im restaurant", "geschlossen", "closed", " zu.", " zu ", "locked", "nobody there", "niemand da", "niemand hier", "not open", "nicht offen", "nicht geöffnet", "shut",
+CLOSED = ("لا يوجد احد في المطعم", "لا يوجد أحد في المطعم", "nobody at the restaurant", "no one at the restaurant", "niemand im restaurant", "geschlossen", "closed", "zugemacht", "macht zu", "locked", "nobody there", "niemand da", "niemand hier", "not open", "nicht offen", "nicht geöffnet", "shut",
           "مغلق", "kapalı", "kapali", "band hai", "closed restaurant", "restaurant closed")
 NO_ORDER = ("does not have this order", "doesn't have this order", "does not have the order", "doesn't have the order", "not have this order",
             "hat diese bestellung nicht", "hat die bestellung nicht", "hat keine bestellung", "kennt die bestellung nicht", "ليس لديهم الطلب", "ما عندهم الطلب",
@@ -176,8 +178,10 @@ REFUSED = ("didn't order", "did not order", "didnt order", "never ordered", "not
 ACK = ("arrived", "angekommen", "at location", "im here", "i'm here", "i am here", "bin da", "bin hier", "on the way", "on my way", "unterwegs", "coming",
        "komme", "moving", "fahre", "fahre los", "thanks", "thank you", "danke", "done", "delivered", "geliefert", "ausgeliefert", "started", "gestartet",
        "all good", "alles gut", "no problem", "kein problem", "im moving", "i'm moving", "going", "jetzt")
-EXCUSE = ("traffic", "stau", "verfahren", "lost", "wrong way", "falsch gefahren", "rain", "regen", "umleitung", "detour", "road closed", "straße gesperrt",
+EXCUSE = ("traffic", "verkehr", "stau", "verfahren", "lost", "wrong way", "falsch gefahren", "rain", "regen", "umleitung", "detour", "road closed", "straße gesperrt",
           "red light", "ampel", "slow", "langsam")
+COMBINE = ("zusammenfassen", "zusammenlegen", "zusammen legen", "beide bestellungen", "beide aufträge", "zwei bestellungen", "zwei aufträge",
+           "both orders", "two orders", "combine", "merge the orders", "both the orders", "طلبين", "الطلبين", "iki sipariş")
 HELLO = ("hello", "hallo", "hi", "hey", "salam", "selam", "good evening", "guten abend", "guten tag", "help", "hilfe", "problem", "question", "frage", "مرحبا", "السلام")
 
 
@@ -218,6 +222,15 @@ MIN_IN_TEXT = re.compile(r"(\d{1,3})\s*(?:min|mins|minute|minutes|minuten|m\b|')
 
 def _has(low: str, words) -> bool:
     return any(w in low for w in words)
+
+
+# German "zu" = closed only as "(das Restaurant) ist zu / hat zu / sind schon zu" — not "zu einer Bestellung", "ist zu spät"
+_ZU_CLOSED = re.compile(r"(?<![a-zäöüß])(ist|hat|sind|haben|schon|noch|laden|restaurant|tür|tuer)\s+(schon\s+|noch\s+)?zu(?![a-zäöüß])"
+                        r"(?!\s+(spät|spaet|weit|lang|lange|viel|wenig|früh|frueh|klein|groß|gross|teuer|schwer|kalt|heiß|heiss|voll|einer|einem|den|dem|der|die|das)\b)")
+
+
+def _closed(low: str) -> bool:
+    return _has(low, CLOSED) or bool(_ZU_CLOSED.search(low))
 
 
 _WORD = re.compile(r"[a-zäöüß]+", re.I)
@@ -384,7 +397,9 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "item_missing"
     if _has(low, NO_ORDER) and not (_has(low, CUSTOMER) and _has(low, UNREACH)) and not _has(low, PHONE):
         return "no_order"
-    if _has(low, CLOSED) and not _has(low, ("door", "tür", "tuer")) and not _has_word(low, ROAD):
+    if _has(low, COMBINE):
+        return "combine"                                    # "two orders at the same restaurant — please combine them"
+    if _closed(low) and not _has(low, ("door", "tür", "tuer")) and not _has_word(low, ROAD):
         return "closed"
     if _has(low, READY) and not _has(low, NOT_READY_GUARD):
         return "ready"
@@ -405,6 +420,8 @@ def classify(text: str, has_photo: bool = False, tags=None) -> str:
         return "customer_phone"
     if _has(low, CANT):
         return "cant_deliver"
+    if _has_word(low, ("traffic", "verkehr", "stau", "زحمة", "trafik")):
+        return "excuse"                                     # "takes half an hour because of heavy traffic" = delay on the road
     if _has(low, NOT_READY) and not _has(low, CUSTOMER) and not _has_word(low, ("no", "nein", "nope")):
         return "not_ready"
     if _has(low, CANCEL) and not _has(low, CUSTOMER):
@@ -458,7 +475,7 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
                 "item_missing": "item not available", "cant_deliver": "can't do the delivery", "customer_unreachable": "customer doesn't answer",
                 "customer_find": "can't find the address", "customer_phone": "asked for the customer's number", "call_failed": "can't call through the app",
                 "liefercode": "Liefercode problem", "customer_problem": "customer refuses / problem", "forgot_finish": "forgot to finish in the app",
-                "damaged": "order damaged", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
+                "damaged": "order damaged", "combine": "wants two orders combined", "other": "unclear", "ack": "confirmed", "excuse": "delay explained", "urgent": "URGENT", "photo": "photo",
                 "yes": "yes", "no": "no", "minutes": "minutes", "ready": "ready", "order_ref": "order number only", "remove_order": "wants the order removed",
                 "returned": "gave the order back to the restaurant", "cant_go_online": "can't go online in the app",
                 "no_new_orders": "gets no new orders", "compensation": "asks for compensation / extra pay",
@@ -466,7 +483,7 @@ INTENT_LABEL = {"nudge": "waiting for an answer ('?')", "not_ready": "food not r
 
 
 # ----------------------------------------------------------------------------- the flow engine
-HANDOVER_KEYS = ("q:no_new_orders", "q:compensation", "q:handover", "q:handover_restaurant", "q:holding", "q:no_order", "q:item_missing", "q:remove_order", "q:urgent",
+HANDOVER_KEYS = ("q:combine", "q:no_new_orders", "q:compensation", "q:handover", "q:handover_restaurant", "q:holding", "q:no_order", "q:item_missing", "q:remove_order", "q:urgent",
                  "q:customer_refuses", "q:photo_thanks", "q:not_ready_check")
 
 
@@ -593,7 +610,7 @@ class RiderFlows:
         return out
 
     def on(self, key: str) -> bool:
-        return self.deps["settings"]().get(f"auto:{key}", "1") == "1"
+        return self.deps["settings"]().get(f"auto:{key}", "0" if key in DEFAULT_OFF else "1") == "1"
 
     def _cfg(self, key: str, default: int) -> int:
         try:
@@ -701,6 +718,10 @@ class RiderFlows:
         self.last_ai[rid] = ai
         if named is not None and intent in ("other", "nudge") and len(joined.split()) <= 3:
             intent = "order_ref"
+        # a photo with "Delivered" / "code 02" (or of an order that is already delivered) = his delivery photo → "thanks"
+        if has_photo and intent in ("ack", "yes", "other") and o is not None and (
+                o.get("phase") in ("delivered", "closed") or any(w in (joined or "").lower() for w in DELIVERED_WORDS)):
+            intent = "photo"
         self.last_intent[rid] = intent
         d["log"](rid, o, f"reply:{intent}", joined[:300] or "📷 photo")
 
@@ -977,8 +998,13 @@ class RiderFlows:
     async def _new(self, rid, conv, o, intent, ai, text, has_photo, in_auto, last_ops_auto) -> str:
         d = self.deps
         ref = (o or {}).get("ref", "")
+        if intent == "not_ready" and o is not None and o.get("phase") in ("to_customer", "at_customer"):
+            intent = "excuse"                          # he already has the food: "it takes 30 min" is a delay on the road
         if intent == "not_ready":
             return await self._restaurant(rid, conv, o, ai.get("minutes_needed"), ai, insist=False)
+        if intent == "combine":
+            await self._hand_over(rid, conv, o, f"🔁 two orders at {(o or {}).get('restaurant') or 'the same restaurant'} — wants both combined", key="q:combine")
+            return "wants two orders combined → teammate"
         if intent == "minutes" and o is not None and o.get("phase") in ("at_restaurant", "to_restaurant", "accepted"):
             m = NUM_RE.match(text.split("\n")[-1])
             return await self._restaurant(rid, conv, o, int(m.group(1)) if m else None, ai)
@@ -1047,6 +1073,11 @@ class RiderFlows:
             self.set(rid, "await_photo", "", 10, kind="damaged", conv=conv, ref=ref)
             return "photo of the damage asked"
         if intent == "photo":                          # a photo alone says nothing yet — ask, don't park the chat with the team
+            low = (text or "").lower()
+            if o is not None and (o.get("phase") in ("delivered", "closed") or any(w in low for w in DELIVERED_WORDS)):
+                await self._send(rid, conv, "q:proof_thanks", o)             # delivery / handover photo: just thank him
+                o["query_flag"] = o.get("query_flag") or "delivery photo sent by the rider"
+                return "delivery photo → thanks"
             await self._send(rid, conv, "q:photo_what_known" if o is not None else "q:photo_what", o)   # known order: don't ask for it
             self.set(rid, "other_wait", "", 30, conv=conv, ref=ref)
             return "photo without text → asked what it is about"
@@ -1071,7 +1102,7 @@ class RiderFlows:
         if intent == "excuse":
             if o is not None:
                 o["excuse"] = text[:120]
-            if in_auto or last_ops_auto:
+            if in_auto or last_ops_auto or (o is not None and o.get("phase") in ("to_customer", "at_customer")):
                 await self._send(rid, conv, "q:noted", o)
                 return "noted"
             return "ignored (reply to a person)"
@@ -1262,6 +1293,11 @@ def kw_reason(text: str) -> str:
             return line.strip()[:120]
     return ""
 
+
+DEFAULT_OFF = {"q:proof_photo"}      # answers that stay off until switched on in Settings
+# a photo sent with one of these words is a delivery / handover photo (rider's own order) → just "thanks"
+DELIVERED_WORDS = ("delivered", "geliefert", "zugestellt", "übergeben", "abgegeben", "liefercode", "code", "تم التوصيل", "تم التسليم",
+                   "سلمت", "teslim edildi", "teslim ettim", "entregado", "consegnato", "livré", "доставлен", "डिलीवर")
 
 _LABEL_LINE = re.compile(r"^[^{}\n]*:\s*\{(\w+)\}[ \t.]*$")
 
