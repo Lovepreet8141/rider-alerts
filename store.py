@@ -1286,9 +1286,19 @@ class Store:
             hb[r["rider_id"]] = (r["n"] or 0, r["exc"] or 0)
         # usual = deliveries per worked day in the 28 days before the period
         u1, u2 = day_key(start - timedelta(days=28)), day_key(start - timedelta(days=1))
-        usual = {r["rider_id"]: round(r["n"] / r["days"], 1) for r in self._rows(
-            "SELECT rider_id, COUNT(*) AS n, COUNT(DISTINCT day) AS days FROM orders WHERE phase='delivered' AND day >= ? AND day <= ? "
-            "AND rider_id IS NOT NULL AND rider_id != '' GROUP BY rider_id", (u1, u2)) if r["days"]}
+        memo = getattr(self, "_usual_memo", None)
+        if memo is None:
+            memo = self._usual_memo = {}
+        hit = memo.get((u1, u2))
+        if hit and time.time() - hit[0] < 3600:                 # 4 finished weeks: read once an hour, not on every refresh
+            usual = hit[1]
+        else:
+            usual = {r["rider_id"]: round(r["n"] / r["days"], 1) for r in self._rows(
+                "SELECT rider_id, COUNT(*) AS n, COUNT(DISTINCT day) AS days FROM orders WHERE phase='delivered' AND day >= ? AND day <= ? "
+                "AND rider_id IS NOT NULL AND rider_id != '' GROUP BY rider_id", (u1, u2)) if r["days"]}
+            memo[(u1, u2)] = (time.time(), usual)
+            if len(memo) > 20:
+                memo.pop(next(iter(memo)))
         shifts = {}
         for s in self.shifts_between(d1, d2, city=city, fleet=fleet):
             shifts.setdefault(s["rider_id"], {})[s["day"]] = s

@@ -23,6 +23,30 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.4.0 — one dashboard, one design
+
+* Every page now has the premium look of /v2: the same left sidebar everywhere (Now · City board · Performance ·
+  Restaurants · Riders & fleets · Orders · Intercom bot · Reports · Settings, and under More: Shifts & scores ·
+  Fleet scorecard · Insights), keys 1–9 switch pages from anywhere, page titles, cards, buttons, tables, dialogs
+  and the messages drawer in the same colours and type.
+* The city you pick travels with you between the live pages and Performance / Restaurants / Riders.
+* Phones: a bottom bar (Now · City · Performance · Orders · Menu) and a menu with every page.
+* Nothing changed in what the pages do — every button, filter, export and setting works as before (all tests pass).
+* Always dark (the light/dark switch is gone).
+
+## 9.3.1 — /v2 fast: every finished day is counted once
+
+* The new dashboard was slow because every period or city you clicked re-read the last 30 days of orders (~150 000)
+  for the trend line and the heatmap. Now each finished day is aggregated ONCE (per city × hour) and kept in memory and
+  on disk (table day_cube); a month, a city or a comparison is a sum of ~30 small tables. Only today is read live.
+  Measured on 156 000 orders: Performance month 2.2 s → 0.03 s, Restaurants month 10 s → 0.04 s, any city ~5 ms.
+* After a deploy the last 9 weeks are prepared in the background (first time ~1–2 min, then loaded from disk).
+* One restaurant's orders use a new index (created in the background after the start).
+* ⌘K searches restaurants in memory; riders' "usual" is read once an hour; week/month rider tables refresh every 2 min.
+* Lighter page: no background blur (it repainted the page on every scroll); the other pages are fetched in advance,
+  so switching between Performance, Restaurants and Riders is instant.
+* /health shows v2_cube_days.
+
 ## 9.3.0 — the new premium dashboard at /v2 (new files: app.html, analytics.py)
 
 * Open **/v2** (same login). Three pages on your real data, next to the current dashboard (which stays at /):

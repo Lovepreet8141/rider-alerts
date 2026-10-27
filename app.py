@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.3.0"
+VERSION = "9.4.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -448,8 +448,9 @@ def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True
         def wrapper(*a, **kw):
             key = (fn.__name__, a, tuple(sorted(kw.items())))
             period = str(kw.get("period") or kw.get("day") or "")
-            live = live_if(kw) if live_if else period in ("", "today")
-            ttl = ttl_live if live else ttl_past
+            lv = live_if(kw) if live_if else period in ("", "today")
+            live = bool(lv)
+            ttl = (float(lv) if not isinstance(lv, bool) and lv else ttl_live) if live else ttl_past
             max_stale = (ttl * 4 if live else 1800) if stale else ttl
             hit = _RCACHE.get(key)
             age = time.monotonic() - hit[0] if hit else None
@@ -1086,6 +1087,23 @@ def _gc_freeze():
         pass
 
 
+def prewarm_v2():
+    """/v2 after a start: the index for one restaurant's orders, the day cube of the last 9 weeks (each finished day
+    once, then kept on disk), and the three first views — so nobody waits for the first numbers."""
+    time.sleep(8)
+    try:
+        store._exec("CREATE INDEX IF NOT EXISTS ix_orders_rest_day ON orders(restaurant, day)")
+    except Exception as e:
+        log.warning("restaurant index: %s", e)
+    try:
+        analytics.warm(store, rules, datetime.now(UTC))
+        _v2_performance_data(period="today", city="", frm="", to="")
+        _v2_restaurants_data(period="today", city="", minutes=10, frm="", to="")
+        _v2_rider_stats(period="today", city="", fleet="", frm="", to="")
+    except Exception as e:
+        log.warning("v2 prewarm: %s", e)
+
+
 def prewarm_reports():
     """After a start, compute the reports people open first (all cities + the default city), one after another."""
     _gc_freeze()
@@ -1137,6 +1155,7 @@ async def post_start(now: datetime):
     except Exception as e:
         log.exception("repair failed: %s", e)
     loop.run_in_executor(None, prewarm_reports)        # in the background: the first visitor after a deploy doesn't wait
+    threading.Thread(target=prewarm_v2, daemon=True).start()
     try:
         total = 0
         while True:
@@ -3422,6 +3441,15 @@ def _v2_live_if(kw: dict) -> bool:
     return p in ("today", "week", "month") or p == today
 
 
+def _v2_rider_ttl(kw: dict):
+    """Riders: a single day that is today refreshes every 30 s; a week/month that includes today every 2 min (its
+    numbers barely move, the computation is the biggest of the page); past ranges are fixed."""
+    if not _v2_live_if(kw):
+        return False
+    p = kw.get("period") or "today"
+    return 30 if (p == "today" or (kw.get("frm") and kw.get("frm") == kw.get("to"))) else 120
+
+
 def _v2_range(period: str, frm: str, to: str, now: datetime) -> tuple:
     """(label for the PDF, start, end) of a named period or a custom from–to (operating days)."""
     from store import period_range
@@ -3503,37 +3531,47 @@ def api_v2_performance(period: str = "today", city: str = "", frm: str = Query("
 
 @report_cache(30, 600, live_if=_v2_live_if)
 def _v2_restaurants_data(period: str = "today", city: str = "", minutes: int = 10, frm: str = "", to: str = "") -> dict:
-    """The ranking: delivered orders from their stored wait (SQL), plus every not-delivered order that reached the
-    restaurant (cancelled after waiting, still waiting now) measured from its history exactly like the PDF."""
+    """The ranking from the day cube (each finished day aggregated once; delivered orders from their stored wait,
+    not-delivered ones measured from their history like the PDF) + today's not-delivered orders measured live."""
     from pdf_report import collect
+    from store import period_range
     now = datetime.now(UTC)
-    label, start, end = _v2_range(period, frm, to, now)
     m = max(1, min(120, int(minutes or 10)))
-    reached, long, hours = analytics.waits_from_columns(store, start, end, now, city, m)
-    stored, _ = store.orders_at_restaurant(period, now, city=city, min_wait=m, rng=(start, end), open_only=True)
-    seen, others = set(), []
-    for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at") and x["phase"] != "delivered"]:
-        if o.get("id") not in seen:
-            seen.add(o.get("id")); o.setdefault("city", city_of(o)); others.append(o)
-    extra = collect(others, m, start, end, now, label, city, None)
-    hrs = [0] * 24
-    for h, n in hours.items():
-        if 0 <= (h or 0) < 24:
-            hrs[h] += n
-    for g in extra["groups"]:
-        k = (g["restaurant"], g["city"])
-        x = long.setdefault(k, [0, 0.0, 0.0])
-        for r in g["rows"]:
-            w = int(str(r[7]).split()[0])
-            x[0] += 1; x[1] += w; x[2] = max(x[2], w)
-            try:
-                hrs[int(r[3][:2]) if r[3][:2].isdigit() else int(r[5][:2])] += 1
-            except (ValueError, TypeError, IndexError):
-                pass
-        reached[k] = max(reached.get(k, 0), g["of_all"] or 0)
+    P = analytics.resolve(period, now, frm, to)
+    reached, long, hrs = {}, {}, [0] * 24
+    for d in analytics._days(P["a"], P["b"]):
+        data = analytics.rest_day(store, d, P["today"], m, now)
+        for rest, cty, n in data["reached"]:
+            if not city or cty == city:
+                reached[(rest, cty)] = reached.get((rest, cty), 0) + n
+        for rest, cty, h, n, sm, mx in data["long"]:
+            if city and cty != city:
+                continue
+            x = long.setdefault((rest, cty), [0, 0.0, 0.0])
+            x[0] += n; x[1] += sm; x[2] = max(x[2], mx)
+            if h is not None and 0 <= h < 24:
+                hrs[h] += n
+    if P["has_today"]:                       # today's orders that are not delivered (still waiting, cancelled after waiting)
+        start, end = period_range(P["today"], now)
+        stored, _ = store.orders_at_restaurant("today", now, city=city, min_wait=m, rng=(start, end), open_only=True)
+        seen, others = set(), []
+        for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at") and x["phase"] != "delivered"]:
+            if o.get("id") not in seen:
+                seen.add(o.get("id")); o.setdefault("city", city_of(o)); others.append(o)
+        for g in collect(others, m, start, end, now, "today", city, None)["groups"]:
+            x = long.setdefault((g["restaurant"], g["city"]), [0, 0.0, 0.0])
+            for r in g["rows"]:
+                w = int(str(r[7]).split()[0])
+                x[0] += 1; x[1] += w; x[2] = max(x[2], w)
+                try:
+                    hrs[int(r[3][:2])] += 1
+                except (ValueError, TypeError, IndexError):
+                    pass
+            k = (g["restaurant"], g["city"])
+            reached[k] = max(reached.get(k, 0), g["of_all"] or 0)
     groups = sorted(({"restaurant": k[0], "city": k[1], "n": v[0], "of_all": reached.get(k, 0), "avg": round(v[1] / v[0]) if v[0] else None,
-                      "max": round(v[2]), "share": round(100 * v[0] / reached[k]) if reached.get(k) else None}
-                     for k, v in long.items() if v[0]), key=lambda g: (-g["n"], -(g["max"] or 0)))
+                      "max": round(v[2]), "share": min(100, round(100 * v[0] / reached[k])) if reached.get(k) else None}
+                     for k, v in long.items() if v[0]), key=lambda g: (-g["n"], -(g["max"] or 0), g["restaurant"]))
     n = sum(g["n"] for g in groups)
     tot_reached = sum(reached.values())
     longest = max(groups, key=lambda g: g["max"] or 0) if groups else None
@@ -3543,11 +3581,11 @@ def _v2_restaurants_data(period: str = "today", city: str = "", minutes: int = 1
     for g in groups:
         cities.setdefault(g["city"] or "?", {"city": g["city"] or "?", "n": 0, "reached": 0})["n"] += g["n"]
     for c in cities.values():
-        c["share"] = round(100 * c["n"] / c["reached"]) if c["reached"] else None
+        c["share"] = min(100, round(100 * c["n"] / c["reached"])) if c["reached"] else None
     return {"reached": tot_reached, "n": n, "avg": round(sum(v[1] for v in long.values()) / n) if n else None,
             "max": longest["max"] if longest else None, "share": round(100 * n / tot_reached) if tot_reached else None,
             "max_where": f"{longest['restaurant']} · {longest['city']}" if longest else "", "restaurants": len(groups),
-            "groups": groups[:400], "min_wait": m, "plabel": extra["plabel"], "where": extra["where"],
+            "groups": groups[:400], "min_wait": m, "where": city or "All cities",
             "by_hour": [{"hour": h, "n": hrs[h]} for h in range(10, 24)],
             "by_city": sorted((c for c in cities.values() if c["n"]), key=lambda c: -c["n"])[:30]}
 
@@ -3592,7 +3630,7 @@ def api_v2_restaurant(name: str = "", city: str = "", period: str = "today", min
             "by_hour": det["by_hour"], "weeks": det["weeks"], "slowest_hour": slow["hour"] if slow else None, "period": P}
 
 
-@report_cache(30, 600, live_if=_v2_live_if)
+@report_cache(30, 900, live_if=_v2_rider_ttl)
 def _v2_rider_stats(period: str = "today", city: str = "", fleet: str = "", frm: str = "", to: str = "") -> dict:
     now = datetime.now(UTC)
     if frm and to:
@@ -3728,6 +3766,14 @@ def api_v2_riders(period: str = "today", city: str = "", fleet: str = "", frm: s
     return out
 
 
+@report_cache(600, 600)
+def _v2_restaurant_list() -> list:
+    """Every restaurant of the last 14 days (busiest first) for ⌘K — read once every 10 minutes, searched in memory."""
+    rows = store._rows("SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE day >= ? AND restaurant IS NOT NULL AND restaurant != '' "
+                       "GROUP BY restaurant, city ORDER BY n DESC", (day_key(datetime.now(UTC) - timedelta(days=14)),))
+    return [(r["restaurant"], r["city"] or "", r["n"], (r["restaurant"] + " " + (r["city"] or "")).lower()) for r in rows]
+
+
 @app.get("/api/v2/search", dependencies=[Depends(require_login)])
 @fast_json
 def api_v2_search(q: str = ""):
@@ -3756,11 +3802,9 @@ def api_v2_search(q: str = ""):
         n = live.get(rid) or 0
         out.append({"kind": "Rider", "id": rid, "title": name, "meta": (f"on {n} order{'s' if n > 1 else ''} now" if n else "no live order")
                     + (f" · {store.fleet_map[rid]}" if store.fleet_map.get(rid) else "")})
-    like = "%" + q.replace("%", "").replace("_", "") + "%"
-    for r in store._rows("SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE day >= ? AND restaurant LIKE ? "
-                         "GROUP BY restaurant, city ORDER BY n DESC LIMIT 5", (day_key(now - timedelta(days=14)), like)):
-        out.append({"kind": "Restaurant", "id": r["restaurant"], "city": r["city"] or "", "title": r["restaurant"],
-                    "meta": f"{r['city'] or ''} · {r['n']} orders in 14 days"})
+    hits = [r for r in _v2_restaurant_list() if ql in r[3]][:5]
+    for name, cty, n, _ in hits:
+        out.append({"kind": "Restaurant", "id": name, "city": cty, "title": name, "meta": f"{cty} · {n} orders in 14 days"})
     for c in network_now(now)["cities"]:
         if ql in c["city"].lower():
             out.append({"kind": "City", "id": c["city"], "title": c["city"], "meta": f"{c['live']} live · {c['delivered']} delivered today · {c['status']}"})
@@ -3781,6 +3825,7 @@ async def health():                                           # async: answers e
             "event_queue": EVENT_QUEUE.qsize(), "slow_requests": STATE.get("slow", [])[-8:], "automation_error": STATE.get("auto_last_error", ""),
             "last_500": STATE.get("last_500"), "claude_classifier": brain.enabled(), "ai": brain.stats(), "slack": {k: v for k, v in slack.status([]).items() if k not in ("names", "matching_now")}, "intercom_received": len(intercom.ic.webhooks), "intercom_last_at": (intercom.ic.webhooks[0]["at"] if intercom.ic.webhooks else None), "loop_lag": STATE.get("loop_lag"), "loop_blocked": BLOCKED[-5:], "memory_mb": _mem_mb(), "eval_ms": STATE.get("eval_ms"), "auto_tick_ms": STATE.get("auto_tick_ms"),
             "enrich_bg_last_hour": len([x for x in ENRICH_LOG if time.time() - x < 3600]), "enrich_bg_budget": ENRICH_BG_PER_HOUR,
+            "v2_cube_days": len(analytics._CUBE),
             "open_alerts": len(STATE["open_alerts"]), "uptime_min": int((datetime.now(UTC) - STARTED).total_seconds() // 60),
             "setup": {"dashboard_password_set": bool(DASH_PASSWORD), "motiontools_token_set": mt.enabled,
                       "webhook_secret_set": PATH_SECRET != "change-me", "data_dir": str(DATA_DIR), "areas": AREAS},
