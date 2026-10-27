@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.2.1"
+VERSION = "9.3.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -438,7 +438,7 @@ _sys.setswitchinterval(0.002)        # worker threads crunching a report hand th
 _RGUARD = threading.Lock()
 
 
-def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True):
+def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True, live_if=None):
     """Reports over many orders (week, month, fleets, riders…) are computed once and served from memory; several
     dispatchers opening the same page share ONE computation. When a cached report is older than its ttl it is still
     served at once (stale-while-revalidate) and a fresh one is computed in the background — so after the first
@@ -448,7 +448,7 @@ def report_cache(ttl_live: float = 30, ttl_past: float = 300, stale: bool = True
         def wrapper(*a, **kw):
             key = (fn.__name__, a, tuple(sorted(kw.items())))
             period = str(kw.get("period") or kw.get("day") or "")
-            live = period in ("", "today")
+            live = live_if(kw) if live_if else period in ("", "today")
             ttl = ttl_live if live else ttl_past
             max_stale = (ttl * 4 if live else 1800) if stale else ttl
             hit = _RCACHE.get(key)
@@ -3224,24 +3224,45 @@ def export_csv(period: str = "today", city: str = ""):
                              headers={"Content-Disposition": f'attachment; filename="quickzi-{(city or "all").lower()}-{period}.csv"'})
 
 
+async def _render_pdf_elsewhere(data: dict) -> bytes:
+    """Draw the PDF in its own short-lived Python process (only pdf_report is loaded there): the CPU work of a
+    300-page PDF never competes with the live board. Falls back to a thread if a process can't be started."""
+    import pickle
+    from starlette.concurrency import run_in_threadpool
+    from pdf_report import render
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, "-c", "import sys, pickle; from pdf_report import render; "
+                                  "sys.stdout.buffer.write(render(pickle.loads(sys.stdin.buffer.read())))",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=os.path.dirname(os.path.abspath(__file__)))
+        out, err = await asyncio.wait_for(proc.communicate(pickle.dumps(data)), timeout=600)
+        if proc.returncode == 0 and out[:4] == b"%PDF":
+            return out
+        raise RuntimeError((err or b"").decode(errors="replace")[-300:] or f"exit {proc.returncode}")
+    except Exception as e:
+        log.warning("PDF in a separate process failed (%s) — drawing it in a thread", e)
+        return await run_in_threadpool(render, data)
+
+
 @app.get("/export/waits.pdf", dependencies=[Depends(require_login)])
-def export_waits_pdf(period: str = "today", city: str = "", minutes: int = 10):
-    """PDF of the orders whose rider waited `minutes`+ at the restaurant (first arrival -> pickup)."""
-    _check_period(period)
-    from pdf_report import build_pdf
-    from store import period_range
-    now = datetime.now(UTC)
-    start, end = period_range(period, now)
+async def export_waits_pdf(period: str = "today", city: str = "", minutes: int = 10, restaurant: str = None,
+                           frm: str = Query("", alias="from"), to: str = ""):
+    """PDF of EVERY order whose rider waited `minutes`+ at the restaurant (first arrival -> pickup) — all
+    restaurants, or one (restaurant=…&city=…); a named period or a custom from–to. The rows are gathered in a
+    worker thread; the PDF is drawn in a separate process, so even a week with 10 000+ orders never slows the
+    live board or the webhooks."""
+    _v2_check(period, frm, to)
+    from starlette.concurrency import run_in_threadpool
     m = max(1, min(120, int(minutes or 10)))
-    stored, reached = store.orders_at_restaurant(period, now, city=city, min_wait=m)
-    seen, orders = set(), []
-    for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at")]:
-        if o.get("id") not in seen:
-            seen.add(o.get("id")); orders.append(o)
-    for o in orders:
-        o.setdefault("city", city_of(o))
-    body = build_pdf(orders, period, start, end, now, city, m, reached=reached)
-    name = f'quickzi-long-waits-{(city or "all").lower().replace(" ", "-")}-{period}.pdf'
+    data = await run_in_threadpool(lambda: _waits_data(period, city, m, frm, to, restaurant=restaurant))
+    if restaurant is not None:
+        data["where"] = f"{restaurant or '?'}{(' · ' + city) if city else ''}"
+        data["title"] = f"Quickzi – long restaurant waits – {restaurant or '?'}{(' · ' + city) if city else ''} – {data['plabel']}"
+    body = await _render_pdf_elsewhere(data)
+    slug = lambda x: re.sub(r"[^a-z0-9]+", "-", (x or "").lower()).strip("-")[:40] or "all"
+    span = f"{min(frm, to)}_{max(frm, to)}" if frm and to else period
+    name = f'quickzi-long-waits-{slug(restaurant) + "-" if restaurant else ""}{slug(city)}-{span}.pdf'
     return _Response(content=body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
@@ -3373,6 +3394,384 @@ async def api_intercom_match_riders():
             out["missing"].append(x["name"] or x["rider_id"])
     store.log("info", f"Intercom matching: {out['matched']} of {out['total']} riders found, {len(out['missing'])} not found")
     return out
+
+
+# ====================================================================== premium dashboard (/v2)
+# Performance, Restaurants, Riders & fleets on one fast page (app.html). Every number is a SQL aggregate (analytics.py)
+# served from the shared report cache; the live parts come from memory. No customer data is sent to this page.
+import analytics  # noqa: E402
+from datetime import date as _date  # noqa: E402
+
+
+def _v2_check(period: str, frm: str, to: str):
+    if frm or to:
+        try:
+            _date.fromisoformat(frm); _date.fromisoformat(to)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "from and to must be YYYY-MM-DD")
+    else:
+        _check_period(period)
+
+
+def _v2_live_if(kw: dict) -> bool:
+    """Does the requested range include today (→ short cache)?"""
+    today = day_key(datetime.now(UTC))
+    if kw.get("frm") and kw.get("to"):
+        return max(kw["frm"], kw["to"]) >= today
+    p = kw.get("period") or "today"
+    return p in ("today", "week", "month") or p == today
+
+
+def _v2_range(period: str, frm: str, to: str, now: datetime) -> tuple:
+    """(label for the PDF, start, end) of a named period or a custom from–to (operating days)."""
+    from store import period_range
+    if frm and to:
+        a, b = sorted((frm, to))
+        b = min(b, day_key(now))
+        return "Custom", period_range(a, now)[0], period_range(b, now)[1]
+    s, e = period_range(period, now)
+    return period, s, e
+
+
+def _waits_data(period: str, city: str, minutes: int, frm: str = "", to: str = "", restaurant: str = None,
+                now: datetime = None, with_orders: bool = False):
+    """Every order whose rider waited `minutes`+ at the restaurant, grouped per restaurant (pdf_report.collect)."""
+    from pdf_report import collect
+    now = now or datetime.now(UTC)
+    label, start, end = _v2_range(period, frm, to, now)
+    m = max(1, min(120, int(minutes or 10)))
+    stored, reached = store.orders_at_restaurant(period, now, city=city, min_wait=m, restaurant=restaurant, rng=(start, end))
+    want = None if restaurant is None else (restaurant or "?")
+    seen, orders = set(), []
+    for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at")]:
+        if o.get("id") in seen or (want is not None and (o.get("restaurant") or "?") != want):
+            continue
+        seen.add(o.get("id")); orders.append(o)
+    for o in orders:
+        o.setdefault("city", city_of(o))
+    data = collect(orders, m, start, end, now, label, city, reached)
+    return (data, orders) if with_orders else data
+
+
+def _v2_live_block(city: str, now: datetime) -> dict:
+    net = network_now(now)
+    cs = [c for c in net["cities"] if not city or c["city"] == city]
+    g = lambda k: sum(c.get(k) or 0 for c in cs)
+    return {"live": g("live"), "waiting": g("waiting"), "on_hold": g("on_hold"), "riders_on_orders": g("riders_on_orders"),
+            "red": g("red"), "amber": g("amber"), "cities": len(cs),
+            "critical": sum(1 for c in cs if c["status"] == "critical"), "strained": sum(1 for c in cs if c["status"] == "strained"),
+            "ok": sum(1 for c in cs if c["status"] == "ok"),
+            "trouble": [{"city": c["city"], "status": c["status"], "issue": c["issue"], "live": c["live"], "waiting": c["waiting"]}
+                        for c in cs if c["status"] != "ok"][:8]}
+
+
+@report_cache(20, 600, live_if=_v2_live_if)
+def _v2_performance_data(period: str = "today", city: str = "", frm: str = "", to: str = "") -> dict:
+    return analytics.performance(store, rules, datetime.now(UTC), period, city, frm, to)
+
+
+@app.get("/api/v2/meta", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_meta():
+    """Sidebar and filters: cities, fleets, the three systems, version."""
+    now = datetime.now(UTC)
+    s, st = STATE["sync"], store.get_settings()
+    last_ok = s.get("last_ok")
+    mt_ok = bool(mt.enabled) and not s.get("webhook_silent") and bool(last_ok) and (now - datetime.fromisoformat(last_ok)).total_seconds() < max(300, SYNC_SECONDS * 6)
+    sc = slack.cfg()
+    return {"version": VERSION, "now": iso(now), "today": day_key(now),
+            "cities": sorted({c["city"] for c in network_now(now)["cities"]}),
+            "fleets": sorted({f for f in store.fleet_map.values() if f}),
+            "target": rules.ptod_target_min, "target_within_pct": rules.target_within_pct,
+            "systems": {"motiontools": {"ok": mt_ok, "text": ("silent %d min" % s.get("silent_min", 0)) if s.get("webhook_silent") else ("live" if mt_ok else "check")},
+                        "intercom": {"ok": bool(intercom.ic.enabled) and ic_master(st)["bot"],
+                                     "text": "on" if (intercom.ic.enabled and ic_master(st)["bot"]) else ("off" if intercom.ic.enabled else "not set")},
+                        "slack": {"ok": bool(sc["on"]), "text": "on" if sc["on"] else "off"}}}
+
+
+@app.get("/api/v2/performance", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_performance(period: str = "today", city: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    _v2_check(period, frm, to)
+    now = datetime.now(UTC)
+    out = dict(_v2_performance_data(period=period, city=city, frm=frm, to=to))
+    if out["period"]["has_today"]:
+        out["live"] = _v2_live_block(city, now)
+    out["generated"] = iso(now)
+    return out
+
+
+@report_cache(30, 600, live_if=_v2_live_if)
+def _v2_restaurants_data(period: str = "today", city: str = "", minutes: int = 10, frm: str = "", to: str = "") -> dict:
+    """The ranking: delivered orders from their stored wait (SQL), plus every not-delivered order that reached the
+    restaurant (cancelled after waiting, still waiting now) measured from its history exactly like the PDF."""
+    from pdf_report import collect
+    now = datetime.now(UTC)
+    label, start, end = _v2_range(period, frm, to, now)
+    m = max(1, min(120, int(minutes or 10)))
+    reached, long, hours = analytics.waits_from_columns(store, start, end, now, city, m)
+    stored, _ = store.orders_at_restaurant(period, now, city=city, min_wait=m, rng=(start, end), open_only=True)
+    seen, others = set(), []
+    for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at") and x["phase"] != "delivered"]:
+        if o.get("id") not in seen:
+            seen.add(o.get("id")); o.setdefault("city", city_of(o)); others.append(o)
+    extra = collect(others, m, start, end, now, label, city, None)
+    hrs = [0] * 24
+    for h, n in hours.items():
+        if 0 <= (h or 0) < 24:
+            hrs[h] += n
+    for g in extra["groups"]:
+        k = (g["restaurant"], g["city"])
+        x = long.setdefault(k, [0, 0.0, 0.0])
+        for r in g["rows"]:
+            w = int(str(r[7]).split()[0])
+            x[0] += 1; x[1] += w; x[2] = max(x[2], w)
+            try:
+                hrs[int(r[3][:2]) if r[3][:2].isdigit() else int(r[5][:2])] += 1
+            except (ValueError, TypeError, IndexError):
+                pass
+        reached[k] = max(reached.get(k, 0), g["of_all"] or 0)
+    groups = sorted(({"restaurant": k[0], "city": k[1], "n": v[0], "of_all": reached.get(k, 0), "avg": round(v[1] / v[0]) if v[0] else None,
+                      "max": round(v[2]), "share": round(100 * v[0] / reached[k]) if reached.get(k) else None}
+                     for k, v in long.items() if v[0]), key=lambda g: (-g["n"], -(g["max"] or 0)))
+    n = sum(g["n"] for g in groups)
+    tot_reached = sum(reached.values())
+    longest = max(groups, key=lambda g: g["max"] or 0) if groups else None
+    cities = {}
+    for (rest, cty), v in reached.items():
+        c = cities.setdefault(cty or "?", {"city": cty or "?", "n": 0, "reached": 0}); c["reached"] += v
+    for g in groups:
+        cities.setdefault(g["city"] or "?", {"city": g["city"] or "?", "n": 0, "reached": 0})["n"] += g["n"]
+    for c in cities.values():
+        c["share"] = round(100 * c["n"] / c["reached"]) if c["reached"] else None
+    return {"reached": tot_reached, "n": n, "avg": round(sum(v[1] for v in long.values()) / n) if n else None,
+            "max": longest["max"] if longest else None, "share": round(100 * n / tot_reached) if tot_reached else None,
+            "max_where": f"{longest['restaurant']} · {longest['city']}" if longest else "", "restaurants": len(groups),
+            "groups": groups[:400], "min_wait": m, "plabel": extra["plabel"], "where": extra["where"],
+            "by_hour": [{"hour": h, "n": hrs[h]} for h in range(10, 24)],
+            "by_city": sorted((c for c in cities.values() if c["n"]), key=lambda c: -c["n"])[:30]}
+
+
+@app.get("/api/v2/restaurants", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_restaurants(period: str = "today", city: str = "", minutes: int = 10, frm: str = Query("", alias="from"), to: str = ""):
+    _v2_check(period, frm, to)
+    m = max(1, min(120, int(minutes or 10)))
+    out = dict(_v2_restaurants_data(period=period, city=city, minutes=m, frm=frm, to=to))
+    out["period"] = analytics.resolve(period, datetime.now(UTC), frm, to)
+    return out
+
+
+@app.get("/api/v2/restaurant", dependencies=[Depends(require_login)])
+@fast_json
+@report_cache(30, 600, live_if=_v2_live_if)
+def api_v2_restaurant(name: str = "", city: str = "", period: str = "today", minutes: int = 10,
+                      frm: str = Query("", alias="from"), to: str = ""):
+    """One restaurant: its long-wait orders (every one), wait by hour, long waits per week."""
+    _v2_check(period, frm, to)
+    now = datetime.now(UTC)
+    m = max(1, min(120, int(minutes or 10)))
+    data, orders = _waits_data(period, city, m, frm, to, restaurant=name, now=now, with_orders=True)
+    g = next((x for x in data["groups"] if x["restaurant"] == (name or "?") and (not city or x["city"] == city)), None)
+    by_ref = {(o.get("ref") or ""): o for o in orders}
+    rows = []
+    for r in (g["rows"] if g else []):
+        o = by_ref.get(r[1]) or {}
+        try:
+            w = int(str(r[7]).split()[0])
+        except (ValueError, IndexError):
+            w = None
+        rows.append({"date": r[0], "ref": r[1], "rider": r[2], "dispatched": r[3], "accepted": r[4], "arrived": r[5], "picked": r[6],
+                     "wait": w, "delivered": r[8], "ptod": r[9], "note": r[10], "id": o.get("id") or "", "mt_url": mt_link(o) if o else ""})
+    P = analytics.resolve(period, now, frm, to)
+    det = analytics.restaurant_detail(store, now, P, name, city, m)
+    slow = max(det["by_hour"], key=lambda b: b["avg"]) if det["by_hour"] else None
+    return {"name": name, "city": city, "n": g["n"] if g else 0, "of_all": g["of_all"] if g else 0,
+            "share": round(100 * g["n"] / g["of_all"]) if g and g["of_all"] else None,
+            "avg": g["avg"] if g else None, "max": g["max"] if g else None, "rows": rows, "min_wait": m,
+            "by_hour": det["by_hour"], "weeks": det["weeks"], "slowest_hour": slow["hour"] if slow else None, "period": P}
+
+
+@report_cache(30, 600, live_if=_v2_live_if)
+def _v2_rider_stats(period: str = "today", city: str = "", fleet: str = "", frm: str = "", to: str = "") -> dict:
+    now = datetime.now(UTC)
+    if frm and to:
+        P = analytics.resolve(period, now, frm, to)
+        return store.rider_stats("custom", now, rules, city=city, fleet=fleet, span=(P["a"], P["b"]))
+    return store.rider_stats(period, now, rules, city=city, fleet=fleet)
+
+
+@report_cache(20, 20)
+def _v2_today_by_rider(city: str = "") -> dict:
+    """Today: per rider the last delivery, deliveries and hand-backs not excused (for 'right now' and the checks)."""
+    now = datetime.now(UTC)
+    d = day_key(now)
+    w, a = "day=? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != ''", [d]
+    if city:
+        w += " AND city=?"; a.append(city)
+    out = {r["rider_id"]: {"last": r["last"], "n": r["n"], "hb": 0} for r in store._rows(
+        f"SELECT rider_id, MAX(delivered_at) AS last, COUNT(*) AS n FROM orders WHERE {w} GROUP BY rider_id", a)}
+    hw, ha = "day=? AND excused=0", [d]
+    if city:
+        hw += " AND city=?"; ha.append(city)
+    for r in store._rows(f"SELECT rider_id, COUNT(*) AS n FROM handbacks WHERE {hw} GROUP BY rider_id", ha):
+        out.setdefault(r["rider_id"], {"last": None, "n": 0, "hb": 0})["hb"] = r["n"]
+    return out
+
+
+def _v2_riders_now(city: str, fleet: str, now: datetime) -> tuple:
+    """(status counts, checks): what every rider who worked today is doing right now, and who needs a look."""
+    today = _v2_today_by_rider(city=city)
+    live, worst = {}, {}
+    names, cities = {}, {}
+    for o in list(STATE["orders"].values()):
+        rid = o.get("rider_id")
+        if not rid or o["phase"] in ("on_hold", "delivered", "cancelled", "closed") or (city and city_of(o) != city):
+            continue
+        if fleet and store.fleet_map.get(rid, "") != fleet:
+            continue
+        live[rid] = live.get(rid, 0) + 1
+        names[rid] = o.get("rider") or names.get(rid)
+        cities[rid] = city_of(o)
+        why, tone, minutes = None, "amber", 0
+        le = o.get("last_event_at")
+        silent = mins(le, now) if le else None
+        if o["phase"] == "at_restaurant" and o.get("at_restaurant_at") and mins(o["at_restaurant_at"], now) >= 15:
+            minutes = int(mins(o["at_restaurant_at"], now))
+            why = f"waiting {minutes}′ at {o.get('restaurant') or 'the restaurant'}"
+        if o["phase"] in ("accepted", "to_restaurant") and o.get("accepted_at") and mins(o["accepted_at"], now) >= 15:
+            minutes = int(mins(o["accepted_at"], now))
+            why = f"accepted {minutes}′ ago, not at the restaurant yet"
+        if o["phase"] in ("to_customer", "at_customer") and tracker.has_feed(rid, now):
+            still = tracker.stationary_minutes(rid, now, rules.stationary_radius_m)
+            if still is not None and still >= 10:
+                minutes, tone, why = int(still), "red", f"not moving for {int(still)}′ with the food"
+        fix = tracker.last_fix(rid)
+        if why is None and fix and mins(fix[0], now) >= 15 and o["phase"] != "unassigned":
+            minutes = int(mins(fix[0], now)); why = f"no GPS for {minutes}′"
+        if silent is not None and silent >= 60:
+            minutes, tone, why = int(silent), "red", f"no update for {int(silent)}′"
+        if why:
+            key = (0 if tone == "red" else 1, -minutes)
+            if rid not in worst or key < worst[rid]["key"]:
+                worst[rid] = {"key": key, "rider_id": rid, "why": why + (f" · {o['ref']}" if o.get("ref") else ""), "tone": tone,
+                              "ref": o.get("ref") or "", "order_id": o["id"], "minutes": minutes}
+    for rid, t in today.items():
+        if fleet and store.fleet_map.get(rid, "") != fleet:
+            continue
+        if t["hb"] >= 2 and rid not in worst:
+            worst[rid] = {"key": (1, -t["hb"]), "rider_id": rid, "why": f"handed back {t['hb']} orders today", "tone": "amber",
+                          "ref": "", "order_id": "", "minutes": 0}
+    counts = {"on_order": 0, "check": 0, "free": 0, "done": 0}
+    for rid in set(live) | {r for r in today if not fleet or store.fleet_map.get(r, "") == fleet}:
+        if live.get(rid):
+            counts["check" if rid in worst else "on_order"] += 1
+            continue
+        last = ts((today.get(rid) or {}).get("last"))
+        if last and mins(last, now) <= 30:
+            counts["free"] += 1
+        elif (today.get(rid) or {}).get("n"):
+            counts["done"] += 1
+    checks = sorted(worst.values(), key=lambda c: c["key"])[:60]
+    for c in checks:
+        r = STATE["riders"].get(c["rider_id"]) or {}
+        c.pop("key", None)
+        c.update(name=r.get("name") or names.get(c["rider_id"]) or "Rider", user=INTERCOM_USER.get(c["rider_id"], ""),
+                 phone=r.get("phone") or projector.phones.get(c["rider_id"], ""), city=cities.get(c["rider_id"], ""))
+    counts["checks_total"] = len(worst)
+    return counts, checks
+
+
+@app.get("/api/v2/riders", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_riders(period: str = "today", city: str = "", fleet: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    _v2_check(period, frm, to)
+    now = datetime.now(UTC)
+    P = analytics.resolve(period, now, frm, to)
+    rs = _v2_rider_stats(period=period, city=city, fleet=fleet, frm=frm, to=to)
+    live_by = live_by_rider(city) if P["has_today"] else {}
+    rows = []
+    for r in rs["riders"]:
+        lv = live_by.get(r["rider_id"], 0) if P["has_today"] else 0
+        if not (r["delivered"] or lv or r["cancelled"]):
+            continue
+        st = STATE["riders"].get(r["rider_id"], {})
+        rows.append({"id": r["rider_id"], "name": r["rider"], "city": r["city"], "fleet": r["fleet"], "delivered": r["delivered"], "live": lv,
+                     "days": r["days"], "hours": r["hours"], "per_hour": r["per_hour"], "avg_ptod": r["avg_ptod"], "within_pct": r["within_pct"],
+                     "on_time_pct": r["on_time_pct"], "accept": r["avg_accept"], "wait": r["avg_wait"], "handbacks": r["handbacks_bad"],
+                     "handbacks_excused": r["handbacks_excused"], "double": r["double"], "usual": r["usual"], "score": r["score"],
+                     "cancelled": r["cancelled"], "user": INTERCOM_USER.get(r["rider_id"], ""),
+                     "phone": st.get("phone") or projector.phones.get(r["rider_id"], ""), "last_at": r["last_at"]})
+    worked = [r for r in rows if r["delivered"]]
+    delivered = sum(r["delivered"] for r in worked)
+    rider_days = sum(max(1, r["days"]) for r in worked)
+    w_n = sum(r["delivered"] for r in worked if r["within_pct"] is not None)
+    # deliveries per rider per worked day: 1 … 10+
+    dist = [0] * 10
+    for r in worked:
+        dist[min(10, max(1, round(r["delivered"] / max(1, r["days"])))) - 1] += 1
+    pts = sorted((r for r in worked if r["delivered"] >= 3 and r["per_hour"] and r["avg_ptod"] is not None), key=lambda r: -r["delivered"])[:600]
+    out = {"period": P, "riders": rows, "target": rules.ptod_target_min, "capacity_per_hour": rules.riders_capacity_per_hour,
+           "kpis": {"riders": len(worked), "with_live": sum(1 for r in rows if r["live"]),
+                    "per_rider": round(delivered / rider_days, 1) if rider_days else None, "delivered": delivered,
+                    "per_hour": rs.get("avg_per_hour"),
+                    "within_pct": round(sum(r["within_pct"] * r["delivered"] for r in worked if r["within_pct"] is not None) / w_n) if w_n else None,
+                    "handbacks": sum(r["handbacks"] or 0 for r in rows), "handbacks_excused": sum(r["handbacks_excused"] or 0 for r in rows),
+                    "low": sum(1 for r in worked if r["delivered"] / max(1, r["days"]) < 3)},
+           "dist": [{"label": str(i + 1) if i < 9 else "10+", "n": n} for i, n in enumerate(dist)],
+           "scatter": [{"id": r["id"], "name": r["name"], "x": r["per_hour"], "y": r["avg_ptod"], "n": r["delivered"]} for r in pts],
+           "fleets": analytics.cached(("fleets", P["a"], P["b"], city), 30 if P["has_today"] else 600, lambda: analytics.fleets(store, rules, P, city))}
+    if P["has_today"]:
+        out["now"], out["checks"] = _v2_riders_now(city, fleet, now)
+        out["checks_total"] = out["now"].pop("checks_total", len(out["checks"]))
+    out["generated"] = iso(now)
+    return out
+
+
+@app.get("/api/v2/search", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_search(q: str = ""):
+    """⌘K: orders (by number), riders, restaurants and cities."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"results": []}
+    ql, now, out = q.lower(), datetime.now(UTC), []
+    for o in list(STATE["orders"].values()):
+        if (o.get("ref") or "").lower().startswith(ql):
+            out.append({"kind": "Order", "id": o["id"], "title": f"{o['ref']} · {o.get('restaurant') or ''}",
+                        "meta": f"{PHASE_LABEL.get(o['phase'], o['phase'])} · {city_of(o)}"})
+            if len(out) >= 5:
+                break
+    if not out and 5 <= len(q) <= 9 and q.isalnum():
+        o = store.order_by_ref(q.upper())
+        if o:
+            out.append({"kind": "Order", "id": o["id"], "title": f"{o['ref']} · {o.get('restaurant') or ''}",
+                        "meta": f"{PHASE_LABEL.get(o['phase'], o['phase'])} · {store.city_of(o)} · {(o.get('dispatched_at') or o.get('created_at') or now).astimezone(BERLIN).strftime('%d %b')}"})
+    live = live_by_rider()
+    riders = []
+    for rid, r in list(STATE["riders"].items()):
+        if ql in (r.get("name") or "").lower():
+            riders.append((-(live.get(rid) or 0), r.get("name") or "", rid))
+    for _, name, rid in sorted(riders)[:5]:
+        n = live.get(rid) or 0
+        out.append({"kind": "Rider", "id": rid, "title": name, "meta": (f"on {n} order{'s' if n > 1 else ''} now" if n else "no live order")
+                    + (f" · {store.fleet_map[rid]}" if store.fleet_map.get(rid) else "")})
+    like = "%" + q.replace("%", "").replace("_", "") + "%"
+    for r in store._rows("SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE day >= ? AND restaurant LIKE ? "
+                         "GROUP BY restaurant, city ORDER BY n DESC LIMIT 5", (day_key(now - timedelta(days=14)), like)):
+        out.append({"kind": "Restaurant", "id": r["restaurant"], "city": r["city"] or "", "title": r["restaurant"],
+                    "meta": f"{r['city'] or ''} · {r['n']} orders in 14 days"})
+    for c in network_now(now)["cities"]:
+        if ql in c["city"].lower():
+            out.append({"kind": "City", "id": c["city"], "title": c["city"], "meta": f"{c['live']} live · {c['delivered']} delivered today · {c['status']}"})
+    return {"results": out[:16]}
+
+
+@app.get("/v2", response_class=HTMLResponse, dependencies=[Depends(require_login)])
+@app.get("/app", response_class=HTMLResponse, dependencies=[Depends(require_login)])
+def dashboard_v2():
+    html = (Path(__file__).parent / "app.html").read_text(encoding="utf-8")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
 
 
 @app.get("/health")

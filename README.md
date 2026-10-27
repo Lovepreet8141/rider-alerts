@@ -23,6 +23,35 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.3.0 — the new premium dashboard at /v2 (new files: app.html, analytics.py)
+
+* Open **/v2** (same login). Three pages on your real data, next to the current dashboard (which stays at /):
+  * **Performance** — delivered, avg delivery time, within 30′, riders (each with a 14-day sparkline and a fair
+    comparison: today is compared with the same weekday last week *up to the same time*); live ribbon (live orders,
+    waiting, cities in trouble); orders vs rider capacity per hour; where the minutes go; delivery time by city;
+    weekday × hour late heatmap; why orders were late; 30-day trend (within 30′ / avg time / delivered).
+  * **Restaurants** — every restaurant ranked by long waits; the selected one with wait by hour, long waits per week,
+    every long-wait order (click = full story, Open ↗ = MotionTools), its own PDF and CSV; long waits by hour and city.
+  * **Riders & fleets** — riders right now, who needs a check (not moving, no GPS, waiting long, accepted but not at the
+    restaurant, 2+ hand-backs) with a Message button (Intercom chat in a side panel), deliveries-per-rider histogram,
+    speed vs workload scatter, sortable rider table, fleets side by side.
+* Periods: Today · Yesterday · This week · Last week · Month · any custom from–to. ← → move a day back/forward.
+* ⌘K (or /) searches orders (any day by number), riders, restaurants and cities. 1–7 switch pages, E export.
+* Hover any bar, cell, dot or line for exact numbers. Everything is computed in SQL and cached; pages answer in
+  milliseconds and refresh by themselves every 30 s while the period includes today.
+* The long-waits PDF now also works for one restaurant and for custom from–to ranges.
+* Now / Orders / Intercom / Settings still open the current dashboard; it got a "✦ New dashboard" link.
+
+## 9.2.2 — the long-waits PDF lists EVERY order (new files: DejaVuSansCondensed.ttf, DejaVuSansCondensed-Bold.ttf)
+
+* No more "2 000 longest" limit: every order that waited 10+ min is in the PDF, grouped per restaurant (worst first),
+  each with its timeline: dispatched · accepted · arrived · picked up · waited · delivered · delivery time · note.
+* All letters print (Phở Việt, Şükrü, ł …): the PDF uses the bundled DejaVu font — the two .ttf files must be
+  uploaded next to app.py.
+* The PDF is drawn in its own short-lived process, so a 400-page week never slows the live board (tested: 13 800 orders,
+  488 pages, 13 s, board answering in ~70 ms meanwhile).
+* Period label shows the real days: "Last week (Mon 19 Oct – Sun 25 Oct 2026)".
+
 ## 9.2.1 — "Last week" (Monday–Sunday) on the Orders page · clock-change fix
 
 * Orders page: Today · Yesterday · This week · **Last week** (Monday 00:00 – Sunday 24:00) · Month. The CSV and the

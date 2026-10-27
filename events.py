@@ -283,7 +283,14 @@ class Projector:
             start = max(min(now, release), o.get("created_at") or release)
         o["dispatched_at"] = start
 
-    def weak_dispatch(self, o: dict, now: datetime):
+    @staticmethod
+    def _held_live(o: dict) -> bool:
+        """We saw this order arrive and it is still "On hold" (to_be_dispatched) right before this event: the
+        transition we are handling now is MotionTools releasing it — the real dispatch moment, as MotionTools
+        shows it (e.g. TW343W: on hold 16:47 for food preparation, auto-dispatch 16:57 → PTOD from 16:57)."""
+        return o.get("status") == "to_be_dispatched" and not o.get("partial") and not o.get("dispatched_at")
+
+    def weak_dispatch(self, o: dict, now: datetime, live: bool = False):
         """A signal that only means "the order is in a tour" (created as dispatched, transition to dispatched,
         tour created). For an ASAP order that IS the release; for a pre-order the tour sits on hold for hours.
         Decide by the planned delivery time: released = planned − lead (MotionTools' automatic scheduling)."""
@@ -300,7 +307,7 @@ class Projector:
             return
         release = planned - timedelta(minutes=self.lead_min)
         if now >= release:
-            self.dispatched(o, now)
+            self.dispatched(o, now, exact=live)
 
     def release_due(self, now: datetime) -> int:
         """Every sync: pre-orders whose release time has come move from On hold to Waiting for rider,
@@ -396,7 +403,9 @@ class Projector:
                 elif to in DISPATCHED:
                     if to == "pickable" and o.get("rider_id") and not o.get("picked_up_at"):
                         self.release(o, now)                                     # back to "pickable" = rider handed it back
-                    self.dispatched(o, now, exact=(to == "pickable"))            # PTOD clock starts here
+                    # PTOD clock starts here. Exact when this IS the release: "pickable", or an order we watched sit
+                    # "On hold" (food preparation / pre-order) that MotionTools releases right now.
+                    self.dispatched(o, now, exact=(to == "pickable" or self._held_live(o)))
                     users = d.get("affected_user_ids") or []
                     users = [users] if isinstance(users, str) else list(users)
                     if to in ("claimed", "en_route") and users:
@@ -408,7 +417,7 @@ class Projector:
                         self.release(o, now)
                     if to in ASSIGNED:
                         o["assigned_at"] = now                                   # in a tour — on hold or released?
-                        self.weak_dispatch(o, now)
+                        self.weak_dispatch(o, now, live=self._held_live(o))
                 o["status"] = to or o["status"]
             elif ev == "in_progress":
                 self.dispatched(o, now)

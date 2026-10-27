@@ -492,14 +492,24 @@ class Store:
                    or ql in (o["restaurant"] or "").lower() or ql in (o["customer_addr"] or "").lower()]
         return out
 
-    def orders_at_restaurant(self, period: str, now: datetime, city: str = "", min_wait: int = 0):
-        """For the long-waits PDF: (candidate orders, {(restaurant, city): orders that reached it}). Only orders whose
-        stored arrival -> pickup is near/over min_wait (or not picked up) are loaded — a month stays fast."""
-        start, end = period_range(period, now)
-        where = "at_restaurant_at IS NOT NULL AND at_restaurant_at >= ? AND at_restaurant_at < ?"
-        args = [iso(start - timedelta(hours=3)), iso(end)]
+    def orders_at_restaurant(self, period: str, now: datetime, city: str = "", min_wait: int = 0,
+                             restaurant: str = None, rng: tuple = None, open_only: bool = False):
+        """For the long-waits PDF and the Restaurants page: (candidate orders, {(restaurant, city): orders that reached
+        it}). Only orders whose stored arrival -> pickup is near/over min_wait (or not picked up) are loaded — a month
+        stays fast. rng = (start, end) overrides the period (custom from–to); restaurant limits it to one place."""
+        start, end = rng if rng else period_range(period, now)
+        # the day index narrows the scan first (an order arrives at the restaurant within hours of its operating day)
+        where = "day >= ? AND day <= ? AND at_restaurant_at IS NOT NULL AND at_restaurant_at >= ? AND at_restaurant_at < ?"
+        args = [day_key(start - timedelta(days=1)), day_key(min(end, now + timedelta(days=1))), iso(start - timedelta(hours=3)), iso(end)]
         if city:
             where += " AND city=?"; args.append(city)
+        if restaurant is not None:
+            if restaurant in ("", "?"):
+                where += " AND (restaurant IS NULL OR restaurant IN ('', '?'))"
+            else:
+                where += " AND restaurant=?"; args.append(restaurant)
+        if open_only:                              # delivered ones are counted from their stored kitchen_wait instead
+            where += " AND phase != 'delivered'"
         reached = {(r["restaurant"] or "?", r["city"] or ""): r["n"] for r in self._rows(
             f"SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE {where} AND at_restaurant_at >= ? GROUP BY restaurant, city", args + [iso(start)])}
         # handed-back orders always: the stored arrival is the LAST rider's, the first rider's wait is in the history
@@ -1239,13 +1249,16 @@ class Store:
         cust, prodv, rel = round(c_ot + c_ptod + c_hand), round(prod), round(r_acc + r_hb + r_sheet)
         return {"score": max(0, min(100, cust + prodv + rel)), "customer": cust, "productivity": prodv, "reliability": rel}
 
-    def rider_stats(self, period: str, now: datetime, rules, city: str = "", fleet: str = "") -> dict:
+    def rider_stats(self, period: str, now: datetime, rules, city: str = "", fleet: str = "", span: tuple = None) -> dict:
         """Every rider with orders in the period (SQL-aggregated: never touches rows one by one):
         deliveries, usual (avg per worked day in the 4 weeks before), working hours (first accept → last delivery, per day),
         per working hour, on time, PTOD, accept, hand-backs (excused ones excluded), doubles, late for the customer,
         shift-sheet fulfilment, and the 0–100 score."""
         start, end = period_range(period, now)
         d1, d2 = day_key(start), day_key(min(end, now) - timedelta(seconds=1)) if end <= now else day_key(now)
+        if span:                                   # a custom from–to range (dashboard /v2): YYYY-MM-DD operating days
+            d1, d2 = span
+            start, end = period_range(d1, now)[0], period_range(d2, now)[1]
         where, args = "day >= ? AND day <= ? AND rider_id IS NOT NULL AND rider_id != '' AND phase != 'closed'", [d1, d2]
         if city:
             where += " AND city=?"; args.append(city)
