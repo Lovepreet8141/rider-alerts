@@ -184,7 +184,9 @@
     <h2>All orders <span class="sp"></span>
       <input id="q" placeholder="search order, rider, restaurant, address" style="min-width:260px">
       <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span><input type="date" data-day="orders" title="any single day" style="padding:5px 8px">
-      <a class="btn" id="csvOrders" href="/export.csv?period=today">⬇ CSV</a></h2>
+      <a class="btn" id="csvOrders" href="/export.csv?period=today">⬇ CSV</a>
+      <span class="muted" style="font-size:12px;text-transform:none;letter-spacing:0;font-weight:400" title="Orders whose rider waited at least this long at the restaurant (first arrival → pickup)">waited ≥ <input type="number" id="waitMin" value="10" min="1" max="120" style="width:52px;padding:4px 6px"> min</span>
+      <a class="btn" id="pdfOrders" href="/export/waits.pdf?period=today&minutes=10">⬇ PDF long waits</a></h2>
     <div class="chips" id="orderChips" style="margin:0 0 10px"></div>
     <div class="panel" style="margin-top:0"><div id="ordersTable"></div></div>
   </section>
@@ -222,7 +224,7 @@
 
   <!-- ================= DAILY ================= -->
   <section id="daily">
-    <h2>Daily report <span class="sp"></span><button id="dayPrev">‹</button><input type="date" id="dayPick"><button id="dayNext">›</button><a class="btn" id="csvDay" href="#">⬇ CSV</a></h2>
+    <h2>Daily report <span class="sp"></span><button id="dayPrev">‹</button><input type="date" id="dayPick"><button id="dayNext">›</button><a class="btn" id="csvDay" href="#">⬇ CSV</a><a class="btn" id="pdfDay" href="#" title="Orders whose rider waited 10+ min at the restaurant (minutes: Orders page)">⬇ PDF long waits</a></h2>
     <div class="panel" style="margin-top:0"><h3>Last 14 days — delivered per day (green = target met)</h3><div class="trend" id="trend"></div></div>
     <div class="pulse" id="dailyKpis" style="margin-top:12px"></div>
     <div id="dailyPhase" class="panel"></div>
@@ -288,6 +290,7 @@ const wdShort=d=>["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d+"T12:00:00").ge
 let P={orders:"today",riders:"today",insights:"today",fleets:"week"}, soundOn=false, known=null, audio, IDLE=[], TARGET=30, TARGET_PCT=90, day=null, REASONS=[];
 let CITY=""; try{ CITY=localStorage.getItem("city")||""; }catch(e){}
 const cq=(sep="&")=>CITY?`${sep}city=${encodeURIComponent(CITY)}`:"";
+const waitsHref=p=>{ const el=document.getElementById("waitMin"); const m=Math.max(1,Math.min(120,+(el&&el.value)||10)); return `/export/waits.pdf?period=${p}&minutes=${m}${cq()}`; };
 try{ const t=localStorage.getItem("theme"); if(t) document.documentElement.dataset.theme=t; }catch(e){}
 document.getElementById("theme").onclick=()=>{ const cur=document.documentElement.dataset.theme==="light"?"":"light"; document.documentElement.dataset.theme=cur; try{localStorage.setItem("theme",cur);}catch(e){} if(MAP){ setTiles(); setTimeout(()=>MAP.invalidateSize(),50); } };
 setInterval(()=>{ document.getElementById("clock").textContent=new Date().toLocaleString("de-DE",{weekday:"short",day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit",timeZone:"Europe/Berlin"}); },1000);
@@ -527,7 +530,7 @@ const CATS=[["all","All"],["live","Live"],["risk","PTOD risk (live)"],["late","L
 const isLate=o=>o.phase==="delivered"&&(o.phases?.ptod??0)>o.target; const isLatePlan=o=>o.phase==="delivered"&&o.on_time===false;
 const inCat=(o,c)=>c==="all"||(c==="live"&&o.live&&o.phase!=="on_hold")||(c==="risk"&&o.live&&o.phase!=="on_hold"&&o.elapsed!=null&&o.elapsed>=(o.warn||o.target-5))||(c==="late"&&isLate(o))||(c==="lateplan"&&isLatePlan(o))||(c==="noreason"&&(isLate(o)||isLatePlan(o))&&!o.reason)||o.phase===c;
 async function loadOrders(){ const q=document.getElementById("q").value.trim(); const res=await api(`/api/orders?period=${P.orders}&q=${encodeURIComponent(q)}`); const all=res.orders; const more=res.total>res.shown?` <span class="muted" style="margin-left:8px">showing the newest ${res.shown} of ${res.total} orders — search or CSV export for all</span>`:"";
-  document.getElementById("csvOrders").href=`/export.csv?period=${P.orders}${cq()}`;
+  document.getElementById("csvOrders").href=`/export.csv?period=${P.orders}${cq()}`; document.getElementById("pdfOrders").href=waitsHref(P.orders); document.getElementById("waitMin").oninput=()=>{ document.getElementById("pdfOrders").href=waitsHref(P.orders); if(typeof day!=="undefined"&&day) document.getElementById("pdfDay").href=waitsHref(day); };
   document.getElementById("orderChips").innerHTML=CATS.map(([c,l])=>{const n=all.filter(o=>inCat(o,c)).length; return `<button data-cat="${c}" class="${ORDER_CAT===c?"on":""}">${l} <span class="muted" style="color:inherit;opacity:.7">${n}</span></button>`;}).join("")+more;
   document.querySelectorAll("#orderChips button").forEach(b=>b.onclick=()=>{ORDER_CAT=b.dataset.cat; loadOrders();});
   const orders=all.filter(o=>inCat(o,ORDER_CAT));
@@ -617,7 +620,7 @@ async function loadStaffing(){ document.getElementById("csvPlan").href=`/export-
 async function loadInsights(){ loadStaffing(); try{ const d=await api(`/api/insights?period=${P.insights}`); SESSIONS_OK=!!d.sessions_ok; renderInsights(d); }catch(e){ document.getElementById("kpis").innerHTML=`<div class="empty" style="grid-column:1/-1">Insights could not be loaded (${esc(e.message||e)}). Settings → System → Log shows the reason.</div>`; } }
 
 /* ---------------- DAILY ---------------- */
-async function loadDaily(){ const d=await api(`/api/daily${day?"?day="+day:""}`); day=d.day; document.getElementById("dayPick").value=day; document.getElementById("csvDay").href=`/export.csv?period=${day}${cq()}`;
+async function loadDaily(){ const d=await api(`/api/daily${day?"?day="+day:""}`); day=d.day; document.getElementById("dayPick").value=day; document.getElementById("csvDay").href=`/export.csv?period=${day}${cq()}`; document.getElementById("pdfDay").href=waitsHref(day);
   const tr=d.trend||[]; const mx=Math.max(1,...tr.map(t=>t.delivered||0)); document.getElementById("trend").innerHTML=tr.length?tr.map(t=>`<div class="${t.within_pct==null?"":t.within_pct>=TARGET_PCT?"ok":t.within_pct<TARGET_PCT-15?"bad":""}" style="height:${Math.max(4,100*(t.delivered||0)/mx)}%" title="${t.day}: ${t.delivered} delivered, ${pc(t.within_pct)} within target, ${pc(t.on_time_pct)} on time, avg ${f1(t.avg_ptod)}′"><span>${t.delivered||0}</span></div>`).join(""):`<div class="muted">The first daily report is frozen a few minutes after the day rolls over.</div>`;
   document.getElementById("dailyKpis").innerHTML=tile("Delivered",d.delivered,`${d.cancelled} cancelled${d.frozen?"":" · live (not frozen yet)"}`)+tile(`≤ ${TARGET} min`,pc(d.within_pct),`target ${d.target_within_pct}%`,wcls(d.within_pct))+tile("On time (plan)",pc(d.on_time_pct),d.on_time_pct==null?"planned time not known":`${d.late_vs_plan} late for the customer`,wcls(d.on_time_pct))+tile("Avg PTOD",f1(d.avg_ptod)+"′",`median ${f1(d.median_ptod)}′ · p90 ${f1(d.p90_ptod)}′`,pcls(d.avg_ptod))+tile("Late",d.late,"over target",d.late?"red":"green")+tile("Alerts",d.alerts_total,`${d.handled} handled`);
   document.getElementById("dailyPhase").innerHTML=phaseStack(d.phases,"Where the minutes went"); document.getElementById("brief").textContent=d.brief; document.getElementById("dailyFocus").innerHTML=focusHtml(d.focus);

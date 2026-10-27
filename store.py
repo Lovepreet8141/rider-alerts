@@ -489,6 +489,22 @@ class Store:
                    or ql in (o["restaurant"] or "").lower() or ql in (o["customer_addr"] or "").lower()]
         return out
 
+    def orders_at_restaurant(self, period: str, now: datetime, city: str = "", min_wait: int = 0):
+        """For the long-waits PDF: (candidate orders, {(restaurant, city): orders that reached it}). Only orders whose
+        stored arrival -> pickup is near/over min_wait (or not picked up) are loaded — a month stays fast."""
+        start, end = period_range(period, now)
+        where = "at_restaurant_at IS NOT NULL AND at_restaurant_at >= ? AND at_restaurant_at < ?"
+        args = [iso(start - timedelta(hours=3)), iso(end)]
+        if city:
+            where += " AND city=?"; args.append(city)
+        reached = {(r["restaurant"] or "?", r["city"] or ""): r["n"] for r in self._rows(
+            f"SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE {where} AND at_restaurant_at >= ? GROUP BY restaurant, city", args + [iso(start)])}
+        # handed-back orders always: the stored arrival is the LAST rider's, the first rider's wait is in the history
+        cand = (f"{where} AND (picked_up_at IS NULL OR (julianday(picked_up_at) - julianday(at_restaurant_at)) * 1440 >= ?"
+                f" OR id IN (SELECT order_id FROM handbacks WHERE at >= ?))")
+        rows = self._rows(f"SELECT * FROM orders WHERE {cand}", args + [max(0, min_wait - 2), iso(start - timedelta(hours=3))])
+        return [self._hydrate(r) for r in rows], reached
+
     def order(self, oid: str):
         rows = self._rows("SELECT * FROM orders WHERE id=?", (oid,))
         return self._hydrate(rows[0]) if rows else None

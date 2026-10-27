@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.1.5"
+VERSION = "9.2.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -3222,6 +3222,27 @@ def export_csv(period: str = "today", city: str = ""):
     body = store.export_csv(period, datetime.now(UTC), rules, city=city)
     return PlainTextResponse(body, media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="quickzi-{(city or "all").lower()}-{period}.csv"'})
+
+
+@app.get("/export/waits.pdf", dependencies=[Depends(require_login)])
+def export_waits_pdf(period: str = "today", city: str = "", minutes: int = 10):
+    """PDF of the orders whose rider waited `minutes`+ at the restaurant (first arrival -> pickup)."""
+    _check_period(period)
+    from pdf_report import build_pdf
+    from store import period_range
+    now = datetime.now(UTC)
+    start, end = period_range(period, now)
+    m = max(1, min(120, int(minutes or 10)))
+    stored, reached = store.orders_at_restaurant(period, now, city=city, min_wait=m)
+    seen, orders = set(), []
+    for o in stored + [x for x in live_orders(city) if x.get("at_restaurant_at")]:
+        if o.get("id") not in seen:
+            seen.add(o.get("id")); orders.append(o)
+    for o in orders:
+        o.setdefault("city", city_of(o))
+    body = build_pdf(orders, period, start, end, now, city, m, reached=reached)
+    name = f'quickzi-long-waits-{(city or "all").lower().replace(" ", "-")}-{period}.pdf'
+    return _Response(content=body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.get("/export-events.jsonl", dependencies=[Depends(require_login)])

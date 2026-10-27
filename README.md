@@ -23,6 +23,17 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.2.0 — PDF of long restaurant waits (new file: pdf_report.py · requirements: fpdf2)
+
+* Orders page → "waited ≥ [10] min" + "⬇ PDF long waits" (Today / Yesterday / Week / Month / any day, current city).
+  Daily report → "⬇ PDF long waits" for that day.
+* The PDF: summary (how many orders waited, share of all orders that reached a restaurant, average, longest), a ranking
+  of restaurants (long waits, share of their orders, average, longest) and the order list (date, arrival, order,
+  restaurant, city, rider, pickup, minutes waited, note: handed back / cancelled / still waiting).
+* The wait is the kitchen's: from the FIRST rider's arrival to pickup — a rider who gave up and handed the order back
+  still counts. No customer data. Very long periods list the 2 000 longest waits (the CSV has every order).
+* Railway installs fpdf2 by itself from requirements.txt (the first build takes a minute longer).
+
 ## 9.1.5 — Slack: rider accepted but not at the restaurant
 
 * New Slack message for priority restaurants: 🕐 a rider ACCEPTED the order but is still not at the restaurant
