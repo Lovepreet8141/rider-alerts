@@ -1221,20 +1221,22 @@ class Store:
     def rider_score(r: dict, avg_per_h: float, rules) -> dict | None:
         """0–100, explainable. Customer 40: on time 25 · PTOD 10 · handover 5. Productivity 30: deliveries per working hour
         vs the average rider of the same period/city. Reliability 30: acceptance 12 · hand-backs 10 · shift sheet 8
-        (planned days without an order, first order late). Needs 3 deliveries; a rider planned with no order at all = 0."""
+        (planned days without an order, first order late). Needs 3 deliveries; a rider planned with no order at all = 0.
+        9.8: on time, PTOD and deliveries per hour are counted WITHOUT the kitchen's delay (waiting at the restaurant
+        beyond a normal 5 minutes) — the rider can't change that; hand-backs after a long wait were already excused."""
         d = r.get("delivered") or 0
         if d < 3:
             if r.get("planned_days") and not d and not r.get("live"):
                 return {"score": 0, "customer": 0, "productivity": 0, "reliability": 0}
             return None
         tgt = rules.ptod_target_min
-        ot = r.get("on_time_pct")
+        ot = r.get("on_time_fair_pct", r.get("on_time_pct"))
         c_ot = 25 * (ot / 100) if ot is not None else 20
-        p = r.get("avg_ptod")
+        p = r.get("avg_ptod_fair", r.get("avg_ptod"))
         c_ptod = 10 if p is None or p <= tgt else max(0.0, 10 - (p - tgt) * (10 / 15))
         h = r.get("avg_handover")
         c_hand = 5 if h is None or h <= 3 else max(0.0, 5 - (h - 3))
-        per_h = r.get("per_hour") or 0
+        per_h = r.get("per_hour_fair", r.get("per_hour")) or 0
         base = max(0.5, avg_per_h or rules.riders_capacity_per_hour or 1.5)
         prod = 30 * min(1.0, per_h / base)
         a = r.get("avg_accept")
@@ -1247,7 +1249,10 @@ class Store:
             if r.get("first_late_days"):
                 r_sheet = max(0.0, r_sheet - 2 * r["first_late_days"])
         cust, prodv, rel = round(c_ot + c_ptod + c_hand), round(prod), round(r_acc + r_hb + r_sheet)
-        return {"score": max(0, min(100, cust + prodv + rel)), "customer": cust, "productivity": prodv, "reliability": rel}
+        lost = {"on_time": round(25 - c_ot, 1), "ptod": round(10 - c_ptod, 1), "handover": round(5 - c_hand, 1), "productivity": round(30 - prod, 1),
+                "accept": round(12 - r_acc, 1), "handbacks": round(10 - r_hb, 1), "sheet": round(8 - r_sheet, 1)}
+        return {"score": max(0, min(100, cust + prodv + rel)), "customer": cust, "productivity": prodv, "reliability": rel, "lost": lost,
+                "avg_per_hour": round(base, 2)}
 
     def rider_stats(self, period: str, now: datetime, rules, city: str = "", fleet: str = "", span: tuple = None) -> dict:
         """Every rider with orders in the period (SQL-aggregated: never touches rows one by one):
@@ -1276,8 +1281,14 @@ class Store:
             "SUM(CASE WHEN phase='delivered' AND at_customer_at IS NOT NULL THEN (julianday(delivered_at)-julianday(at_customer_at))*1440 END) AS hand_sum, "
             "SUM(phase='delivered' AND at_customer_at IS NOT NULL) AS hand_n, "
             "SUM(CASE WHEN phase='delivered' AND at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL THEN (julianday(picked_up_at)-julianday(at_restaurant_at))*1440 END) AS wait_sum, "
-            "SUM(phase='delivered' AND at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL) AS wait_n "
-            f"FROM orders WHERE {where} GROUP BY rider_id, day", [rules.ptod_target_min] + args)
+            "SUM(phase='delivered' AND at_restaurant_at IS NOT NULL AND picked_up_at IS NOT NULL) AS wait_n, "
+            # 9.8 fair: the kitchen's delay (waiting beyond a normal 5-minute hand-over) is not the rider's
+            "SUM(CASE WHEN phase='delivered' THEN ptod_min - MAX(0, COALESCE(kitchen_wait, 0) - 5) END) AS fptod_sum, "
+            "SUM(phase='delivered' AND ptod_min IS NOT NULL AND ptod_min - MAX(0, COALESCE(kitchen_wait, 0) - 5) <= ?) AS fwithin, "
+            "SUM(CASE WHEN on_time IS NULL THEN 0 WHEN vs_plan IS NULL THEN on_time "
+            "ELSE (vs_plan - MAX(0, COALESCE(kitchen_wait, 0) - 5) <= ?) END) AS fot, "
+            "SUM(CASE WHEN phase='delivered' THEN MAX(0, COALESCE(kitchen_wait, 0) - 5) ELSE 0 END) AS kx_sum "
+            f"FROM orders WHERE {where} GROUP BY rider_id, day", [rules.ptod_target_min, rules.ptod_target_min, rules.plan_grace_min] + args)
         hb = {}
         hwhere, hargs = "day >= ? AND day <= ?", [d1, d2]
         if city:
@@ -1308,7 +1319,8 @@ class Store:
             x = riders.setdefault(r["rider_id"], {"rider_id": r["rider_id"], "rider": r["rider"] or "Rider", "city": r["city"] or "", "fleet": r["fleet"] or "",
                                                    "delivered": 0, "cancelled": 0, "live": 0, "days": 0, "hours": 0.0, "ptod_sum": 0.0, "ptod_n": 0, "within": 0,
                                                    "ot": 0, "otn": 0, "late": 0, "acc_sum": 0.0, "acc_n": 0, "double": 0, "hand_sum": 0.0, "hand_n": 0,
-                                                   "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {}})
+                                                   "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {},
+                                                   "fptod_sum": 0.0, "fwithin": 0, "fot": 0, "kx_sum": 0.0, "fhours": 0.0})
             x["delivered"] += r["delivered"] or 0; x["cancelled"] += r["cancelled"] or 0; x["live"] += r["live"] or 0
             cc = x.setdefault("cities", {}); cc[r["city"] or ""] = cc.get(r["city"] or "", 0) + (r["delivered"] or 0) + (r["live"] or 0) + (r["cancelled"] or 0)
             x["city"] = max(cc.items(), key=lambda kv: kv[1])[0]
@@ -1319,11 +1331,15 @@ class Store:
             f, l = ts(r["first_at"]), ts(r["last_at"])
             if r["live"] and r["day"] == today:
                 l = max([t for t in (l, now) if t]) if l else now
+            hd = 0.0
             if f and l:
-                x["hours"] += max(1.0, (l - f).total_seconds() / 3600 + 0.5)
+                hd = max(1.0, (l - f).total_seconds() / 3600 + 0.5)
             elif r["delivered"] or r["live"]:
-                x["hours"] += 1.0
-            for k in ("ptod_sum", "ptod_n", "within", "ot", "otn", "late", "acc_sum", "acc_n", "hand_sum", "hand_n", "wait_sum", "wait_n"):
+                hd = 1.0
+            x["hours"] += hd
+            x["fhours"] += max(hd * 0.5, hd - (r["kx_sum"] or 0) / 60)        # waiting for kitchens is not working time lost by the rider
+            for k in ("ptod_sum", "ptod_n", "within", "ot", "otn", "late", "acc_sum", "acc_n", "hand_sum", "hand_n", "wait_sum", "wait_n",
+                      "fptod_sum", "fwithin", "fot", "kx_sum"):
                 x[k] += r[k] or 0
             x["double"] += r["dbl"] or 0
             x["day_rows"][r["day"]] = {"delivered": r["delivered"] or 0, "first": f, "last": l}
@@ -1348,7 +1364,8 @@ class Store:
                 riders[rid] = {"rider_id": rid, "rider": s0["rider"] or "Rider", "city": s0.get("city") or city or "", "fleet": s0.get("fleet") or "",
                                "delivered": 0, "cancelled": 0, "live": 0, "days": 0, "hours": 0.0, "ptod_sum": 0.0, "ptod_n": 0, "within": 0,
                                "ot": 0, "otn": 0, "late": 0, "acc_sum": 0.0, "acc_n": 0, "double": 0, "hand_sum": 0.0, "hand_n": 0,
-                               "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {}}
+                               "wait_sum": 0.0, "wait_n": 0, "first_at": None, "last_at": None, "first_late_days": 0, "planned_days_worked": 0, "day_rows": {},
+                               "fptod_sum": 0.0, "fwithin": 0, "fot": 0, "kx_sum": 0.0, "fhours": 0.0}
         out = []
         for rid, x in riders.items():
             n, exc = hb.get(rid, (0, 0))
@@ -1367,13 +1384,22 @@ class Store:
                  "planned_days": len(sh), "planned_days_worked": x["planned_days_worked"], "first_late_days": x["first_late_days"],
                  "shift": f"{today_shift['start']}–{today_shift['end']}" if today_shift and today_shift.get("start") else ("" if not sh else "planned"),
                  "shift_start": today_shift.get("start") if today_shift else None, "shift_end": today_shift.get("end") if today_shift else None,
-                 "in_sheet": bool(sh), "no_order_planned_days": max(0, len(sh) - x["planned_days_worked"])}
+                 "in_sheet": bool(sh), "no_order_planned_days": max(0, len(sh) - x["planned_days_worked"]),
+                 # 9.8 fair numbers (kitchen delay beyond 5 min taken out) — these make the score
+                 "on_time_fair_pct": _pct(x["fot"], x["otn"]), "within_fair_pct": _pct(x["fwithin"], x["ptod_n"]),
+                 "avg_ptod_fair": round(x["fptod_sum"] / x["ptod_n"], 1) if x["ptod_n"] else None,
+                 "hours_fair": round(x["fhours"], 1), "per_hour_fair": round(x["delivered"] / x["fhours"], 1) if x["fhours"] else None,
+                 "kitchen_lost_min": round(x["kx_sum"])}
             o["usual_pct"] = round(100 * x["delivered"] / (usual[rid] * max(1, x["days"] or 1))) if usual.get(rid) and (x["delivered"] or x["days"]) else None
             out.append(o)
-        scored = [r for r in out if (r["delivered"] or 0) >= 3 and r["per_hour"]]
-        avg_per_h = (sum(r["per_hour"] for r in scored) / len(scored)) if scored else None
+        scored = [r for r in out if (r["delivered"] or 0) >= 3 and r["per_hour_fair"]]
+        avg_per_h = (sum(r["per_hour_fair"] for r in scored) / len(scored)) if scored else None
+        by_city = {}                                    # 9.8: a rider is compared with the riders of his own city
+        for r in scored:
+            by_city.setdefault(r["city"], []).append(r["per_hour_fair"])
+        city_avg = {c: sum(v) / len(v) for c, v in by_city.items() if len(v) >= 3}
         for r in out:
-            s = self.rider_score(r, avg_per_h, rules)
+            s = self.rider_score(r, city_avg.get(r["city"], avg_per_h), rules)
             r["score"] = s["score"] if s else None
             r["score_parts"] = s
         out.sort(key=lambda r: (-(r["score"] if r["score"] is not None else -1), -r["delivered"], r["rider"]))

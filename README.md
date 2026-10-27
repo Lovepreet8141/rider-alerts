@@ -23,6 +23,41 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.8.0 — Fair rider score · weekly review · accounts that move together (Riders & fleets page)
+
+* **Fair score.** Kitchen waits are no longer counted against riders. Anything a rider waited at a restaurant beyond a
+  normal 5 minutes is taken out of his on-time, his delivery time (PTOD) and his working hours before scoring.
+  - Speed is now compared with the average of riders in **his own city** (when the city has 3+ riders), not with the whole network.
+  - The rider drawer shows how the score is made up (customer / speed / reliability), what each part lost, and the
+    kitchen minutes that were not counted.
+  - The morning Intercom scorecard uses the fair on-time and gives the rider the one tip that matters most for him.
+* **Weekly review** (last Monday–Sunday, with the two weeks before) — three tabs:
+  - **Talk**: under 60 two weeks running. A third week under 60 is marked as your block rule.
+  - **Watch**: 60–79, or under 60 for the first time.
+  - **Top**: 80 and more — first pick for peak and rain shifts.
+  - Every rider gets "the one thing to fix" in plain words, and there is a Message button.
+* **Accounts that move together** (7 / 14 / 28 days). Flags two accounts that keep picking up at the same restaurant
+  within 4 minutes and delivering within 8 minutes of each other. For each pair it shows:
+  - the share of orders done together and on how many days
+  - same start and end of the day
+  - GPS together (last 2 days)
+  - same phone number
+  - Click a pair for the orders, with both order numbers to check in MotionTools.
+  - Evidence only: nothing is blocked and no rider is messaged automatically.
+
+## 9.7.2 — Faster pages at 8–10k orders a day
+
+Measured on a test database with 8,000–10,000 orders a day and ~600 live orders, at laptop speed:
+* **City board** shows in 1.6 s (was 3.8 s) and stays responsive: the browser was frozen 11 s out of every 31 s, now 1.5 s.
+  - It is only drawn while it is on screen (Settings, Orders etc. no longer redraw it in the background every 15 s);
+    alerts and the alert sound keep working on every page.
+  - Map pins are moved instead of rebuilt every 15 s, and no longer get a graphics layer each.
+  - The per-second clocks look orders up directly instead of searching the whole list each time.
+  - Live rows below the screen are not drawn until you scroll to them.
+* **Orders** shows the first 200 rows at once (was all up to 2,500 → 6.7 s and a 4-second freeze), "Show 200 more" / "Show all".
+* **Every page**: fonts and the map library no longer hold up the first paint; the map library loads when the map is needed.
+  The pulsing "live" dot no longer makes the browser repaint the page 60 times a second.
+
 ## 9.7.1 — Morning report: long restaurant waits in Slack with @here + the sheet to download (new file: gsheet.py · requirements: openpyxl)
 
 * **Every day at 10:00 (Berlin)** — the time can be changed in Settings — a message starting with **@here** goes to

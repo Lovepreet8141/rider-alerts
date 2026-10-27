@@ -204,7 +204,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.7.1"
+VERSION = "9.8.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1105,6 +1105,8 @@ def prewarm_v2():
         _v2_performance_data(period="today", city="", frm="", to="")
         _v2_restaurants_data(period="today", city="", minutes=10, frm="", to="")
         _v2_rider_stats(period="today", city="", fleet="", frm="", to="")
+        _v2_review_data(city="", fleet="")              # weekly review + accounts that move together (Riders page)
+        _v2_twins_data(city="", days=14)
     except Exception as e:
         log.warning("v2 prewarm: %s", e)
     while True:                                        # weather for the staffing forecast: every hour
@@ -2742,15 +2744,16 @@ def automation_tick(now: datetime, trace: list = None) -> list:
         for r in rs["riders"]:
             if not r["delivered"]:
                 continue
-            worst = None
-            parts = {"restaurant wait": r.get("avg_wait"), "acceptance": r.get("avg_accept"), "handover": r.get("avg_handover")}
-            if (r.get("avg_wait") or 0) >= rules.wait_restaurant_min:
-                worst = "restaurant wait"
-            elif (r.get("avg_accept") or 0) >= 3:
-                worst = "accept faster"
-            elif (r.get("handbacks_bad") or 0):
-                worst = "no hand-backs"
-            fire("scorecard", r["rider_id"], r["rider"], f"scorecard:{yday}", "", deliveries=r["delivered"], on_time=r["on_time_pct"] if r["on_time_pct"] is not None else "–",
+            worst = None                                   # 9.8: only what the rider himself can change (kitchen waits are not his)
+            lost = ((r.get("score_parts") or {}).get("lost") or {})
+            tips = {"accept": "accept faster", "handbacks": "no hand-backs", "handover": "quick hand-over at the door",
+                    "sheet": "start your shift on time", "productivity": "take the next order quickly", "on_time": "go straight to the customer",
+                    "ptod": "go straight to the customer"}
+            big = max(lost.items(), key=lambda kv: kv[1]) if lost else None
+            if big and big[1] >= 2:
+                worst = tips.get(big[0])
+            ot = r.get("on_time_fair_pct", r.get("on_time_pct"))
+            fire("scorecard", r["rider_id"], r["rider"], f"scorecard:{yday}", "", deliveries=r["delivered"], on_time=ot if ot is not None else "–",
                  score=r["score"] if r["score"] is not None else "–", tip=worst or "keep it up")
     return out
 
@@ -4210,6 +4213,83 @@ def _v2_riders_now(city: str, fleet: str, now: datetime) -> tuple:
     return counts, checks
 
 
+def _fix_text(r: dict) -> tuple:
+    """The one thing that cost the rider the most points — said so the team can tell him (only what he can change)."""
+    parts = r.get("score_parts") or {}
+    lost = parts.get("lost") or {}
+    if not lost:
+        return "", ""
+    k, v = max(lost.items(), key=lambda kv: kv[1])
+    if v < 2:
+        return "", "nothing big — keep it up"
+    t = {"accept": f"accepts in {r.get('avg_accept')}′ (should be 2′)",
+         "handbacks": f"{r.get('handbacks_bad')} hand-back{'s' if (r.get('handbacks_bad') or 0) != 1 else ''} that were not the kitchen's fault",
+         "handover": f"{r.get('avg_handover')}′ at the door (should be 3′)",
+         "sheet": (f"no order on {r.get('no_order_planned_days')} of {r.get('planned_days')} planned days" if r.get("no_order_planned_days")
+                   else f"first order late on {r.get('first_late_days')} planned days"),
+         "productivity": f"{r.get('per_hour_fair')} deliveries per working hour (city average {parts.get('avg_per_hour')})",
+         "on_time": f"on time {r.get('on_time_fair_pct')} % even without kitchen delays",
+         "ptod": f"{r.get('avg_ptod_fair')}′ per delivery even without kitchen delays"}
+    return k, t.get(k, k)
+
+
+@report_cache(600, 3600, live_if=lambda kw: False)
+def _v2_review_data(city: str = "", fleet: str = "") -> dict:
+    """Last week (Mon–Sun) per rider, with the two weeks before: who to talk to, who to watch, who did great."""
+    now = datetime.now(UTC)
+    today = _date.fromisoformat(day_key(now))
+    mon = today - timedelta(days=today.weekday())
+    weeks = [(mon - timedelta(days=7 * k), mon - timedelta(days=7 * k - 6)) for k in (3, 2, 1)]      # oldest → last week
+    stats = [store.rider_stats("custom", now, rules, city=city, fleet=fleet, span=(a.isoformat(), b.isoformat())) for a, b in weeks]
+    prev = [{r["rider_id"]: r["score"] for r in st["riders"]} for st in stats[:2]]
+    talk, watch, top = [], [], []
+    for r in stats[2]["riders"]:
+        s0 = r["score"]
+        if s0 is None:
+            continue
+        s2, s1 = prev[0].get(r["rider_id"]), prev[1].get(r["rider_id"])
+        key, fix = _fix_text(r)
+        row = {"id": r["rider_id"], "name": r["rider"], "city": r["city"], "fleet": r["fleet"], "scores": [s2, s1, s0], "score": s0,
+               "fix_key": key, "fix": fix, "delivered": r["delivered"], "days": r["days"], "kitchen_lost": r.get("kitchen_lost_min"),
+               "phone": projector.phone_for(r["rider_id"], (STATE["riders"].get(r["rider_id"]) or {}).get("phone") or "")}
+        if s0 < 60 and s1 is not None and s1 < 60:
+            row["block"] = s2 is not None and s2 < 60
+            talk.append(row)
+        elif s0 < 80:
+            row["first_time"] = s0 < 60
+            watch.append(row)
+        else:
+            top.append(row)
+    talk.sort(key=lambda x: (not x.get("block"), x["score"]))
+    watch.sort(key=lambda x: x["score"])
+    top.sort(key=lambda x: (-x["score"], -x["delivered"]))
+    a, b = weeks[2]
+    return {"from": a.isoformat(), "to": b.isoformat(), "city": city, "fleet": fleet, "talk": talk, "watch": watch, "top": top[:20],
+            "counts": {"talk": len(talk), "watch": len(watch), "top": len(top), "block": sum(1 for x in talk if x.get("block"))}}
+
+
+@app.get("/api/v2/review", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_review(city: str = "", fleet: str = ""):
+    return _v2_review_data(city=city, fleet=fleet)
+
+
+@report_cache(600, 900, live_if=lambda kw: False)
+def _v2_twins_data(city: str = "", days: int = 14) -> dict:
+    phones = dict(projector.phones)
+    for rid, st in list(STATE["riders"].items()):
+        if st.get("phone"):
+            phones.setdefault(rid, st["phone"])
+    return analytics.twins(store, datetime.now(UTC), days=days, city=city, phones=phones)
+
+
+@app.get("/api/v2/twins", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_twins(city: str = "", days: int = 14):
+    """Rider accounts that move together (two accounts, one person?) — evidence to check, nothing automatic."""
+    return _v2_twins_data(city=city, days=max(3, min(28, int(days or 14))))
+
+
 @app.get("/api/v2/riders", dependencies=[Depends(require_login)])
 @fast_json
 def api_v2_riders(period: str = "today", city: str = "", fleet: str = "", frm: str = Query("", alias="from"), to: str = ""):
@@ -4229,6 +4309,8 @@ def api_v2_riders(period: str = "today", city: str = "", fleet: str = "", frm: s
                      "on_time_pct": r["on_time_pct"], "accept": r["avg_accept"], "wait": r["avg_wait"], "handbacks": r["handbacks_bad"],
                      "handbacks_excused": r["handbacks_excused"], "double": r["double"], "usual": r["usual"], "score": r["score"],
                      "cancelled": r["cancelled"], "user": INTERCOM_USER.get(r["rider_id"], ""),
+                     "on_time_fair": r.get("on_time_fair_pct"), "ptod_fair": r.get("avg_ptod_fair"), "per_hour_fair": r.get("per_hour_fair"),
+                     "kitchen_lost": r.get("kitchen_lost_min"), "parts": r.get("score_parts"),
                      "phone": st.get("phone") or projector.phones.get(r["rider_id"], ""), "last_at": r["last_at"]})
     worked = [r for r in rows if r["delivered"]]
     delivered = sum(r["delivered"] for r in worked)

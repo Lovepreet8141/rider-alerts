@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections import Counter
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -1344,3 +1345,110 @@ def late_risk(orders: list, now: datetime, target: int, avgs: dict, city_of) -> 
     over.sort(key=lambda r: -r["elapsed"])
     return {"risk": risk[:60], "over": over[:60], "n_risk": len(risk), "n_over": len(over),
             "live": sum(1 for o in orders if o.get("phase") not in ("delivered", "cancelled", "closed", "on_hold") and o.get("dispatched_at"))}
+
+
+# ====================================================================== 9.8 — accounts that move together
+def _jd_hm(m):
+    """minutes since the Julian epoch (SQLite julianday × 1440) → 'HH:MM' Berlin."""
+    from datetime import timezone as _tz
+    if m is None:
+        return ""
+    return datetime.fromtimestamp((m / 1440 - 2440587.5) * 86400, _tz.utc).astimezone(BERLIN).strftime("%H:%M")
+
+
+def twins(store, now: datetime, days: int = 14, city: str = "", phones: dict = None, pick_win: float = 4, drop_win: float = 8) -> dict:
+    """Pairs of rider accounts that keep doing the same orders at the same time: picked up at the same restaurant within
+    `pick_win` min of each other and delivered within `drop_win` min of each other. Once or twice is normal (orders paired
+    at peak); on most of their orders, on several days, two accounts move as one. GPS (kept 2 days) and working hours
+    are added as extra evidence. Only shown in the dashboard — nobody is blocked or messaged automatically."""
+    today = day_key(now)
+    a = (_d(today) - timedelta(days=days)).isoformat()
+    b = (_d(today) - timedelta(days=1)).isoformat()
+    w, args = ("day BETWEEN ? AND ? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != '' "
+               "AND picked_up_at IS NOT NULL AND delivered_at IS NOT NULL"), [a, b]
+    if city:
+        w += " AND city=?"; args.append(city)
+    rows = store._rows("SELECT id, ref, rider_id, rider, fleet, city, restaurant, day, julianday(picked_up_at) * 1440 AS pm, "
+                       f"julianday(delivered_at) * 1440 AS dm FROM orders WHERE {w} ORDER BY city, restaurant, pm", args)
+    total, name, fleet, rcity = Counter(), {}, {}, {}
+    span = {}                                      # (rider, day) -> [first pickup, last delivery]
+    for r in rows:
+        rid = r["rider_id"]
+        total[rid] += 1
+        name[rid] = r["rider"] or name.get(rid) or rid[:8]
+        fleet[rid] = r["fleet"] or fleet.get(rid, "")
+        rcity[rid] = r["city"] or rcity.get(rid, "")
+        s = span.setdefault((rid, r["day"]), [r["pm"], r["dm"]])
+        s[0] = min(s[0], r["pm"]); s[1] = max(s[1], r["dm"])
+    pairs = {}
+    n = len(rows)
+    for i in range(n):
+        x = rows[i]
+        for j in range(i + 1, n):
+            y = rows[j]
+            if y["restaurant"] != x["restaurant"] or y["city"] != x["city"] or y["pm"] - x["pm"] > pick_win:
+                break
+            if y["rider_id"] == x["rider_id"] or abs(y["dm"] - x["dm"]) > drop_win:
+                continue
+            k = tuple(sorted((x["rider_id"], y["rider_id"])))
+            o1, o2 = (x, y) if x["rider_id"] == k[0] else (y, x)
+            p = pairs.setdefault(k, {"a": set(), "b": set(), "days": set(), "ex": [], "rest": Counter()})
+            p["a"].add(o1["id"]); p["b"].add(o2["id"]); p["days"].add(x["day"]); p["rest"][x["restaurant"]] += 1
+            if len(p["ex"]) < 400:
+                p["ex"].append((x["day"], x["restaurant"], o1["ref"], o2["ref"], o1["pm"], o2["pm"], o1["dm"], o2["dm"]))
+    out = []
+    for (ra, rb), p in pairs.items():
+        tw = min(len(p["a"]), len(p["b"]))
+        base = min(total[ra], total[rb]) or 1
+        share = tw / base
+        if tw < 6 or len(p["days"]) < 2 or share < 0.3:
+            continue
+        both = [d for (r_, d) in span if r_ == ra and (rb, d) in span]
+        same = sum(1 for d in both if abs(span[(ra, d)][0] - span[(rb, d)][0]) <= 15 and abs(span[(ra, d)][1] - span[(rb, d)][1]) <= 15)
+        ex = sorted(p["ex"], key=lambda e: (e[0], e[4]), reverse=True)[:12]
+        pa, pb = (phones or {}).get(ra, ""), (phones or {}).get(rb, "")
+        digits = lambda s: "".join(ch for ch in str(s or "") if ch.isdigit())[-9:]
+        out.append({"a": ra, "b": rb, "name_a": name[ra], "name_b": name[rb], "fleet_a": fleet[ra], "fleet_b": fleet[rb],
+                    "city": rcity[ra] or rcity[rb], "together": tw, "share": round(share * 100), "days": len(p["days"]),
+                    "deliveries_a": total[ra], "deliveries_b": total[rb], "shared_days": len(both), "same_hours_days": same,
+                    "same_phone": bool(digits(pa)) and digits(pa) == digits(pb),
+                    "restaurants": [r_ for r_, _ in p["rest"].most_common(3)],
+                    "level": "strong" if share >= 0.6 and len(p["days"]) >= 3 else "likely" if share >= 0.45 else "check",
+                    "examples": [{"day": e[0], "restaurant": e[1], "ref_a": e[2], "ref_b": e[3], "pick_a": _jd_hm(e[4]), "pick_b": _jd_hm(e[5]),
+                                  "drop_a": _jd_hm(e[6]), "drop_b": _jd_hm(e[7])} for e in ex]})
+    # GPS: how often both accounts were within 120 m of each other while moving (positions are kept 2 days)
+    ids = sorted({x for p in out for x in (p["a"], p["b"])})
+    gps = {}
+    if ids:
+        since = (now - timedelta(days=2)).isoformat(timespec="seconds")
+        q = ",".join("?" * len(ids))
+        for r in store._rows(f"SELECT rider_id, CAST(julianday(at) * 1440 AS INTEGER) AS m, lat, lng FROM positions WHERE at >= ? AND rider_id IN ({q})",
+                             [since] + ids):
+            gps.setdefault(r["rider_id"], {})[r["m"]] = (r["lat"], r["lng"])
+    for p in out:
+        ga, gb = gps.get(p["a"], {}), gps.get(p["b"], {})
+        both = close = 0
+        for m, (la, lo) in ga.items():
+            q2 = gb.get(m) or gb.get(m - 1) or gb.get(m + 1)
+            if not q2:
+                continue
+            prev = ga.get(m - 5) or ga.get(m - 4) or ga.get(m - 6)
+            moving = prev is not None and _meters(prev, (la, lo)) > 100
+            if not moving:
+                continue
+            both += 1
+            close += _meters((la, lo), q2) <= 120
+        p["gps_minutes"] = both
+        p["gps_together"] = round(close / both * 100) if both >= 15 else None
+        if p["gps_together"] is not None and p["gps_together"] >= 70 and p["level"] != "strong":
+            p["level"] = "likely" if p["level"] == "check" else "strong"
+    rank = {"strong": 0, "likely": 1, "check": 2}
+    out.sort(key=lambda p: (rank[p["level"]], -p["share"], -p["together"]))
+    return {"from": a, "to": b, "days": days, "city": city, "pairs": out[:60], "riders": len(total),
+            "rule": f"picked up at the same restaurant within {pick_win:g} min and delivered within {drop_win:g} min of each other"}
+
+
+def _meters(p, q):
+    la1, lo1 = map(math.radians, p); la2, lo2 = map(math.radians, q)
+    x = (lo2 - lo1) * math.cos((la1 + la2) / 2)
+    return math.hypot(x, la2 - la1) * 6371000
