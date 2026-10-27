@@ -114,12 +114,15 @@ def period_range(period: str, now: datetime):
         local = datetime.strptime(period, "%Y-%m-%d").replace(hour=DAY_STARTS_AT, tzinfo=BERLIN)
         return local.astimezone(UTC), (local + timedelta(days=1)).astimezone(UTC)
     start = day_start(now)
+    # days and weeks are counted on Berlin's wall clock: across the clock change (last Sunday of March / October)
+    # a day has 23 or 25 hours — subtracting 24 h in UTC would cut or add an hour
     if period == "yesterday":
-        return start - timedelta(days=1), start
+        local = start.astimezone(BERLIN)
+        return (local - timedelta(days=1)).astimezone(UTC), start
     if period == "lastweek":
         local = start.astimezone(BERLIN)
-        this_week = (local - timedelta(days=local.weekday())).astimezone(UTC)
-        return this_week - timedelta(days=7), this_week
+        this_week = local - timedelta(days=local.weekday())
+        return (this_week - timedelta(days=7)).astimezone(UTC), this_week.astimezone(UTC)
     if period == "week":
         local = start.astimezone(BERLIN)
         start = (local - timedelta(days=local.weekday())).astimezone(UTC)

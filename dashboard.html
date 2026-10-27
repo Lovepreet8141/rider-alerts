@@ -183,7 +183,7 @@
   <section id="orders">
     <h2>All orders <span class="sp"></span>
       <input id="q" placeholder="search order, rider, restaurant, address" style="min-width:260px">
-      <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">Week</button><button data-p="month">Month</button></span><input type="date" data-day="orders" title="any single day" style="padding:5px 8px">
+      <span class="seg" data-periods="orders"><button data-p="today" class="active">Today</button><button data-p="yesterday">Yesterday</button><button data-p="week">This week</button><button data-p="lastweek" title="Monday to Sunday of last week">Last week</button><button data-p="month">Month</button></span><input type="date" data-day="orders" title="any single day" style="padding:5px 8px">
       <a class="btn" id="csvOrders" href="/export.csv?period=today">⬇ CSV</a>
       <span class="muted" style="font-size:12px;text-transform:none;letter-spacing:0;font-weight:400" title="Orders whose rider waited at least this long at the restaurant (first arrival → pickup)">waited ≥ <input type="number" id="waitMin" value="10" min="1" max="120" style="width:52px;padding:4px 6px"> min</span>
       <a class="btn" id="pdfOrders" href="/export/waits.pdf?period=today&minutes=10">⬇ PDF long waits</a></h2>

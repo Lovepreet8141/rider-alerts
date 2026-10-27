@@ -23,6 +23,13 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.2.1 — "Last week" (Monday–Sunday) on the Orders page · clock-change fix
+
+* Orders page: Today · Yesterday · This week · **Last week** (Monday 00:00 – Sunday 24:00) · Month. The CSV and the
+  long-waits PDF follow the chosen period.
+* Fix: "Last week" and "Yesterday" are counted on Berlin's wall clock. Across the clock change (last Sunday of March /
+  October) they had lost or gained an hour (last week started Monday 01:00 instead of 00:00).
+
 ## 9.2.0 — PDF of long restaurant waits (new file: pdf_report.py · requirements: fpdf2)
 
 * Orders page → "waited ≥ [10] min" + "⬇ PDF long waits" (Today / Yesterday / Week / Month / any day, current city).
