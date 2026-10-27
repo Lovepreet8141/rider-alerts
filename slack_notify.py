@@ -25,6 +25,13 @@ import httpx
 log = logging.getLogger("slack")
 UTC = timezone.utc
 WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# 9.7: the morning reports (daily long waits, Monday waiting report) can go to another channel of your own team, e.g.
+# Quickzii ops — its own webhook, also only in Railway. Without it they use SLACK_WEBHOOK_URL.
+REPORT_WEBHOOK = os.environ.get("SLACK_REPORT_WEBHOOK_URL", "").strip()
+
+
+def report_url() -> str:
+    return REPORT_WEBHOOK or WEBHOOK
 
 
 def _norm(s: str) -> str:
@@ -52,6 +59,11 @@ class SlackNotifier:
             store.set_settings({"slack_events": s["slack_events"] + ",weekly", "mig_slack_weekly": "1"})
         elif s.get("mig_slack_weekly") != "1":
             store.set_settings({"mig_slack_weekly": "1"})
+        s = store.get_settings()                  # 9.7, once: the daily long-waits report (sheet + Slack) starts switched on
+        if s.get("slack_events") and s.get("mig_slack_daily") != "1" and "daily" not in s["slack_events"].split(","):
+            store.set_settings({"slack_events": s["slack_events"] + ",daily", "mig_slack_daily": "1"})
+        elif s.get("mig_slack_daily") != "1":
+            store.set_settings({"mig_slack_daily": "1"})
 
     # ---- settings
     def cfg(self) -> dict:
@@ -65,7 +77,7 @@ class SlackNotifier:
             rest = max(1, int(s.get("slack_rest_min") or 10))
         except ValueError:
             rest = 10
-        events = set((s.get("slack_events") or "new,norider,rest,cancel,weekly").split(","))
+        events = set((s.get("slack_events") or "new,norider,rest,cancel,weekly,daily").split(","))
         return {"names": names, "no_rider_min": norider, "rest_min": rest, "events": events, "on": bool(WEBHOOK) and bool(names)}
 
     def match(self, restaurant: str, names: list) -> str:
@@ -78,8 +90,9 @@ class SlackNotifier:
         return ""
 
     # ---- sending
-    async def send(self, text: str) -> bool:
-        if not WEBHOOK:
+    async def send(self, text: str, url: str = "") -> bool:
+        target = url or WEBHOOK
+        if not target:
             return False
         wait = 1.1 - (time.time() - self._last_send)           # Slack: about one message per second per webhook
         if wait > 0:
@@ -90,11 +103,11 @@ class SlackNotifier:
             self.stats.update(day=today, posted=0, failed=0)
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(WEBHOOK, json={"text": text, "unfurl_links": False, "unfurl_media": False})
+                r = await c.post(target, json={"text": text, "unfurl_links": False, "unfurl_media": False})
             if r.status_code == 429:
                 await asyncio.sleep(min(30, float(r.headers.get("Retry-After", "2") or 2)))
                 async with httpx.AsyncClient(timeout=10) as c:
-                    r = await c.post(WEBHOOK, json={"text": text, "unfurl_links": False, "unfurl_media": False})
+                    r = await c.post(target, json={"text": text, "unfurl_links": False, "unfurl_media": False})
             if r.status_code >= 300:
                 raise RuntimeError(f"Slack {r.status_code}: {r.text[:120]}")
             self.stats["posted"] += 1

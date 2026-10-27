@@ -23,6 +23,8 @@ import shutil
 import threading
 import time
 from datetime import datetime, timedelta
+from datetime import date as _date, time as _dtime
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 
@@ -202,7 +204,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.6.0"
+VERSION = "9.7.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1506,7 +1508,7 @@ async def slack_loop():
 
 @app.get("/api/slack", dependencies=[Depends(require_login)])
 def api_slack():
-    return slack.status(list(STATE["orders"].values()))
+    return {**slack.status(list(STATE["orders"].values())), **_report_cfg()}
 
 
 @app.post("/api/slack", dependencies=[Depends(require_login)])
@@ -1521,9 +1523,17 @@ async def api_slack_save(request: Request):
         rest = str(max(1, min(120, int(b.get("rest_min") or 10))))
     except (TypeError, ValueError):
         rest = "10"
-    ev = ",".join(e for e in ("new", "norider", "rest", "cancel", "weekly") if e in (b.get("events") or []))
-    store.set_settings({"slack_restaurants": names, "slack_no_rider_min": mins, "slack_rest_min": rest, "slack_events": ev})
-    return slack.status(list(STATE["orders"].values()))
+    ev = ",".join(e for e in ("new", "norider", "rest", "cancel", "weekly", "daily") if e in (b.get("events") or []))
+    upd = {"slack_restaurants": names, "slack_no_rider_min": mins, "slack_rest_min": rest, "slack_events": ev}
+    if "report_time" in b and re.fullmatch(r"\d{1,2}:\d{2}", str(b.get("report_time") or "").strip()):
+        upd["report_time"] = str(b["report_time"]).strip()
+    if "gsheet" in b:
+        g = str(b.get("gsheet") or "").strip()
+        if g and not gsheet.sheet_id_from(g):
+            raise HTTPException(400, "That is not a Google Sheets link")
+        upd["gsheet_id"] = gsheet.sheet_id_from(g)
+    store.set_settings(upd)
+    return {**slack.status(list(STATE["orders"].values())), **_report_cfg()}
 
 
 @app.post("/api/slack/test", dependencies=[Depends(require_login)])
@@ -1633,8 +1643,25 @@ def weekly_report(now: datetime = None) -> dict:
     return {"text": "\n".join(L), "week": P["a"]}
 
 
+def _report_time(st: dict) -> tuple:
+    """When the morning reports go out (Settings → Slack), Berlin time. Default 10:00."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", (st.get("report_time") or "10:00").strip())
+    h, mi = (int(m.group(1)), int(m.group(2))) if m else (10, 0)
+    return (h, mi) if 0 <= h < 24 and 0 <= mi < 60 else (10, 0)
+
+
+def _report_url() -> str:
+    import slack_notify
+    return slack_notify.report_url()
+
+
+_DAILY_TRY = {"day": "", "n": 0, "next": 0.0}
+
+
 async def weekly_report_loop():
-    """Mondays from 08:30 (Berlin): last week's waiting report to the team's own Slack channel — once per week."""
+    """Every morning at the report time (default 10:00 Berlin): yesterday's long restaurant waits → Google Sheet +
+    a message with @here in the team's own channel. Mondays also last week (sheet tabs + the waiting report).
+    Each once per day / week; a restart after the time sends what is still due."""
     from starlette.concurrency import run_in_threadpool
     await asyncio.sleep(90)
     while True:
@@ -1642,17 +1669,204 @@ async def weekly_report_loop():
             now = datetime.now(UTC)
             loc = now.astimezone(BERLIN)
             st = store.get_settings()
-            events = set((st.get("slack_events") or "new,norider,rest,cancel,weekly").split(","))
+            events = set((st.get("slack_events") or "new,norider,rest,cancel,weekly,daily").split(","))
+            rt = _report_time(st)
+            after = (loc.hour, loc.minute) >= rt
+            today = loc.date().isoformat()
+            url = _report_url()
+            ready = bool(url) or bool(gsheet.sheet_id_from(st.get("gsheet_id") or ""))
+            mins_late = (loc.hour * 60 + loc.minute) - (rt[0] * 60 + rt[1])
+            if "daily" in events and after and mins_late >= 8 * 60 and st.get("daily_report_sent") != today:
+                store.set_settings({"daily_report_sent": today})       # far too late today (e.g. a deploy at night): tomorrow again
+                log.info("daily long-waits report skipped today — started %d min after the report time", mins_late)
+                st = store.get_settings()
+            if "daily" in events and after and ready and st.get("daily_report_sent") != today \
+                    and not (_DAILY_TRY["day"] == today and time.time() < _DAILY_TRY["next"]):
+                rep = await run_in_threadpool(daily_report, now)
+                ok = await slack.send(rep["text"], url=url) if url else True
+                if _DAILY_TRY["day"] != today:
+                    _DAILY_TRY.update(day=today, n=0)
+                _DAILY_TRY["n"] += 1
+                done = ok and (rep["sheet"]["ok"] or not rep["sheet"]["configured"])
+                store.set_settings({"daily_report_last": json.dumps({"at": iso(now), "slack": ok, "sheet": rep["sheet"]["ok"],
+                                                                     "error": rep["sheet"]["error"] or ("" if ok else slack.stats.get("last_error", "")),
+                                                                     "orders": rep["n"]})})
+                if done or _DAILY_TRY["n"] >= 3:                     # a failure is retried twice, 10 minutes apart
+                    store.set_settings({"daily_report_sent": today})
+                    log.info("daily long-waits report done (slack %s, sheet %s)", ok, rep["sheet"]["ok"])
+                else:
+                    _DAILY_TRY["next"] = time.time() + 600
             monday = (loc - timedelta(days=loc.weekday())).date().isoformat()
-            due = loc.weekday() == 1 or (loc.weekday() == 0 and (loc.hour, loc.minute) >= (8, 30))
-            if slack_notify_webhook() and "weekly" in events and due and st.get("slack_weekly_sent") != monday:
+            due_w = loc.weekday() == 1 or (loc.weekday() == 0 and after)
+            if url and "weekly" in events and due_w and st.get("slack_weekly_sent") != monday \
+                    and ("daily" not in events or store.get_settings().get("daily_report_sent") == today or loc.weekday() == 1):
                 rep = await run_in_threadpool(weekly_report, now)
-                if await slack.send(rep["text"]):
+                if await slack.send(rep["text"], url=url):
                     store.set_settings({"slack_weekly_sent": monday})
                     log.info("weekly waiting report posted to Slack")
         except Exception as e:
-            log.warning("weekly report: %s", e)
-        await asyncio.sleep(300)
+            log.warning("morning reports: %s", e)
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------- 9.7: the daily long-waits sheet
+import gsheet  # noqa: E402
+
+
+def _long_wait_rows(a, b, now: datetime) -> list:
+    """Every order of the days a..b whose rider waited 10+ min at the restaurant — the same orders as the long-waits
+    PDF/CSV — with a real date, times, PTOD and the MotionTools link. No customer data."""
+    data, orders = _waits_data("today", "", 10, a.isoformat(), b.isoformat(), now=now, with_orders=True)
+    by_ref = {(o.get("ref") or ""): o for o in orders}
+    hm = lambda x: _dtime(int(x[:2]), int(x[3:5])) if isinstance(x, str) and re.fullmatch(r"\d{2}:\d{2}", x) else None
+    out = []
+    for g in data["groups"]:
+        for r in g["rows"]:
+            o = by_ref.get(r[1]) or {}
+            try:
+                dd, mm = (int(x) for x in str(r[0]).split()[1].strip(".").split(".")[:2])
+                d = _date(a.year, mm, dd)
+                if d < a:
+                    d = _date(a.year + 1, mm, dd)
+            except (ValueError, IndexError):
+                d = a
+            try:
+                w = int(str(r[7]).split()[0])
+            except (ValueError, IndexError):
+                continue
+            ptod = (o.get("phases") or {}).get("ptod") if o.get("phase") == "delivered" else None
+            if ptod is None and str(r[9]).split()[0].isdigit():
+                ptod = int(str(r[9]).split()[0])
+            out.append({"date": d, "city": g["city"] or "?", "rest": g["restaurant"], "ref": r[1], "rider": r[2] if r[2] != "–" else "",
+                        "disp": hm(r[3]), "arr": hm(r[5]), "pick": hm(r[6]), "wait": w, "deliv": hm(r[8]),
+                        "ptod": round(ptod) if ptod is not None else None, "note": r[10] or "", "link": mt_link(o) if o else ""})
+    return out
+
+
+def _delivered_by_city(a, b, now: datetime) -> dict:
+    today, out = day_key(now), {}
+    for d in analytics._days(a.isoformat(), b.isoformat()):
+        for c, v in analytics.perf_day(store, rules, d, today)["tot"].items():
+            if c and c != "?":
+                out[c] = out.get(c, 0) + int(v[analytics.I["delivered"]] or 0)
+    return {c: n for c, n in out.items() if n}
+
+
+def _sheet_part(a, b, now: datetime, label: str) -> dict:
+    return {"rows": _long_wait_rows(a, b, now), "delivered": _delivered_by_city(a, b, now), "label": label, "a": a, "b": b}
+
+
+def _waits_line(part: dict) -> tuple:
+    rows, tot = part["rows"], sum(part["delivered"].values())
+    ws = [r["wait"] for r in rows]
+    lost = sum(max(0, w - 5) for w in ws) / 60
+    pct = round(len(ws) / tot * 100) if tot else 0
+    return ws, tot, lost, pct
+
+
+def daily_report(now: datetime = None, write_sheet: bool = True, force_week: bool = False) -> dict:
+    """Yesterday's long restaurant waits: write the Google Sheet (Mondays also last week) and build the Slack text."""
+    now = now or datetime.now(UTC)
+    loc = now.astimezone(BERLIN)
+    today = loc.date()
+    y = today - timedelta(days=1)
+    mon = today - timedelta(days=today.weekday())
+    lwa, lwb = mon - timedelta(days=7), mon - timedelta(days=1)
+    st = store.get_settings()
+    sid = gsheet.sheet_id_from(st.get("gsheet_id") or "")
+    Y = _sheet_part(y, y, now, f"Yesterday · {y:%A} {y.day} {y:%B %Y}")
+    is_monday = today.weekday() == 0
+    LW = None
+    need_week = is_monday or (write_sheet and sid and (force_week or st.get("gsheet_week") != lwa.isoformat()))
+    if not need_week and write_sheet and sid and not gsheet.key_problem():
+        try:
+            need_week = bool(gsheet.missing(sid, ["Last week", "Last week orders"]))
+        except Exception:
+            pass
+    if need_week:
+        LW = _sheet_part(lwa, lwb, now, f"Monday {lwa.day} {lwa:%B} – Sunday {lwb.day} {lwb:%B %Y}")
+    problem = gsheet.key_problem()
+    sheet = {"configured": bool(sid) and not problem, "ok": False, "url": gsheet.sheet_url(sid) if sid else "", "error": ""}
+    if write_sheet and sheet["configured"]:
+        try:
+            gids = gsheet.write(sid, gsheet.build(Y, LW))
+            sheet.update(ok=True, url=gsheet.sheet_url(sid, gids.get("Yesterday")))
+            if LW is not None:
+                store.set_settings({"gsheet_week": lwa.isoformat()})
+        except Exception as e:
+            sheet["error"] = str(e)[:240]
+            log.warning("long-waits sheet: %s", e)
+    elif sid and problem:
+        sheet["error"] = problem
+    # the Slack text — no customer data, no rider names
+    base = _public_url()
+    link = lambda path, text: f"<{base}{path}|{text}>" if base else text
+    ws, tot, lost, pct = _waits_line(Y)
+    L = [f"<!here> ⏱️ *Long restaurant waits · {y:%a} {y.day} {y:%b}*"]
+    if not ws:
+        L.append("No rider waited 10+ min at a restaurant yesterday. 🎉")
+    else:
+        L.append(f"*{_fmt_n(len(ws))} orders* waited 10+ min ({pct} % of {_fmt_n(tot)} delivered) · *{_hrs(lost)} rider-hours* lost · "
+                 f"avg wait {round(sum(ws) / len(ws), 1)}′")
+        cities = Counter(r["city"] for r in Y["rows"]).most_common(3)
+        L.append("Most: " + " · ".join(f"{c} {_fmt_n(n)}" for c, n in cities))
+        (rest, city), n = Counter((r["rest"], r["city"]) for r in Y["rows"]).most_common(1)[0]
+        rw = [r["wait"] for r in Y["rows"] if r["rest"] == rest and r["city"] == city]
+        L.append(f"Worst restaurant: *{_rc(rest, city)}* — {n} orders, avg {round(sum(rw) / len(rw))}′")
+    if is_monday and LW is not None:
+        w2, t2, l2, p2 = _waits_line(LW)
+        L.append(f"*Last week ({lwa.day}–{lwb.day} {lwb:%b}):* {_fmt_n(len(w2))} orders waited 10+ min ({p2} %) · {_hrs(l2)} rider-hours lost"
+                 + (" — the call list per city is in the 'Last week' tab." if sheet["ok"] else "."))
+    tail = []
+    if sheet["ok"]:
+        tail.append(f"<{sheet['url']}|Open the sheet>")
+    elif sheet["error"]:
+        tail.append(f"_Sheet not updated: {sheet['error']}_")
+    elif not sid:
+        tail.append("_Google Sheet not set up yet (Settings → Slack)_")
+    elif sheet["url"]:
+        tail.append(f"<{sheet['url']}|Open the sheet>")
+    tail.append(link(f"/v2#restaurants?period={y.isoformat()}", "Restaurants in the dashboard"))
+    L.append("  ·  ".join(tail))
+    return {"text": "\n".join(L), "sheet": sheet, "n": len(ws)}
+
+
+def _report_cfg() -> dict:
+    import slack_notify
+    st = store.get_settings()
+    sid = gsheet.sheet_id_from(st.get("gsheet_id") or "")
+    try:
+        last = json.loads(st.get("daily_report_last") or "{}")
+    except ValueError:
+        last = {}
+    h, m = _report_time(st)
+    return {"report_time": f"{h:02d}:{m:02d}", "gsheet_id": sid, "gsheet_url": gsheet.sheet_url(sid) if sid else "",
+            "robot_email": gsheet.robot_email(), "google_problem": gsheet.key_problem(),
+            "report_channel": "SLACK_REPORT_WEBHOOK_URL" if slack_notify.REPORT_WEBHOOK else ("SLACK_WEBHOOK_URL" if slack_notify.WEBHOOK else ""),
+            "daily_sent": st.get("daily_report_sent", ""), "daily_last": last}
+
+
+@app.get("/api/report/daily", dependencies=[Depends(require_login)])
+def api_report_daily_preview():
+    """The message the team will get (nothing is written or sent)."""
+    rep = daily_report(write_sheet=False)
+    return {"text": rep["text"], **_report_cfg()}
+
+
+@app.post("/api/report/daily", dependencies=[Depends(require_login)])
+async def api_report_daily_run(request: Request):
+    """Write the sheet and send the message now (does not replace the automatic one of the day)."""
+    from starlette.concurrency import run_in_threadpool
+    b = {}
+    try:
+        b = await request.json() or {}
+    except Exception:
+        pass
+    rep = await run_in_threadpool(lambda: daily_report(force_week=bool(b.get("week"))))
+    url = _report_url()
+    ok = await slack.send(rep["text"], url=url) if url and b.get("slack", True) else False
+    return {"ok": ok, "sheet": rep["sheet"], "orders": rep["n"],
+            "error": rep["sheet"]["error"] or ("" if ok or not url else slack.stats.get("last_error", "")) or ("" if url else "No Slack webhook in Railway")}
 
 
 @app.get("/api/slack/weekly", dependencies=[Depends(require_login)])
@@ -1663,11 +1877,11 @@ def api_slack_weekly_preview():
 
 @app.post("/api/slack/weekly", dependencies=[Depends(require_login)])
 async def api_slack_weekly_send():
-    if not slack_notify_webhook():
+    if not _report_url():
         return {"ok": False, "error": "SLACK_WEBHOOK_URL is not set in Railway (web service → Variables)"}
     from starlette.concurrency import run_in_threadpool
     rep = await run_in_threadpool(weekly_report)
-    ok = await slack.send(rep["text"])
+    ok = await slack.send(rep["text"], url=_report_url())
     return {"ok": ok, "error": "" if ok else slack.stats.get("last_error", "")}
 
 
