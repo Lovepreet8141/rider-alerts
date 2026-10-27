@@ -42,6 +42,10 @@ def resolve(period: str, now: datetime, frm: str = "", to: str = "") -> dict:
         a = b = min(_d(period), today)
         pa = pb = a - timedelta(days=7)
         label = _fmt(a, True)
+    elif period == "7d":
+        a, b = today - timedelta(days=7), today - timedelta(days=1)
+        pa, pb = a - timedelta(days=7), b - timedelta(days=7)
+        label = f"Last 7 days · {_fmt(a)} – {_fmt(b)}"
     elif period == "yesterday":
         a = b = today - timedelta(days=1)
         pa = pb = a - timedelta(days=7)
@@ -1085,3 +1089,258 @@ def weekly_waits(store, rules, now: datetime, a: str, b: str, pa: str, pb: str, 
             "worse": [{"restaurant": k[0], "city": k[1], "delta_h": d} for d, k in change[::-1][:3] if d > 0],
             "better": [{"restaurant": k[0], "city": k[1], "delta_h": d} for d, k in change[:3] if d < 0],
             "cities": city_rows[:3]}
+
+
+
+# ====================================================================== 9.6 — keep PTOD under 30
+# Every delivered order is split into its five stages. A late order is "saved" by a stage when it would have been on
+# target had only that stage taken its normal time (the 30-minute budget below). Counting saved orders per stage, city,
+# hour, restaurant and rider shows which fix brings the most "within 30′" — and exactly where to make it.
+U30_STAGES = [("acc", "Rider accepts the order", 2), ("tr", "Ride to the restaurant", 8), ("wt", "Waiting for the food", 5),
+              ("tc", "Ride to the customer", 12), ("ho", "Hand-over at the door", 3)]
+_UK = [k for k, _, _ in U30_STAGES]
+_UN = {k: v for k, _, v in U30_STAGES}
+_UCH = 29          # per city|hour: n, within, late, ptod_s · (sum, n) × 5 all orders · (sum, n) × 5 late orders · saved × 5
+_URE = 10          # per restaurant|city: n, late, sv_wt, wt_excess, wt_s, wt_n, sv_tc, tc_s, tc_n, sv_tr
+_URI = 11          # per rider|city: n, late, sv_acc, acc_s, acc_n, sv_ho, ho_s, ho_n, sv_tr, tr_s, tr_n
+
+
+def u30_day(store, rules, day: str, today: str) -> dict:
+    t = rules.ptod_target_min
+
+    def build():
+        ch, rest, rid, rh, names = {}, {}, {}, {}, {}
+        q = ("SELECT city, hour, restaurant, rider_id, rider, ptod_min, accept_min, kitchen_wait, "
+             f"{_span('accepted_at', 'at_restaurant_at')} AS tr, {_span('picked_up_at', 'at_customer_at')} AS tc, "
+             f"{_span('at_customer_at', 'delivered_at')} AS ho FROM orders WHERE day = ? AND phase='delivered' AND ptod_min IS NOT NULL")
+        for r in store._rows(q, [day]):
+            if r["hour"] is None:
+                continue
+            c, h, p = r["city"] or "?", int(r["hour"]), float(r["ptod_min"])
+            ok = lambda x: x if x is not None and 0 <= x <= 180 else None
+            st = {"acc": ok(r["accept_min"]), "tr": r["tr"], "wt": ok(r["kitchen_wait"]), "tc": r["tc"], "ho": r["ho"]}
+            late = p > t
+            sv = {k: bool(late and st[k] is not None and p - max(0.0, st[k] - _UN[k]) <= t) for k in _UK}
+            v = ch.setdefault(f"{c}|{h}", [0.0] * _UCH)
+            v[0] += 1; v[1] += not late; v[2] += late; v[3] += p
+            for j, k in enumerate(_UK):
+                x = st[k]
+                if x is None:
+                    continue
+                v[4 + 2 * j] += x; v[5 + 2 * j] += 1
+                if late:
+                    v[14 + 2 * j] += x; v[15 + 2 * j] += 1
+                v[24 + j] += sv[k]
+            rn = r["restaurant"] or "?"
+            g = rest.setdefault(f"{rn}|{c}", [0.0] * _URE)
+            g[0] += 1; g[1] += late; g[2] += sv["wt"]; g[6] += sv["tc"]; g[9] += sv["tr"]
+            if st["wt"] is not None:
+                g[3] += max(0.0, st["wt"] - _UN["wt"]); g[4] += st["wt"]; g[5] += 1
+                rh.setdefault(f"{rn}|{c}|{h}", []).append(round(st["wt"], 1))
+            if st["tc"] is not None:
+                g[7] += st["tc"]; g[8] += 1
+            if r["rider_id"]:
+                names[r["rider_id"]] = r["rider"] or names.get(r["rider_id"]) or ""
+                x = rid.setdefault(f"{r['rider_id']}|{c}", [0.0] * _URI)
+                x[0] += 1; x[1] += late; x[2] += sv["acc"]; x[5] += sv["ho"]; x[8] += sv["tr"]
+                for k, i in (("acc", 3), ("ho", 6), ("tr", 9)):
+                    if st[k] is not None:
+                        x[i] += st[k]; x[i + 1] += 1
+        hb = {}
+        for r in store._rows("SELECT rider_id, city, COUNT(*) AS n FROM handbacks WHERE day = ? AND COALESCE(excused, 0) = 0 GROUP BY rider_id, city", [day]):
+            if r["rider_id"]:
+                hb[f"{r['rider_id']}|{r['city'] or '?'}"] = r["n"]
+        rnd = lambda d: {k: [round(x, 1) for x in v] for k, v in d.items()}
+        return {"ch": rnd(ch), "rest": rnd(rest), "rid": rnd(rid), "rh": rh, "hb": hb, "names": names}
+    return cube(store, "u30", day, str(t), today, build, 30)
+
+
+def _pct(a, b):
+    return round(a / b * 100, 1) if b else None
+
+
+def _send_later(waits_by_hour: dict) -> list:
+    """Per hour: how many minutes later a rider can be sent so that he still waits ~2 min in 3 of 4 cases (25th
+    percentile of the waits − 2). Neighbouring hours with a suggestion are joined; at least 6 orders per hour."""
+    sug = {}
+    for h, ws in waits_by_hour.items():
+        if len(ws) < 6:
+            continue
+        q = sorted(ws)[len(ws) // 4]
+        if q - 2 >= 3:
+            sug[h] = (int(q - 2), len(ws))
+    out, run = [], []
+    for h in sorted(sug):
+        if run and h != run[-1] + 1:
+            out.append(run); run = []
+        run.append(h)
+    if run:
+        out.append(run)
+    return sorted(({"from": r[0], "to": r[-1] + 1, "min": min(sug[h][0] for h in r), "n": sum(sug[h][1] for h in r)} for r in out),
+                  key=lambda x: -x["n"])[:3]
+
+
+def under30(store, rules, now: datetime, period: str = "7d", city: str = "", frm: str = "", to: str = "") -> dict:
+    P = resolve(period, now, frm, to)
+    today, t = day_key(now), rules.ptod_target_min
+    ch, rest, rid, rh, hb, names = {}, {}, {}, {}, {}, {}
+
+    def add(dst, k, v, n):
+        acc = dst.setdefault(k, [0.0] * n)
+        for i, x in enumerate(v):
+            acc[i] += x
+    for d in _days(P["a"], P["b"]):
+        D = u30_day(store, rules, d, today)
+        for k, v in D["ch"].items():
+            if not city or k.rsplit("|", 1)[0] == city:
+                add(ch, k, v, _UCH)
+        for k, v in D["rest"].items():
+            if not city or k.rsplit("|", 1)[1] == city:
+                add(rest, k, v, _URE)
+        for k, v in D["rid"].items():
+            if not city or k.rsplit("|", 1)[1] == city:
+                add(rid, k, v, _URI)
+        for k, v in D["rh"].items():
+            if not city or k.rsplit("|", 2)[1] == city:
+                rh.setdefault(k, []).extend(v)
+        for k, v in D["hb"].items():
+            if not city or k.rsplit("|", 1)[1] == city:
+                hb[k] = hb.get(k, 0) + v
+        names.update({k: v for k, v in D["names"].items() if v})
+    tot = [0.0] * _UCH
+    for v in ch.values():
+        for i, x in enumerate(v):
+            tot[i] += x
+    n, late = tot[0], tot[2]
+    prev_vec = _agg([perf_day(store, rules, d, today) for d in _days(P["pa"], P["pb"])], city)[0]
+    prev_within = _pct(prev_vec[I["within"]], prev_vec[I["ptod_n"]])
+    avg = lambda s_, n_: round(s_ / n_, 1) if n_ else None
+    stages = []
+    for j, (k, label, norm) in enumerate(U30_STAGES):
+        sa, na, sl, nl = tot[4 + 2 * j], tot[5 + 2 * j], tot[14 + 2 * j], tot[15 + 2 * j]
+        stages.append({"key": k, "label": label, "norm": norm, "all": avg(sa, na), "late": avg(sl, nl), "ontime": avg(sa - sl, na - nl)})
+    # where each fix has to be made
+    rows_rest = [(k.rsplit("|", 1), v) for k, v in rest.items()]
+    rows_rid = [(k.rsplit("|", 1), v) for k, v in rid.items()]
+    rows_ch = [(k.rsplit("|", 1), v) for k, v in ch.items()]
+    by_rest_hours = {}
+    for k, ws in rh.items():
+        rn, c, h = k.rsplit("|", 2)
+        by_rest_hours.setdefault((rn, c), {})[int(h)] = ws
+    rider_name = lambda r: names.get(r) or r[:8]
+
+    def top_rest(i_sv, extra, lim=8):
+        xs = sorted((x for x in rows_rest if x[1][i_sv] >= 1), key=lambda x: -x[1][i_sv])[:lim]
+        return [dict({"restaurant": rn, "city": c, "saved": int(v[i_sv]), "n": int(v[0]), "late": int(v[1])}, **extra(rn, c, v)) for (rn, c), v in xs]
+
+    def top_ch(j, lim=8):
+        xs = sorted((x for x in rows_ch if x[1][24 + j] >= 1), key=lambda x: -x[1][24 + j])[:lim]
+        return [{"city": c, "hour": int(h), "saved": int(v[24 + j]), "n": int(v[0]), "within_pct": _pct(v[1], v[0]),
+                 "avg": avg(v[4 + 2 * j], v[5 + 2 * j]), "avg_late": avg(v[14 + 2 * j], v[15 + 2 * j])} for (c, h), v in xs]
+
+    def top_riders(i_sv, i_s, lim=8):
+        xs = sorted((x for x in rows_rid if x[1][i_sv] >= 1), key=lambda x: (-x[1][i_sv], -x[1][0]))[:lim]
+        return [{"rider_id": r, "rider": rider_name(r), "city": c, "fleet": store.fleet_map.get(r, ""), "saved": int(v[i_sv]), "n": int(v[0]),
+                 "late": int(v[1]), "avg": avg(v[i_s], v[i_s + 1]), "handbacks": hb.get(f"{r}|{c}", 0)} for (r, c), v in xs]
+    fixes = []
+    for j, (k, label, norm) in enumerate(U30_STAGES):
+        sv = int(tot[24 + j])
+        f = {"key": k, "label": label, "norm": norm, "saved": sv, "pts": _pct(sv, n) or 0.0, "avg_late": stages[j]["late"]}
+        if k == "wt":
+            f["restaurants"] = top_rest(2, lambda rn, c, v: {"avg_wait": avg(v[4], v[5]), "lost_h": round(v[3] / 60, 1),
+                                                             "send_later": _send_later(by_rest_hours.get((rn, c), {}))})
+        elif k == "tc":
+            f["restaurants"] = top_rest(6, lambda rn, c, v: {"avg_ride": avg(v[7], v[8])})
+        elif k == "tr":
+            f["hours"] = top_ch(j)
+        elif k == "acc":
+            f["hours"] = top_ch(j); f["riders"] = top_riders(2, 3)
+        elif k == "ho":
+            f["riders"] = top_riders(5, 6)
+        fixes.append(f)
+    fixes.sort(key=lambda f: -f["saved"])
+    # city × hour: within target, and the fix that matters most there
+    grid = {}
+    for (c, h), v in rows_ch:
+        g = grid.setdefault(c, {"city": c, "n": 0, "within": 0, "late": 0, "ptod_s": 0.0, "sv": [0] * 5, "hours": []})
+        g["n"] += v[0]; g["within"] += v[1]; g["late"] += v[2]; g["ptod_s"] += v[3]
+        for j in range(5):
+            g["sv"][j] += v[24 + j]
+        main = max(range(5), key=lambda j: v[24 + j])
+        g["hours"].append({"hour": int(h), "n": int(v[0]), "within_pct": _pct(v[1], v[0]), "late": int(v[2]),
+                           "cause": _UK[main] if v[24 + main] >= 1 else None, "saved": {_UK[j]: int(v[24 + j]) for j in range(5) if v[24 + j] >= 1}})
+    cities = []
+    for g in grid.values():
+        g["hours"].sort(key=lambda x: x["hour"])
+        main = max(range(5), key=lambda j: g["sv"][j])
+        cities.append({"city": g["city"], "n": int(g["n"]), "late": int(g["late"]), "within_pct": _pct(g["within"], g["n"]),
+                       "avg_ptod": avg(g["ptod_s"], g["n"]), "main": _UK[main] if g["sv"][main] >= 1 else None,
+                       "main_pts": _pct(g["sv"][main], g["n"]) or 0.0, "pts": {_UK[j]: _pct(g["sv"][j], g["n"]) or 0.0 for j in range(5)},
+                       "hours": g["hours"]})
+    cities.sort(key=lambda c: -c["n"])
+    best = fixes[0] if fixes and fixes[0]["saved"] else None
+    return {"period": P, "city": city, "target": t, "target_within_pct": rules.target_within_pct,
+            "delivered": int(n), "late": int(late), "within_pct": _pct(tot[1], n), "prev_within_pct": prev_within,
+            "avg_ptod": avg(tot[3], n), "stages": stages, "fixes": fixes, "cities": cities,
+            "best": {"key": best["key"], "pts": best["pts"], "saved": best["saved"]} if best else None,
+            "top3_pts": round(sum(f["pts"] for f in fixes[:3]), 1),
+            "budget": {k: v for k, _, v in U30_STAGES}}
+
+
+def stage_avgs(store, rules, now: datetime) -> dict:
+    """Typical minutes per stage per city over the last 7 finished days (for the live 'will it be late?' check)."""
+    def build():
+        today = day_key(now)
+        datas = [perf_day(store, rules, (_d(today) - timedelta(days=i)).isoformat(), today) for i in range(1, 8)]
+        out = {}
+        for c in {c for x in datas for c in x["tot"]} | {""}:
+            v = _agg(datas, c)[0]
+            f = lambda s_, n_, dflt: round(v[I[s_]] / v[I[n_]], 1) if v[I[n_]] >= 20 else dflt
+            out[c] = {"tr": f("tr_s", "tr_n", 8.0), "wt": f("wt_s", "wt_n", 6.0), "tc": f("tc_s", "tc_n", 12.0), "ho": f("ho_s", "ho_n", 3.0)}
+        return out
+    return cached(("stage_avgs", day_key(now)), 600, build)
+
+
+def late_risk(orders: list, now: datetime, target: int, avgs: dict, city_of) -> dict:
+    """Live orders that will go over the target unless someone acts, with the stage they're stuck in and what to do."""
+    def mins(a):
+        return (now - a).total_seconds() / 60 if a else None
+    risk, over = [], []
+    for o in orders:
+        ph, disp = o.get("phase"), o.get("dispatched_at")
+        if ph in ("delivered", "cancelled", "closed", "on_hold") or not disp:
+            continue
+        c = city_of(o) or ""
+        A = avgs.get(c) or avgs.get("") or {"tr": 8.0, "wt": 6.0, "tc": 12.0, "ho": 3.0}
+        el = mins(disp)
+        if el is None or el < 0 or el > 180:
+            continue
+        acc, at_r, pick, at_c = o.get("accepted_at"), o.get("at_restaurant_at"), o.get("picked_up_at"), o.get("at_customer_at")
+        # stuck = this step already takes clearly longer than usual → there is something to do now
+        if at_c:
+            x = mins(at_c); stage, since = "ho", x; rem = max(0.5, A["ho"] - x); stuck = x >= 4
+            act = f"At the door for {round(x)}′ — the rider should call the customer" if stuck else "At the customer — almost done"
+        elif pick:
+            x = mins(pick); stage, since = "tc", x; rem = max(1.0, A["tc"] - x) + A["ho"]; stuck = x > A["tc"] + 5
+            act = f"Riding to the customer for {round(x)}′ — check where the rider is" if stuck else "Riding to the customer — nothing to do but watch it"
+        elif at_r:
+            x = mins(at_r); stage, since = "wt", x; rem = max(1.0, A["wt"] - x) + A["tc"] + A["ho"]; stuck = x >= 8
+            act = f"Food not ready after {round(x)}′ — call the restaurant" if stuck else "Waiting for the food — ask the kitchen to hurry"
+        elif acc or o.get("rider_id"):
+            x = mins(acc) if acc else el; stage, since = "tr", x; rem = max(1.0, A["tr"] - x) + A["wt"] + A["tc"] + A["ho"]; stuck = x > A["tr"] + 3
+            act = f"On the way to the restaurant for {round(x)}′ — call the rider or give it to a closer one" if stuck else "Rider on the way — ask the restaurant to have the food ready"
+        else:
+            stage, since = "acc", el; rem = A["tr"] + A["wt"] + A["tc"] + A["ho"]; stuck = el >= 3
+            act = f"No rider after {round(el)}′ — assign one now"
+        proj = el + rem
+        row = {"id": o.get("id"), "ref": o.get("ref") or "", "city": c, "restaurant": o.get("restaurant") or "", "rider": o.get("rider") or "",
+               "rider_id": o.get("rider_id") or "", "stage": stage, "since": round(since or 0), "elapsed": round(el), "projected": round(proj),
+               "left": round(target - el), "action": act}
+        if el > target:
+            over.append(row)
+        elif proj > target - 1 and (stuck or el >= 10):      # a fresh order that is going normally: nothing to do yet
+            risk.append(row)
+    risk.sort(key=lambda r: (r["left"], -r["projected"]))
+    over.sort(key=lambda r: -r["elapsed"])
+    return {"risk": risk[:60], "over": over[:60], "n_risk": len(risk), "n_over": len(over),
+            "live": sum(1 for o in orders if o.get("phase") not in ("delivered", "cancelled", "closed", "on_hold") and o.get("dispatched_at"))}

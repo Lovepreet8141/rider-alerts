@@ -944,12 +944,13 @@ refreshState(); route(); icStatus(); setInterval(refreshState,15000); setInterva
     orders: "M4 6h16M4 12h16M4 18h10", ic: "M4 5h16v11H9l-5 4V5z", rep: "M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7",
     set: "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1",
     shifts: "M4 5h16v15H4zM4 10h16M9 3v4M15 3v4", fleet: "M3 17h18M5 17V9l7-5 7 5v8M9 17v-5h6v5", ins: "M12 3a6 6 0 0 0-3 11v3h6v-3a6 6 0 0 0-3-11zM10 21h4",
-    menu: "M4 7h16M4 12h16M4 17h16", staff: "M3 20h18M6 16V9M10 16V5M14 16v-6M18 16v-9", proof: "M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4"
+    menu: "M4 7h16M4 12h16M4 17h16", staff: "M3 20h18M6 16V9M10 16V5M14 16v-6M18 16v-9", u30: "M9 2h6M12 5a8 8 0 1 0 0 16 8 8 0 0 0 0-16zM12 9v4l2.5 2", proof: "M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4"
   };
   const NAV = [
     {id: "overview", label: "Now", icon: I.now, sec: "overview"},
     {id: "live", label: "City board", icon: I.city, sec: "live"},
     {id: "performance", label: "Performance", icon: I.perf, v2: "performance"},
+    {id: "under30", label: "PTOD under 30", icon: I.u30, v2: "under30"},
     {id: "restaurants", label: "Restaurants", icon: I.rest, v2: "restaurants"},
     {id: "riders2", label: "Riders & fleets", icon: I.riders, v2: "riders"},
     {id: "staffing", label: "Staffing", icon: I.staff, v2: "staffing"},
@@ -970,9 +971,9 @@ refreshState(); route(); icStatus(); setInterval(refreshState,15000); setInterva
   const cur = () => (location.hash || "#live").slice(1);
   function draw() {
     const h = cur();
-    const a = (n, i, cls) => `<a href="${href(n)}" data-qnav="${n.id}" class="${cls || ""}" ${n.sec === h ? 'aria-current="page"' : ""}>${svg(n.icon)}<span>${n.label}</span>${i != null ? `<kbd>${i + 1}</kbd>` : ""}</a>`;
+    const a = (n, i, cls) => `<a href="${href(n)}" data-qnav="${n.id}" class="${cls || ""}" ${n.sec === h ? 'aria-current="page"' : ""}>${svg(n.icon)}<span>${n.label}</span>${i != null ? `<kbd>${(i + 1) % 10}</kbd>` : ""}</a>`;
     const nav = document.getElementById("qNav");
-    if (nav) nav.innerHTML = NAV.map((n, i) => (i === 2 || i === 7 ? '<div class="q-navsep"></div>' : "") + a(n, i < 9 ? i : null)).join("") +
+    if (nav) nav.innerHTML = NAV.map((n, i) => (i === 2 || i === 8 ? '<div class="q-navsep"></div>' : "") + a(n, i < 10 ? i : null)).join("") +
       '<div class="q-navh">More</div>' + MORE.map(n => a(n, null, "q-more")).join("");
     const tb = document.getElementById("qTabs");
     if (tb) tb.innerHTML = ["overview", "live", "performance", "orders"].map(id => NAV.find(n => n.id === id)).map(n => `<a href="${href(n)}" data-qnav="${n.id}" ${n.sec === h ? 'aria-current="page"' : ""}>${svg(n.icon, 20)}<span>${n.label === "City board" ? "City" : n.label}</span></a>`).join("") +
@@ -994,7 +995,7 @@ refreshState(); route(); icStatus(); setInterval(refreshState,15000); setInterva
   document.addEventListener("keydown", e => {
     if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest("input,textarea,select,[contenteditable]")) return;
     const d = document.getElementById("dlg"); if (d && d.open) return;
-    const i = "123456789".indexOf(e.key); if (i < 0) return;
+    const i = "1234567890".indexOf(e.key); if (i < 0) return;
     const n = NAV[i]; if (!n) return;
     e.preventDefault(); location.href = href(n);
   });

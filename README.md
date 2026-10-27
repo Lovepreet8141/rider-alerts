@@ -23,6 +23,25 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.6.0 — PTOD under 30 (new page, key 4)
+
+* **Its own section in the sidebar, right after Performance.** It shows how to keep PTOD under 30′, from your own orders:
+  * **Right now** — live orders that will go over 30′ unless someone acts, with the step they're stuck in and what to
+    do ("No rider after 7′ — assign one now", "Food not ready after 13′ — call the restaurant"). Orders that are
+    going normally are left out. Refreshes every 20 s.
+  * **Where the minutes go** — the 30′ budget (accept 2′ · to the restaurant 8′ · food 5′ · ride 12′ · hand-over 3′)
+    next to the on-time and the late orders, step by step.
+  * **Biggest fixes** — for each step, how many points of "within 30′" you'd gain if only that step had its normal
+    time, ranked. Each fix has its own card with where to make it: slow kitchens (with "send riders X′ later" per
+    restaurant and hour), long rides (restaurants to ask Lieferando about), hours short of riders, riders who accept
+    slowly, riders slow at the door.
+  * **City by city, hour by hour** — % within 30′ per city and hour, with the fix that matters most in each hour.
+* Periods: last 7 days (default), today, yesterday, last week, month or any range.
+* The Monday Slack report now ends with the 3 biggest fixes of the week (no rider names in Slack).
+* Number keys: 1 Now · 2 City board · 3 Performance · 4 PTOD under 30 · 5 Restaurants · 6 Riders & fleets ·
+  7 Staffing · 8 Evidence pack · 9 Orders · 0 Intercom bot.
+* Only shown in the dashboard — nothing is sent to riders, restaurants or MotionTools.
+
 ## 9.5.0 — Staffing forecast · Lieferando evidence pack · Monday waiting report in Slack
 
 * **Staffing (key 6)** — orders and riders needed per city and hour for tomorrow (or any of the next 7 days, ← →).

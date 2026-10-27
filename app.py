@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.5.0"
+VERSION = "9.6.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1595,6 +1595,27 @@ def weekly_report(now: datetime = None) -> dict:
               + (f" ({ev['late_share']} % of the late ones)" if ev["late_share"] is not None else "")
               + (f" — within {ev['target']}′ would be *{ev['within_if_excused']} %* instead of {ev['within_pct']} %." if ev["within_pct"] is not None else ".")
               + " " + link(f"/v2#evidence?wk={P['a']}", "Open the evidence pack")]
+    try:                                                   # 9.6: the three fixes that bring the most "within 30′"
+        u = analytics.under30(store, rules, now, frm=P["a"], to=P["b"])
+        FXN = {"wt": ("🍳", "Kitchens not ready"), "tc": ("📍", "Long rides to the customer"), "acc": ("⏱️", "Orders wait for a rider"),
+               "tr": ("🛵", "Riders far from the restaurant"), "ho": ("🚪", "Slow hand-over at the door")}
+        fx = [f for f in u["fixes"] if f["saved"]][:3]
+        if fx:
+            L += ["", f"*To stay under {rules.ptod_target_min}′ — the 3 biggest fixes* (points of \"within {rules.ptod_target_min}′\" each would add on its own)"]
+            for f in fx:
+                ic, name = FXN[f["key"]]
+                if f.get("restaurants"):
+                    where = " — start with " + ", ".join(_rc(x["restaurant"], x["city"]) for x in f["restaurants"][:2])
+                elif f.get("hours"):
+                    where = " — worst: " + ", ".join(f"{x['city']} {x['hour']}:00" for x in f["hours"][:3])
+                elif f.get("riders"):
+                    where = f" — {len(f['riders'])} riders to coach (names in the dashboard)"
+                else:
+                    where = ""
+                L.append(f"{ic} *{name}*: +{f['pts']} pts ({_fmt_n(f['saved'])} late orders){where}")
+            L.append(link(f"/v2#under30?from={P['a']}&to={P['b']}", "Open PTOD under 30"))
+    except Exception as e:
+        log.warning("weekly report, under-30 part: %s", e)
     acts = []
     if w["top"]:
         t = w["top"][0]
@@ -3559,7 +3580,7 @@ def _v2_check(period: str, frm: str, to: str):
             _date.fromisoformat(frm); _date.fromisoformat(to)
         except (TypeError, ValueError):
             raise HTTPException(400, "from and to must be YYYY-MM-DD")
-    else:
+    elif period != "7d":
         _check_period(period)
 
 
@@ -4045,6 +4066,24 @@ def _v2_evidence_data(period: str = "lastweek", city: str = "", frm: str = "", t
     P, a, b = _evidence_range(period, frm, to, now)
     out = analytics.evidence(store, rules, now, a, b, city)
     out["period"] = P
+    return out
+
+
+@report_cache(30, 900, live_if=_v2_live_if)
+def _v2_under30_data(period: str = "7d", city: str = "", frm: str = "", to: str = "") -> dict:
+    return analytics.under30(store, rules, datetime.now(UTC), period, city, frm, to)
+
+
+@app.get("/api/v2/under30", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_under30(period: str = "7d", city: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    """How to keep PTOD under 30′: where the minutes go, which fix brings the most, where to make it — plus the live
+    orders that will go over unless someone acts now. Shown only here; nobody is messaged."""
+    _v2_check(period, frm, to)
+    now = datetime.now(UTC)
+    out = dict(_v2_under30_data(period=period, city=city, frm=frm, to=to))
+    out["now"] = analytics.late_risk(live_orders(city), now, rules.ptod_target_min, analytics.stage_avgs(store, rules, now), city_of)
+    out["generated"] = iso(now)
     return out
 
 

@@ -306,6 +306,10 @@ button.chip:hover{border-color:var(--edge2);color:#fff}
 @media (max-width:520px){ .filters{width:100%} .seg{width:100%} .seg button{flex:1 1 auto;padding:0 8px} .sel{flex:1 1 140px;max-width:none} .search{flex-basis:100%;order:3} }
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 .stick{position:sticky;left:0;z-index:2;background:var(--card);align-self:stretch;display:flex;align-items:center}
+.uc{display:flex;flex-direction:column;align-items:center;justify-content:center;height:38px;border-radius:7px;font-size:12.5px;line-height:1.05;font-variant-numeric:tabular-nums;color:var(--text)}
+.uc i{font-style:normal;font-size:11px;margin-top:2px}
+.uc:focus-visible{outline:2px solid var(--accentText);outline-offset:1px}
+.fxrow:hover b:first-of-type{color:#fff}.fxrow:focus-visible{outline:2px solid var(--accentText);outline-offset:2px;border-radius:8px}
 .gc{display:flex;align-items:center;justify-content:center;height:28px;border-radius:7px;font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--text)}
 .gc:focus-visible{outline:2px solid var(--accentText);outline-offset:1px}
 </style>
@@ -366,13 +370,14 @@ const ICON = {
   search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.5-3.5",
   city: "M12 21s-7-6.2-7-11a7 7 0 1 1 14 0c0 4.8-7 11-7 11zM12 12.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z",
   rep: "M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7", shifts: "M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",
-  fleet: "M3 17h18M5 17V9l7-5 7 5v8M9 17v-5h6v5", staff: "M3 20h18M6 16V9M10 16V5M14 16v-6M18 16v-9", proof: "M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4", ins: "M12 3a6 6 0 0 0-3 11v3h6v-3a6 6 0 0 0-3-11zM10 21h4", menu: "M4 7h16M4 12h16M4 17h16"
+  fleet: "M3 17h18M5 17V9l7-5 7 5v8M9 17v-5h6v5", staff: "M3 20h18M6 16V9M10 16V5M14 16v-6M18 16v-9", u30: "M9 2h6M12 5a8 8 0 1 0 0 16 8 8 0 0 0 0-16zM12 9v4l2.5 2", proof: "M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4", ins: "M12 3a6 6 0 0 0-3 11v3h6v-3a6 6 0 0 0-3-11zM10 21h4", menu: "M4 7h16M4 12h16M4 17h16"
 };
 const svgI = (d, s = 18) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" aria-hidden="true"><path d="${d}"/></svg>`;
 const NAV = [                                       // the same sidebar as the live pages (dashboard.html)
   {id: "now", label: "Now", href: "/#overview", icon: ICON.now, ext: true},
   {id: "live", label: "City board", href: "/#live", icon: ICON.city, ext: true},
   {id: "performance", label: "Performance", href: "#performance", icon: ICON.perf},
+  {id: "under30", label: "PTOD under 30", href: "#under30", icon: ICON.u30},
   {id: "restaurants", label: "Restaurants", href: "#restaurants", icon: ICON.rest},
   {id: "riders", label: "Riders & fleets", href: "#riders", icon: ICON.riders},
   {id: "staffing", label: "Staffing", href: "#staffing", icon: ICON.staff},
@@ -407,13 +412,15 @@ function readHash() {
   const h = decodeURIComponent(location.hash.slice(1) || "performance"); const [pg, qs] = h.split("?");
   S.page = PAGES[pg] ? pg : "performance";
   const p = new URLSearchParams(qs || "");
-  S.period = p.get("period") || "today"; S.city = p.get("city") || ""; S.from = p.get("from") || ""; S.to = p.get("to") || "";
+  S.period = p.get("period") || (S.page === "under30" && !p.get("from") ? "7d" : "today"); S.city = p.get("city") || ""; S.from = p.get("from") || ""; S.to = p.get("to") || "";
   S.fleet = p.get("fleet") || ""; S.min = +(p.get("min") || 10) || 10; S.sel = p.get("sel") || "";
   S.sday = p.get("day") || ""; S.wk = p.get("wk") || "";
 }
 function hashFor(page) {
   const p = new URLSearchParams();
-  if (S.from && S.to) { p.set("from", S.from); p.set("to", S.to); } else if (S.period !== "today") p.set("period", S.period);
+  if (S.from && S.to) { p.set("from", S.from); p.set("to", S.to); }
+  else if (page === "under30") { if (S.period !== "7d") p.set("period", S.period); }
+  else if (S.period !== "today" && S.period !== "7d") p.set("period", S.period);
   if (S.city) p.set("city", S.city);
   if (page === "riders" && S.fleet) p.set("fleet", S.fleet);
   if (page === "restaurants") { if (S.min !== 10) p.set("min", S.min); if (S.sel) p.set("sel", S.sel); }
@@ -569,8 +576,8 @@ function ylabels(max, ticks, h, bottom = 22) {
 
 /* ======================================================================== shell: nav, filters, systems */
 function renderNav() {
-  const a = (n, i, cls) => `<a href="${n.href}" data-nav="${n.id}" class="${cls || ""}" ${S.page === n.id ? 'aria-current="page"' : ""}>${svgI(n.icon)}<span>${n.label}</span>${i != null ? `<kbd>${i + 1}</kbd>` : ""}</a>`;
-  $("#nav").innerHTML = NAV.map((n, i) => `${i === 2 || i === 7 ? '<div class="navsep"></div>' : ""}${a(n, i < 9 ? i : null)}`).join("") +
+  const a = (n, i, cls) => `<a href="${n.href}" data-nav="${n.id}" class="${cls || ""}" ${S.page === n.id ? 'aria-current="page"' : ""}>${svgI(n.icon)}<span>${n.label}</span>${i != null ? `<kbd>${(i + 1) % 10}</kbd>` : ""}</a>`;
+  $("#nav").innerHTML = NAV.map((n, i) => `${i === 2 || i === 8 ? '<div class="navsep"></div>' : ""}${a(n, i < 10 ? i : null)}`).join("") +
     `<div class="navh">More</div>` + MORE.map(n => a(n, null, "more")).join("");
   const tabs = ["now", "live", "performance", "orders"].map(id => NAV.find(n => n.id === id));
   $("#tabbar").innerHTML = tabs.map(n => `<a href="${n.href}" data-nav="${n.id}" ${S.page === n.id ? 'aria-current="page"' : ""}>${svgI(n.icon, 20)}<span>${n.id === "live" ? "City" : n.label}</span></a>`).join("") +
@@ -590,7 +597,7 @@ const PERIODS = [["today", "Today"], ["yesterday", "Yesterday"], ["week", "This 
 function periodSeg(opts = {}) {
   const custom = S.from && S.to, day = !custom && /^\d{4}-\d{2}-\d{2}$/.test(S.period);
   const lab = custom ? (S.from === S.to ? shortDay(S.from) : `${dm(S.from)} – ${dm(S.to)}`) : day ? shortDay(S.period) : "Custom";
-  return `<div class="seg" role="group" aria-label="Period">${PERIODS.filter(p => !(opts.noYesterday && p[0] === "yesterday")).map(([id, l]) =>
+  return `<div class="seg" role="group" aria-label="Period">${(opts.list || PERIODS).filter(p => !(opts.noYesterday && p[0] === "yesterday")).map(([id, l]) =>
     `<button type="button" data-period="${id}" aria-pressed="${!custom && !day && S.period === id}">${l}</button>`).join("")}<button type="button" data-act="custom" aria-pressed="${custom || day}">${esc(lab)}</button></div>`;
 }
 function citySel() {
@@ -775,7 +782,7 @@ const PERF = {
         </div>
       </section>
       <section class="card data"><div class="ch"><div><h2 id="trTitle">Delivered within 30 minutes</h2><p class="d" id="trSub">30 days to the period's end</p></div><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><div class="seg dark" role="group" aria-label="Trend metric" id="trSeg"></div><span id="trBig" style="font-size:28px;font-weight:600;letter-spacing:-.03em"></span></div></div><div id="pTrend" class="chart" style="margin-top:16px;height:210px"><div class="sk" style="height:100%"></div></div></section>
-      <div class="shortcuts"><span><kbd>⌘K</kbd> search anything</span><span><kbd>1–9</kbd> switch page</span><span><kbd>←</kbd> <kbd>→</kbd> previous / next day</span><span><kbd>E</kbd> export</span><span><kbd>C</kbd> compare on / off</span></div>`;
+      <div class="shortcuts"><span><kbd>⌘K</kbd> search anything</span><span><kbd>1–0</kbd> switch page</span><span><kbd>←</kbd> <kbd>→</kbd> previous / next day</span><span><kbd>E</kbd> export</span><span><kbd>C</kbd> compare on / off</span></div>`;
   },
   fail(e) { const h = $("#pHero"); if (h) h.innerHTML = `<div class="errbox" style="flex:1">Could not load the numbers: ${esc(e.message)} <button class="btn ghost sm" data-act="retry">Try again</button></div>`; },
   render(d, o = {}) {
@@ -1331,11 +1338,143 @@ const EVID = {
   }
 };
 
-const PAGES = {performance: PERF, restaurants: REST, riders: RID, staffing: STAFF, evidence: EVID};
+/* ======================================================================== page: PTOD UNDER 30 */
+const FX = {
+  acc: {name: "Orders wait for a rider", short: "accept", icon: "⏱️", col: C.v4, fg: "#fff",
+        act: "Too few free riders at these hours — add riders there (see Staffing) and coach the riders who accept slowly."},
+  tr: {name: "Riders far from the restaurant", short: "ride to the restaurant", icon: "🛵", col: C.v3, fg: "#fff",
+       act: "Riders aren't near the busy restaurants when the orders come in — more riders at these hours, or let them wait close to the busy restaurants."},
+  wt: {name: "Kitchens not ready", short: "kitchen wait", icon: "🍳", col: C.amber, fg: "#1A1206",
+       act: "Send riders later to these restaurants at these hours (set it in MotionTools), call the restaurant, and add them to the evidence pack."},
+  tc: {name: "Long rides to the customer", short: "ride to the customer", icon: "📍", col: C.v2, fg: "#120F1B",
+       act: "Ask Lieferando to deliver from these restaurants to a smaller area at peak times, or put faster vehicles on them."},
+  ho: {name: "Slow hand-over at the door", short: "hand-over", icon: "🚪", col: C.v5, fg: "#120F1B",
+       act: "Coach these riders: call the customer 2 minutes before arriving and have the order ready in hand."}
+};
+const STG = {acc: "No rider yet", tr: "To restaurant", wt: "At restaurant", tc: "To customer", ho: "At the door"};
+const UPER = [["7d", "Last 7 days"], ["today", "Today"], ["yesterday", "Yesterday"], ["lastweek", "Last week"], ["month", "Month"]];
+const USTATE = {over: false, data: null};
+const hh = h => String(h % 24).padStart(2, "0") + ":00";
+const ell = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+const UND = {
+  fresh: 20000,
+  url: () => "/api/v2/under30?" + qs(),
+  filters: () => `${citySel()}${periodSeg({list: UPER, noYesterday: false})}`,
+  shell() {
+    return `<div class="head"><div><div class="over">PTOD · stay under 30′</div><h1>Keep PTOD under 30′</h1><div class="sub" id="uSub">&nbsp;</div></div><div class="filters" id="filters">${this.filters()}</div></div>
+      <section class="row data" id="uKpi" aria-label="Key numbers">${[1, 2, 3, 4].map(() => `<div class="tile plain"><div class="sk" style="height:14px;width:60%"></div><div class="sk" style="height:44px;width:50%;margin-top:12px"></div></div>`).join("")}</section>
+      <section class="card data"><div class="ch"><div><h2>Right now</h2><p class="d">live orders that will go over 30′ unless someone acts · refreshes every 20 s · click an order for its story</p></div><div id="uNowCount" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"></div></div><div id="uNow" style="margin-top:10px"><div class="sk" style="height:110px"></div></div></section>
+      <section class="row data" style="align-items:stretch">
+        <div class="card" style="flex:1 1 460px"><div class="ch"><div><h2>Where the minutes go</h2><p class="d">the 30′ budget next to the orders that made it and the ones that didn't</p></div></div><div id="uMin" style="margin-top:16px"><div class="sk" style="height:280px"></div></div></div>
+        <div class="card" style="flex:1 1 460px"><div class="ch"><div><h2>Biggest fixes</h2><p class="d">points of "within 30′" each fix alone would add · click one to see where</p></div></div><div id="uFix" style="margin-top:6px"><div class="sk" style="height:280px"></div></div></div>
+      </section>
+      <section class="card data"><div class="ch"><div><h2>City by city, hour by hour</h2><p class="d">% delivered within 30′ · icon = the fix that matters most in that hour · click a city to see only it</p></div></div><div id="uGrid" style="margin-top:14px"><div class="sk" style="height:300px"></div></div></section>
+      <div id="uDetails" class="data" style="display:flex;flex-direction:column;gap:14px"></div>
+      <p class="d" id="uNote" style="font-size:12px;color:var(--muted);margin:0"></p>
+      <div class="shortcuts"><span><kbd>←</kbd> <kbd>→</kbd> previous / next period</span><span><kbd>⌘K</kbd> search</span><span>Only shown here — nobody is messaged</span></div>`;
+  },
+  fail(e) { $("#uKpi").innerHTML = `<div class="errbox" style="flex:1">Could not load: ${esc(e.message)} <button class="btn ghost sm" data-act="retry">Try again</button></div>`; },
+  render(d, o = {}) {
+    const anim = o.anim, t = d.target, tw = d.target_within_pct, w = d.within_pct, best = d.best;
+    USTATE.data = d; LASTP = Object.assign({}, d.period, {has_today: true});
+    $("#uSub").textContent = `${S.city || "All cities"} · ${d.period.label} · goal: ${tw} % of orders within ${t}′ of dispatch`;
+    const gap = w == null ? null : Math.round((tw - w) * 10) / 10;
+    $("#uKpi").innerHTML = `
+      <div class="tile plain"><div class="l"><span>Within ${t}′</span>${w != null && d.prev_within_pct != null ? delta(w, d.prev_within_pct, "pts") : ""}</div><div class="big ${w == null ? "" : w >= tw ? "good" : w >= tw - 15 ? "warn" : "bad"}">${cnt("u.w", w, "pct")}</div><div class="s">${gap == null ? "no delivered orders" : gap > 0 ? `${F1(gap)} pts below your ${tw} % goal` : `goal of ${tw} % reached`}</div></div>
+      <div class="tile plain"><div class="l"><span>Avg PTOD</span></div><div class="big ${d.avg_ptod > t ? "warn" : ""}">${cnt("u.a", d.avg_ptod, "min1")}</div><div class="s">dispatch → delivered · ${N(d.delivered)} orders</div></div>
+      <div class="tile plain"><div class="l"><span>Late orders</span></div><div class="big">${cnt("u.l", d.late)}</div><div class="s">over ${t}′ · ${d.delivered ? Math.round(d.late / d.delivered * 100) : 0} % of delivered</div></div>
+      <div class="tile plain"><div class="l"><span>Biggest single fix</span></div>${best ? `<div class="big good">+${F1(best.pts)}<span style="font-size:20px"> pts</span></div><div class="s">${FX[best.key].icon} ${esc(FX[best.key].name)} → ${F1(Math.min(100, (w || 0) + best.pts))} % within ${t}′</div>` : `<div class="big">–</div><div class="s">no late orders to fix</div>`}</div>`;
+    this.now(d); this.minutes(d, anim); this.fixes(d, anim); this.grid(d); this.details(d);
+    const B = d.budget;
+    $("#uNote").innerHTML = `How it works: every delivered order is split into five steps. A fix "saves" a late order when the order would have been within ${t}′ with only that step at its normal time — accept ${B.acc}′, ride to the restaurant ${B.tr}′, food ${B.wt}′, ride to the customer ${B.tc}′, hand-over ${B.ho}′ (together ${t}′). One order can be saved by more than one fix, so the points don't add up. "Send riders later" = the time riders still waited in 3 of 4 orders at that restaurant and hour, minus 2 minutes. Right now: the expected rest of each live order uses the city's usual times of the last 7 days. Nothing here is sent to riders or restaurants.`;
+    countUp($("#view"), anim);
+  },
+  now(d) {
+    const L = d.now, el = $("#uNow"), t = d.target;
+    $("#uNowCount").innerHTML = `<span class="chip ${L.n_risk ? "strained" : ""}">${N(L.n_risk)} can still make it</span><span class="chip ${L.n_over ? "critical" : ""}">${N(L.n_over)} already over ${t}′</span><span class="muted" style="font-size:12px">of ${N(L.live)} live</span>`;
+    const multi = !S.city;
+    const row = x => `<div class="tr click" data-order="${esc(x.id)}"><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${multi ? `<span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.city)}</span>` : ""}<span style="flex:1 1 130px;${ell}">${esc(x.restaurant)}</span>
+      <span class="hm" style="flex:0 0 132px;font-size:12.5px">${FX[x.stage].icon} ${STG[x.stage]}</span><span class="r" style="flex:0 0 78px"><b class="${x.elapsed > t ? "badt" : x.left <= 6 ? "warnt" : ""}">${x.elapsed}′</b><span class="muted" style="font-size:12px"> / ${t}′</span></span><span class="r hm t2" style="flex:0 0 64px">≈ ${x.projected}′</span>
+      <span style="flex:2 1 300px;min-width:0;font-size:13px;font-weight:500;padding-left:14px;line-height:1.35">${esc(x.action)}</span><span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.rider || "–")}</span></div>`;
+    const head = `<div class="th"><span style="flex:0 0 86px">Order</span>${multi ? `<span class="hm" style="flex:0 0 120px">City</span>` : ""}<span style="flex:1 1 130px">Restaurant</span><span class="hm" style="flex:0 0 132px">Step</span><span class="r" style="flex:0 0 78px">Since dispatch</span><span class="r hm" style="flex:0 0 64px">Expected</span><span style="flex:2 1 300px;padding-left:14px">What to do</span><span class="hm" style="flex:0 0 120px">Rider</span></div>`;
+    if (!L.live) { el.innerHTML = `<div class="empty">No live orders right now.</div>`; return; }
+    el.innerHTML = `${L.risk.length ? `<div class="tbl" style="margin-top:0"><div class="tblin" style="--mw:${multi ? 1060 : 940}px">${head}${L.risk.map(row).join("")}</div></div>` : `<div class="empty" style="padding:16px 10px">✓ No live order is heading over ${t}′ right now.</div>`}
+      ${L.over.length ? `<button type="button" class="more" data-act="uover">${USTATE.over ? "Hide" : "Show"} the ${N(L.n_over)} orders already over ${t}′ ${USTATE.over ? "↑" : "↓"}</button>${USTATE.over ? `<div class="tbl" style="margin-top:4px"><div class="tblin" style="--mw:${multi ? 1060 : 940}px">${L.over.map(row).join("")}</div></div>` : ""}` : ""}`;
+  },
+  minutes(d, anim) {
+    const st = d.stages, el = $("#uMin");
+    if (!d.delivered) { el.innerHTML = `<div class="empty">No delivered orders in this period.</div>`; return; }
+    const sum = k => st.reduce((a, x) => a + (x[k] || 0), 0);
+    const bars = [["The 30′ budget", "norm", ""], ["On-time orders", "ontime", "good"], ["Late orders", "late", "badt"]];
+    const mx = Math.max(d.target, sum("late"), sum("ontime")) * 1.04, narrow = innerWidth < 600, LW = narrow ? 92 : 112, fit = narrow ? 0.09 : 0.055;
+    const worst = st.filter(x => x.late != null).sort((a, b) => (b.late - b.norm) - (a.late - a.norm))[0];
+    el.innerHTML = `<div style="position:relative">${bars.map(([l, k, cls], bi) => `<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px"><span style="flex:0 0 ${LW}px;font-size:${narrow ? 12 : 13}px;color:var(--text2)">${l}</span>
+        <div style="flex:1;min-width:0"><div class="stack ${anim ? "growx" : ""}" style="--i:${bi};height:30px;border-radius:8px;width:${(sum(k) / mx * 100).toFixed(1)}%">${st.map(x => x[k] ? `<div style="flex:${x[k].toFixed(2)} 1 0;background:${FX[x.key].col};color:${FX[x.key].fg};display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700;min-width:0;overflow:hidden" ${tipAttr([{t: `${x.label} · ${l.toLowerCase()}`}, {v: M1(x[k]), l: k === "norm" ? "budget" : "average", k: FX[x.key].col}, ...(k === "late" && x.late > x.norm ? [{v: "+" + F1(x.late - x.norm) + "′", l: "over the budget", c: "em"}] : [])])}>${x[k] / mx > fit ? Math.round(x[k]) : ""}</div>` : "").join("")}</div></div>
+        <b class="${cls}" style="flex:0 0 52px;text-align:right;font-size:14px">${F1(sum(k))}′</b></div>`).join("")}
+      <div aria-hidden="true" style="position:absolute;top:-6px;bottom:6px;left:calc(${LW + 12}px + (100% - ${LW + 76}px) * ${(d.target / mx).toFixed(4)});border-left:2px dashed var(--good);opacity:.75"></div></div>
+      <div class="lst" style="margin-top:4px"><div style="padding:6px 0;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)"><span style="flex:1">Step</span><span style="flex:0 0 56px;text-align:right">Budget</span><span style="flex:0 0 60px;text-align:right">On time</span><span style="flex:0 0 52px;text-align:right">Late</span></div>
+      ${st.map(x => `<div style="padding:9px 0"><span class="sw" style="background:${FX[x.key].col}"></span><span style="flex:1;font-size:13px;min-width:0">${esc(x.label)}</span><span class="muted" style="flex:0 0 56px;text-align:right;font-size:12.5px">${x.norm}′</span><span class="good" style="flex:0 0 60px;text-align:right;font-size:13px">${M1(x.ontime)}</span><b class="${x.late != null && x.late > x.norm + 1 ? "warnt" : ""}" style="flex:0 0 52px;text-align:right;font-size:13px">${M1(x.late)}</b></div>`).join("")}</div>
+      ${worst && worst.late > worst.norm + 1 ? `<a href="#" data-ufx="${worst.key}" style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;background:var(--amberBg);border:1px solid var(--amberEdge);color:var(--amberText);border-radius:12px;padding:12px 14px;font-size:13px;font-weight:500;min-height:44px"><span>Late orders lose the most time here: ${esc(worst.label.toLowerCase())} — ${M1(worst.late)} instead of ${worst.norm}′</span><span aria-hidden="true">→</span></a>` : ""}`;
+  },
+  fixes(d, anim) {
+    const fs = d.fixes.filter(f => f.saved > 0), el = $("#uFix");
+    if (!fs.length) { el.innerHTML = `<div class="empty">No late orders — nothing to fix. 🎉</div>`; return; }
+    const mx = Math.max(...fs.map(f => f.pts)) || 1;
+    el.innerHTML = fs.map((f, i) => `<a href="#" data-ufx="${f.key}" class="fxrow" style="display:block;padding:13px 0;${i ? "border-top:1px solid var(--hair);" : ""}color:inherit;text-decoration:none">
+      <div style="display:flex;align-items:center;gap:10px"><span style="font-size:17px" aria-hidden="true">${FX[f.key].icon}</span><b style="flex:1;font-size:14px">${esc(FX[f.key].name)}</b><b class="good" style="font-size:16px">+${F1(f.pts)} pts</b></div>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:8px"><span class="track t8" style="flex:1"><span class="f ${anim ? "growx" : ""}" style="--i:${i};width:${(f.pts / mx * 100).toFixed(1)}%;background:${FX[f.key].col}"></span></span><span class="muted" style="font-size:12px;white-space:nowrap">${N(f.saved)} late orders</span></div>
+      <div class="t2" style="font-size:12.5px;margin-top:7px">${f.avg_late > f.norm ? `Late orders spent ${M1(f.avg_late)} here (budget ${f.norm}′).` : `Usually fine (${M1(f.avg_late)} on average), but in these orders it ran long enough to cost the ${d.target}′.`} ${esc(FX[f.key].act)} <span style="color:var(--accentText);white-space:nowrap">Where →</span></div></a>`).join("");
+  },
+  grid(d) {
+    const el = $("#uGrid"), cs = d.cities, tw = d.target_within_pct, t = d.target;
+    if (!cs.length) { el.innerHTML = `<div class="empty">No delivered orders in this period.</div>`; return; }
+    const hrs = [...new Set(cs.flatMap(c => c.hours.filter(h => h.n >= 3).map(h => h.hour)))].sort((a, b) => a - b);
+    const bg = p => p >= tw ? "rgba(61,220,151,.34)" : p >= tw - 15 ? "rgba(61,220,151,.16)" : p >= 50 ? "rgba(255,181,71,.24)" : p >= 30 ? "rgba(255,107,129,.24)" : "rgba(255,107,129,.42)";
+    const cell = (c, x) => {
+      if (!x || x.n < 3) return `<span class="uc" style="color:var(--muted)">·</span>`;
+      const sv = Object.entries(x.saved || {}).sort((a, b) => b[1] - a[1]);
+      const tip = [{t: `${c.city} · ${hh(x.hour)} – ${hh(x.hour + 1)}`}, {v: P0(x.within_pct), l: `within ${t}′`, k: C.good}, {v: N(x.n), l: "delivered"}, {v: N(x.late), l: "late"},
+                   ...sv.slice(0, 3).map(([k, v]) => ({v: N(v), l: `late orders a normal ${FX[k].short} would save`, k: FX[k].col}))];
+      return `<span class="uc" tabindex="0" ${tipAttr(tip)} style="background:${bg(x.within_pct)}">${Math.round(x.within_pct)}${x.cause && x.within_pct < tw ? `<i aria-hidden="true">${FX[x.cause].icon}</i>` : ""}</span>`;
+    };
+    el.innerHTML = `<div class="tbl"><div class="tblin keep" style="--mw:${330 + hrs.length * 42}px">
+      <div class="th"><span class="stick" style="flex:0 0 150px">City</span>${hrs.map(h => `<span style="flex:1 1 0;min-width:36px;text-align:center">${h}</span>`).join("")}<span class="r" style="flex:0 0 70px">Within</span><span style="flex:0 0 110px;padding-left:10px">Biggest fix</span></div>
+      ${cs.map(c => { const by = Object.fromEntries(c.hours.map(x => [x.hour, x]));
+        return `<div class="tr click" data-city="${esc(c.city)}" style="padding:3px 0"><b class="stick" style="flex:0 0 150px;min-width:0;overflow:hidden;font-size:13px;padding-right:6px" title="${esc(c.city)}"><span style="${ell}">${esc(c.city)}</span></b>${hrs.map(h => `<span style="flex:1 1 0;min-width:36px;padding:0 2px">${cell(c, by[h])}</span>`).join("")}
+          <b class="r ${c.within_pct >= tw ? "good" : c.within_pct >= tw - 15 ? "warnt" : "badt"}" style="flex:0 0 70px">${P0(c.within_pct)}</b><span style="flex:0 0 110px;padding-left:10px;font-size:12.5px;white-space:nowrap">${c.main ? `${FX[c.main].icon} <b class="good">+${F1(c.main_pts)}</b>` : "–"}</span></div>`; }).join("")}
+    </div></div>
+    <div class="legend" style="margin-top:10px;font-size:12px"><span><i style="background:rgba(61,220,151,.34)"></i>${tw} %+</span><span><i style="background:rgba(61,220,151,.16)"></i>${tw - 15}–${tw} %</span><span><i style="background:rgba(255,181,71,.24)"></i>50–${tw - 15} %</span><span><i style="background:rgba(255,107,129,.42)"></i>under 50 %</span>${Object.values(FX).map(f => `<span>${f.icon} ${f.short}</span>`).join("")}</div>`;
+  },
+  details(d) {
+    const el = $("#uDetails"), fs = d.fixes.filter(f => f.saved > 0), multi = !S.city;
+    const P = d.period, rlink = x => "#restaurants?" + new URLSearchParams({from: P.a, to: P.b, city: x.city, sel: x.restaurant + "|" + x.city});
+    const tbl = (mw, head, rows) => `<div class="tbl"><div class="tblin" style="--mw:${mw}px"><div class="th">${head}</div>${rows}</div></div>`;
+    const restName = x => `<span style="flex:1 1 220px;${ell}"><b>${esc(x.restaurant)}</b>${multi ? `<span class="muted" style="font-size:11.5px"> · ${esc(x.city)}</span>` : ""}</span>`;
+    const whenTbl = (f, avgLabel) => tbl(560, `<span style="flex:1 1 200px">When</span><span class="r" style="flex:0 0 80px">Saved</span><span class="r" style="flex:0 0 110px">${avgLabel}</span><span class="r hm" style="flex:0 0 90px">Within ${d.target}′</span>`,
+      f.hours.map(x => `<div class="tr click" data-city="${esc(x.city)}"><span style="flex:1 1 200px;${ell}"><b>${hh(x.hour)}–${hh(x.hour + 1)}</b>${multi ? `<span class="t2"> · ${esc(x.city)}</span>` : ""}</span><b class="r good" style="flex:0 0 80px">${N(x.saved)}</b><span class="r" style="flex:0 0 110px">${M1(x.avg)} <span class="muted" style="font-size:11.5px">late ${M1(x.avg_late)}</span></span><span class="r hm ${withinText(x.within_pct)}" style="flex:0 0 90px">${P0(x.within_pct)}</span></div>`).join(""));
+    const riderTbl = (f, avgLabel) => tbl(640, `<span style="flex:1 1 200px">Rider</span><span class="hm" style="flex:0 0 120px">Fleet</span><span class="r" style="flex:0 0 70px">Saved</span><span class="r" style="flex:0 0 90px">${avgLabel}</span><span class="r hm" style="flex:0 0 80px">Orders</span><span class="r hm" style="flex:0 0 90px">Hand-backs</span>`,
+      f.riders.map(x => `<div class="tr"><span style="flex:1 1 200px;${ell}"><b>${esc(x.rider)}</b>${multi ? `<span class="t2"> · ${esc(x.city)}</span>` : ""}</span><span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.fleet || "–")}</span><b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><span class="r" style="flex:0 0 90px">${M1(x.avg)}</span><span class="r hm t2" style="flex:0 0 80px">${N(x.n)}</span><span class="r hm ${x.handbacks >= 3 ? "warnt" : "t2"}" style="flex:0 0 90px">${N(x.handbacks)}</span></div>`).join(""));
+    const body = f => {
+      if (f.key === "wt") return f.restaurants.length ? tbl(900, `<span style="flex:1 1 220px">Restaurant</span><span class="r" style="flex:0 0 70px">Saved</span><span class="r" style="flex:0 0 80px">Avg wait</span><span class="r hm" style="flex:0 0 90px">Rider-h lost</span><span style="flex:1 1 230px;padding-left:16px">Send riders later</span><span style="flex:0 0 70px"></span>`,
+        f.restaurants.map(x => `<div class="tr">${restName(x)}<b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><b class="r warnt" style="flex:0 0 80px">${M1(x.avg_wait)}</b><span class="r hm t2" style="flex:0 0 90px">${F1(x.lost_h)} h</span>
+          <span style="flex:1 1 230px;padding-left:16px;font-size:12.5px">${x.send_later.length ? x.send_later.map(s => `<b>${hh(s.from)}–${hh(s.to)}</b> ${s.min}′ later`).join(" · ") : `<span class="muted">waits vary too much — call them</span>`}</span><a href="${rlink(x)}" style="flex:0 0 70px;text-align:right;font-size:12.5px">Orders →</a></div>`).join("")) : "";
+      if (f.key === "tc") return f.restaurants.length ? tbl(700, `<span style="flex:1 1 220px">Restaurant</span><span class="r" style="flex:0 0 70px">Saved</span><span class="r" style="flex:0 0 90px">Avg ride</span><span class="r hm" style="flex:0 0 80px">Orders</span><span class="r hm" style="flex:0 0 80px">Late</span>`,
+        f.restaurants.map(x => `<div class="tr">${restName(x)}<b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><b class="r" style="flex:0 0 90px">${M1(x.avg_ride)}</b><span class="r hm t2" style="flex:0 0 80px">${N(x.n)}</span><span class="r hm t2" style="flex:0 0 80px">${N(x.late)}</span></div>`).join("")) : "";
+      if (f.key === "acc") return `<h3 style="font-size:13px;margin:4px 0 0;color:var(--text2)">When it happens</h3>${whenTbl(f, "Avg accept")}<a href="#staffing" class="more">Plan more riders in Staffing →</a>
+        ${f.riders.length ? `<h3 style="font-size:13px;margin:14px 0 0;color:var(--text2)">Riders who accept slowly</h3>${riderTbl(f, "Avg accept")}` : ""}`;
+      if (f.key === "tr") return `${whenTbl(f, "Avg to restaurant")}<a href="#staffing" class="more">Plan more riders in Staffing →</a>`;
+      if (f.key === "ho") return f.riders.length ? riderTbl(f, "Avg hand-over") : "";
+      return "";
+    };
+    el.innerHTML = fs.map(f => `<section class="card" id="fx-${f.key}" style="scroll-margin-top:84px"><div class="ch"><div><h2>${FX[f.key].icon} ${esc(FX[f.key].name)} <span class="good" style="font-size:15px;font-weight:600;margin-left:6px">+${F1(f.pts)} pts</span></h2><p class="d">${N(f.saved)} late orders would have made ${d.target}′ with a normal ${FX[f.key].short} (${f.norm}′). ${esc(FX[f.key].act)}</p></div></div><div style="margin-top:10px">${body(f)}</div></section>`).join("");
+  }
+};
+
+const PAGES = {performance: PERF, under30: UND, restaurants: REST, riders: RID, staffing: STAFF, evidence: EVID};
 
 /* ======================================================================== events */
 document.addEventListener("click", e => {
-  const a = e.target.closest("[data-act],[data-period],[data-city],[data-metric],[data-sel],[data-sort],[data-msg],[data-order],[data-rider],[data-ex],[data-pi],[data-nav],[data-sday],[data-ewk],[data-ewkd]");
+  const a = e.target.closest("[data-act],[data-period],[data-city],[data-metric],[data-sel],[data-sort],[data-msg],[data-order],[data-rider],[data-ex],[data-pi],[data-nav],[data-sday],[data-ewk],[data-ewkd],[data-ufx]");
   if (!a) { if (!e.target.closest(".menu,#btnExport,#customPop,[data-act=custom]")) closeMenus(); return; }
   if (a.hasAttribute("data-stop") || e.target.closest("[data-stop]")) return;
   const ds = a.dataset;
@@ -1348,6 +1487,7 @@ document.addEventListener("click", e => {
   if (ds.sday) { S.sday = ds.sday; history.replaceState(null, "", hashFor("staffing")); return refresh({dim: true, anim: true}); }
   if (ds.ewk) { S.wk = ds.ewk; history.replaceState(null, "", hashFor("evidence")); renderFilters(); return refresh({dim: true, anim: true}); }
   if (ds.ewkd) return EVID.shift(+ds.ewkd / 7);
+  if (ds.ufx) { e.preventDefault(); const tg = $("#fx-" + ds.ufx); if (tg) tg.scrollIntoView({behavior: RM ? "auto" : "smooth", block: "start"}); return; }
   if (ds.msg) { e.stopPropagation(); return openMessage(ds.msg, ds.name, ds.phone, ds.ref); }
   if (ds.order) return openOrder(ds.order);
   if (ds.rider) return RID.riderDrawer(ds.rider);
@@ -1370,6 +1510,7 @@ document.addEventListener("click", e => {
     case "ecsv": return EVID.dl("csv");
     case "eall": EVID.allRest = !EVID.allRest; return EVID.data && EVID.render(EVID.data, {});
     case "erows": EVID.allRows = !EVID.allRows; return EVID.orders();
+    case "uover": USTATE.over = !USTATE.over; return USTATE.data && UND.now(USTATE.data);
   }
 });
 $("#openSearch").onclick = openPal;
@@ -1393,7 +1534,7 @@ document.addEventListener("keydown", e => {
   if (PAL || $("#drawer").classList.contains("open")) return;
   if (e.target.closest("input,textarea,select,[contenteditable]") || e.metaKey || e.ctrlKey || e.altKey) return;
   if (k === "/") { e.preventDefault(); return openPal(); }
-  const n = "123456789".indexOf(k); if (n >= 0) return goPage(NAV[n].id);
+  const n = "1234567890".indexOf(k); if (n >= 0) return goPage(NAV[n].id);
   if (k === "ArrowLeft" || k === "ArrowRight") { if (S.page === "restaurants" && e.shiftKey) return; e.preventDefault(); const dir = k === "ArrowLeft" ? -1 : 1;
     if (S.page === "staffing") return STAFF.shift(dir); if (S.page === "evidence") return EVID.shift(dir); return shiftRange(dir); }
   const l = k.toLowerCase();
