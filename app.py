@@ -204,7 +204,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.8.0"
+VERSION = "9.8.1"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -508,6 +508,43 @@ def rider_name(u: dict) -> str:
     return " ".join(x for x in [p.get("first_name"), p.get("last_name")] if x).strip() or u.get("email") or "Rider"
 
 
+MT_USER: dict = {k[8:]: v for k, v in store.get_settings().items() if k.startswith("mt_user:")}
+
+
+def remember_mt_user(rid: str, u: dict, batch: dict = None):
+    """The rider's MotionTools login (the part of the email before @) — tells apart riders with the same name."""
+    email = str(u.get("email") or (u.get("profile") or {}).get("email") or "").strip()
+    user = email.split("@")[0].strip()[:60] if "@" in email else ""
+    if rid and user and MT_USER.get(rid) != user:
+        MT_USER[rid] = user
+        if batch is None:
+            store.set_settings({f"mt_user:{rid}": user})
+        else:
+            batch[f"mt_user:{rid}"] = user
+
+
+def login_of(rid: str) -> str:
+    """@login without the @: the Intercom username, else the MotionTools login."""
+    return (INTERCOM_USER.get(rid) or MT_USER.get(rid) or "") if rid else ""
+
+
+def full_name(rid: str, fallback: str = "") -> str:
+    """The name as MotionTools has it (first + last) — an order often only carries the first name."""
+    n = ((STATE["riders"].get(rid) or {}).get("name") or "") if rid else ""
+    ok = n and n != "Rider" and "@" not in n
+    return n if ok and len(n) >= len(fallback or "") else (fallback or (n if ok else ""))
+
+
+def handle(rid: str) -> str:
+    """What tells this rider apart from others with the same name: "@login", else the end of his phone number, else the
+    start of his MotionTools id."""
+    u = login_of(rid)
+    if u:
+        return "@" + u
+    ph = "".join(ch for ch in ((STATE["riders"].get(rid) or {}).get("phone") or projector.phones.get(rid) or "") if ch.isdigit()) if rid else ""
+    return f"☎ …{ph[-4:]}" if len(ph) >= 6 else (f"#{rid[:6]}" if rid else "")
+
+
 async def sync_riders(now: datetime):
     rows = await mt.list_drivers(AREAS)
     if rows is None:
@@ -515,10 +552,12 @@ async def sync_riders(now: datetime):
     if rows and "rider" not in STATE["raw_samples"]:
         STATE["raw_samples"]["rider"] = rows[0]
     busy_order = {o["rider_id"]: o["id"] for o in list(STATE["orders"].values()) if o["rider_id"]}
+    logins = {}
     for u in rows:
         rid = u.get("id")
         if not rid:
             continue
+        remember_mt_user(rid, u, logins)
         loc = u.get("location") or {}
         online = u.get("status") == "online"
         mt_phone = (u.get("profile") or {}).get("phone_number") or ""
@@ -531,6 +570,8 @@ async def sync_riders(now: datetime):
             tracker.push(rid, info["lat"], info["lng"], now)
             if rid in busy_order or info["active_ids"]:
                 store.record_position(rid, info["lat"], info["lng"], busy_order.get(rid), now)
+    if logins:
+        store.set_settings(logins)
     STATE["sync"]["riders_seen"] = len(rows)
 
 
@@ -714,6 +755,7 @@ async def enrich_rider(rid: str, now: datetime = None, force: bool = False) -> b
     if not u:
         return False
     r = projector.rider(rid)
+    remember_mt_user(rid, u)
     name = rider_name(u)
     if name and name != "Rider":
         r["name"] = name
@@ -1106,10 +1148,15 @@ def prewarm_v2():
         _v2_restaurants_data(period="today", city="", minutes=10, frm="", to="")
         _v2_rider_stats(period="today", city="", fleet="", frm="", to="")
         _v2_review_data(city="", fleet="")              # weekly review + accounts that move together (Riders page)
+        analytics.gps_pairs_ensure(store, datetime.now(UTC))
         _v2_twins_data(city="", days=14)
     except Exception as e:
         log.warning("v2 prewarm: %s", e)
     while True:                                        # weather for the staffing forecast: every hour
+        try:                                           # GPS of yesterday → kept as a daily summary before the raw points go
+            analytics.gps_pairs_ensure(store, datetime.now(UTC))
+        except Exception as e:
+            log.warning("gps pairs: %s", e)
         try:
             now = datetime.now(UTC)
             n = analytics.refresh_weather(analytics.city_coords(store, projector.place_ll, now), day_key(now))
@@ -1966,7 +2013,7 @@ def order_view(o: dict, now: datetime, idx: dict = None) -> dict:
             "rider_online": r.get("online"), "live": live, "in_stage": int(in_stage) if in_stage is not None else None,
             "alert_heads": [h for h in heads if h], "stack": STATE["stack"].get(o["id"]) if live else None,
             "reason": o.get("reason") or "", "note": o.get("note") or "", "query_flag": o.get("query_flag") or "", "excuse": o.get("excuse") or "", "customer_name": o.get("customer_name") or "", "warn": rules.ptod_warn_min,
-            "history": o.get("history") or [], "reassigned": o.get("reassigned") or 0,
+            "history": [dict(h, rider=full_name(h.get("rider_id"), h.get("rider"))) for h in o.get("history") or []], "reassigned": o.get("reassigned") or 0,
             "created": hm(o.get("created_at")), "scheduled": hm(o.get("scheduled_at")),
             "planned": hm(o.get("eta_customer") or o.get("scheduled_at")),
             "plan": hm(planned_at(o)), "plan_grace": rules.plan_grace_min, "on_time": on_time(o, rules.plan_grace_min),
@@ -2026,7 +2073,7 @@ def api_state(city: str = "", done: int = 0):
         last_min = int((now - last).total_seconds() // 60) if last else None
         status = "on_order" if n else ("free" if last_min is not None and last_min <= 30 else "done")
         fix = tracker.last_fix(rid)
-        riders.append({"id": rid, "name": r["name"] or "Rider", "user": INTERCOM_USER.get(rid, ""), "phone": r["phone"], "online": r.get("online"), "orders": n, "lat": r.get("lat"), "lng": r.get("lng"),
+        riders.append({"id": rid, "name": r["name"] or "Rider", "user": login_of(rid), "phone": r["phone"], "online": r.get("online"), "orders": n, "lat": r.get("lat"), "lng": r.get("lng"),
                        "fleet": store.fleet_map.get(rid, ""), "done_today": pc["done_by"].get(rid, 0), "last_min": last_min, "status": status,
                        "stale": bool(n and last_min is not None and last_min >= 60),
                        "map_url": f"https://maps.google.com/?q={r['lat']:.5f},{r['lng']:.5f}" if r.get("lat") is not None and n else "",
@@ -2303,7 +2350,7 @@ def api_riders_page(period: str = "today", city: str = "", fleet: str = ""):
         r["status"], r["tone"] = rider_status_now(r, r["live"] if is_today else 0, now, is_today)
         st = STATE["riders"].get(r["rider_id"], {})
         r["phone"] = st.get("phone") or projector.phones.get(r["rider_id"], "")
-        r["user"] = INTERCOM_USER.get(r["rider_id"], "")
+        r["user"] = login_of(r["rider_id"])
         last = ts(r.get("last_at"))
         r["last_min"] = int((now - last).total_seconds() // 60) if last else None
         r["first"] = hm(ts(r.get("first_at"))); r["last"] = hm(last)
@@ -2350,7 +2397,7 @@ def _automations_payload() -> dict:
                          **counts.get(k, {"today": 0, "sent": 0})} for k, t, m in QUERIES],
             "cities": {"all": sorted({city_of(o) for o in list(STATE["orders"].values()) if city_of(o)} | set(store.city_map.values()) if hasattr(store, "city_map") else set()),
                        "on": sorted(auto_cities_enabled(settings))},
-            "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=INTERCOM_USER.get(f["rider_id"], "")) for f in flows.active()],
+            "flows": [dict(f, rider=STATE["riders"].get(f["rider_id"], {}).get("name") or f["rider_id"], user=login_of(f["rider_id"])) for f in flows.active()],
             "forwarded_today": counts.get("reply:forwarded", {}).get("today", 0),
             "master": ic_master(settings),
             "bot": {"wait_more": settings.get("bot_wait_more") or "10", "wait_total": settings.get("bot_wait_total") or "20",
@@ -3377,6 +3424,19 @@ def _check_period(period):
         raise HTTPException(400, "period must be today, yesterday, week, lastweek, month or YYYY-MM-DD")
 
 
+def _rider_ids_for(q: str) -> set:
+    """Riders whose @login contains q (3+ letters, with or without @) or whose phone ends with q (4+ digits)."""
+    ql = (q or "").strip().lower()
+    qh, out = ql.lstrip("@"), set()
+    if len(qh) >= 3:
+        out |= {rid for rid in set(INTERCOM_USER) | set(MT_USER) if qh in login_of(rid).lower()}
+    if ql.isdigit() and len(ql) >= 4:
+        for rid, r in list(STATE["riders"].items()):
+            if "".join(ch for ch in (r.get("phone") or "") if ch.isdigit()).endswith(ql):
+                out.add(rid)
+    return out
+
+
 @app.get("/api/orders", dependencies=[Depends(require_login)])
 @fast_json
 @report_cache(15, 120)
@@ -3384,7 +3444,7 @@ def api_orders(period: str = "today", q: str = "", city: str = ""):
     _check_period(period)
     now = datetime.now(UTC)
     cap = 2500 if period not in ("today",) or not city else 5000     # a browser table of 20 000 rows helps nobody
-    rows = store.orders_in(period, now, q, city=city, limit=cap)
+    rows = store.orders_in(period, now, q, city=city, limit=cap, q_ids=_rider_ids_for(q))
     idx = alerts_index()
     total = len(rows) if q else store.count_in(period, now, city=city)
     return {"orders": [order_view(o, now, idx) for o in rows[:cap]], "total": total, "shown": min(total, cap)}
@@ -4022,7 +4082,8 @@ def api_v2_restaurant(name: str = "", city: str = "", period: str = "today", min
         except (ValueError, IndexError):
             w = None
         rows.append({"date": r[0], "ref": r[1], "rider": r[2], "dispatched": r[3], "accepted": r[4], "arrived": r[5], "picked": r[6],
-                     "wait": w, "delivered": r[8], "ptod": r[9], "note": r[10], "id": o.get("id") or "", "mt_url": mt_link(o) if o else ""})
+                     "wait": w, "delivered": r[8], "ptod": r[9], "note": r[10], "id": o.get("id") or "", "mt_url": mt_link(o) if o else "",
+                     "rider_id": o.get("rider_id") or ""})
     P = analytics.resolve(period, now, frm, to)
     det = analytics.restaurant_detail(store, now, P, name, city, m)
     slow = max(det["by_hour"], key=lambda b: b["avg"]) if det["by_hour"] else None
@@ -4073,7 +4134,7 @@ def _v2_all_restaurants(period: str, city: str, m: int, frm: str, to: str, now: 
                 w = mins(o["at_restaurant_at"], now)
                 if w >= m:
                     rows.append({"date": o["at_restaurant_at"].astimezone(BERLIN).strftime("%a %d.%m."), "ref": o.get("ref") or "",
-                                 "restaurant": o.get("restaurant") or "?", "city": city_of(o), "rider": o.get("rider") or "–",
+                                 "restaurant": o.get("restaurant") or "?", "city": city_of(o), "rider": o.get("rider") or "–", "rider_id": o.get("rider_id") or "",
                                  "dispatched": hm(o.get("dispatched_at")), "accepted": hm(o.get("accepted_at")), "arrived": hm(o["at_restaurant_at"]),
                                  "picked": "–", "wait": int(round(w)), "delivered": "–", "ptod": "–", "note": "still waiting",
                                  "id": o["id"], "mt_url": mt_link(o)})
@@ -4081,13 +4142,13 @@ def _v2_all_restaurants(period: str, city: str, m: int, frm: str, to: str, now: 
     w, a = "day BETWEEN ? AND ? AND phase='delivered' AND kitchen_wait >= ?", [P["a"], P["b"], m]
     if city:
         w += " AND city=?"; a.append(city)
-    for r in store._rows("SELECT id, ref, rider, restaurant, city, dispatched_at, accepted_at, picked_up_at, delivered_at, ptod_min, kitchen_wait, "
+    for r in store._rows("SELECT id, ref, rider, rider_id, restaurant, city, dispatched_at, accepted_at, picked_up_at, delivered_at, ptod_min, kitchen_wait, "
                          "(SELECT COUNT(*) FROM handbacks h WHERE h.order_id = orders.id) AS hb "
                          f"FROM orders WHERE {w} ORDER BY picked_up_at DESC LIMIT ?", a + [ALL_ROWS_MAX]):
         pick, kw = ts(r["picked_up_at"]), r["kitchen_wait"] or 0
         arrived = pick - timedelta(minutes=kw) if pick else None          # the FIRST rider's arrival (kitchen_wait starts there)
         rows.append({"date": (arrived or pick or now).astimezone(BERLIN).strftime("%a %d.%m."), "ref": r["ref"] or "",
-                     "restaurant": r["restaurant"] or "?", "city": r["city"] or "", "rider": r["rider"] or "–",
+                     "restaurant": r["restaurant"] or "?", "city": r["city"] or "", "rider": r["rider"] or "–", "rider_id": r["rider_id"] or "",
                      "dispatched": hm(ts(r["dispatched_at"])), "accepted": hm(ts(r["accepted_at"])), "arrived": hm(arrived), "picked": hm(pick),
                      "wait": int(round(kw)), "delivered": hm(ts(r["delivered_at"])),
                      "ptod": f"{round(r['ptod_min'])} min" if r["ptod_min"] is not None else "–",
@@ -4207,7 +4268,7 @@ def _v2_riders_now(city: str, fleet: str, now: datetime) -> tuple:
     for c in checks:
         r = STATE["riders"].get(c["rider_id"]) or {}
         c.pop("key", None)
-        c.update(name=r.get("name") or names.get(c["rider_id"]) or "Rider", user=INTERCOM_USER.get(c["rider_id"], ""),
+        c.update(name=r.get("name") or names.get(c["rider_id"]) or "Rider", user=login_of(c["rider_id"]),
                  phone=r.get("phone") or projector.phones.get(c["rider_id"], ""), city=cities.get(c["rider_id"], ""))
     counts["checks_total"] = len(worst)
     return counts, checks
@@ -4268,6 +4329,14 @@ def _v2_review_data(city: str = "", fleet: str = "") -> dict:
             "counts": {"talk": len(talk), "watch": len(watch), "top": len(top), "block": sum(1 for x in talk if x.get("block"))}}
 
 
+@app.get("/api/handles", dependencies=[Depends(require_login)])
+@fast_json
+def api_handles():
+    """rider id → what tells him apart from riders with the same name ("@login" or "☎ …4471"), for every page."""
+    ids = set(STATE["riders"]) | set(INTERCOM_USER) | set(MT_USER) | {r["id"] for r in store.riders()}
+    return {"h": {rid: h for rid in ids if rid and (h := handle(rid))}}
+
+
 @app.get("/api/v2/review", dependencies=[Depends(require_login)])
 @fast_json
 def api_v2_review(city: str = "", fleet: str = ""):
@@ -4280,7 +4349,9 @@ def _v2_twins_data(city: str = "", days: int = 14) -> dict:
     for rid, st in list(STATE["riders"].items()):
         if st.get("phone"):
             phones.setdefault(rid, st["phone"])
-    return analytics.twins(store, datetime.now(UTC), days=days, city=city, phones=phones)
+    names = {r["id"]: r["name"] for r in store.riders() if r.get("name") and r["name"] != "Rider" and "@" not in r["name"]}
+    names.update({rid: full_name(rid) for rid in list(STATE["riders"]) if full_name(rid)})
+    return analytics.twins(store, datetime.now(UTC), days=days, city=city, phones=phones, names=names)
 
 
 @app.get("/api/v2/twins", dependencies=[Depends(require_login)])
@@ -4308,7 +4379,7 @@ def api_v2_riders(period: str = "today", city: str = "", fleet: str = "", frm: s
                      "days": r["days"], "hours": r["hours"], "per_hour": r["per_hour"], "avg_ptod": r["avg_ptod"], "within_pct": r["within_pct"],
                      "on_time_pct": r["on_time_pct"], "accept": r["avg_accept"], "wait": r["avg_wait"], "handbacks": r["handbacks_bad"],
                      "handbacks_excused": r["handbacks_excused"], "double": r["double"], "usual": r["usual"], "score": r["score"],
-                     "cancelled": r["cancelled"], "user": INTERCOM_USER.get(r["rider_id"], ""),
+                     "cancelled": r["cancelled"], "user": login_of(r["rider_id"]),
                      "on_time_fair": r.get("on_time_fair_pct"), "ptod_fair": r.get("avg_ptod_fair"), "per_hour_fair": r.get("per_hour_fair"),
                      "kitchen_lost": r.get("kitchen_lost_min"), "parts": r.get("score_parts"),
                      "phone": st.get("phone") or projector.phones.get(r["rider_id"], ""), "last_at": r["last_at"]})
@@ -4463,13 +4534,19 @@ def api_v2_search(q: str = ""):
             out.append({"kind": "Order", "id": o["id"], "title": f"{o['ref']} · {o.get('restaurant') or ''}",
                         "meta": f"{PHASE_LABEL.get(o['phase'], o['phase'])} · {store.city_of(o)} · {(o.get('dispatched_at') or o.get('created_at') or now).astimezone(BERLIN).strftime('%d %b')}"})
     live = live_by_rider()
-    riders = []
-    for rid, r in list(STATE["riders"].items()):
-        if ql in (r.get("name") or "").lower():
-            riders.append((-(live.get(rid) or 0), r.get("name") or "", rid))
-    for _, name, rid in sorted(riders)[:5]:
-        n = live.get(rid) or 0
-        out.append({"kind": "Rider", "id": rid, "title": name, "meta": (f"on {n} order{'s' if n > 1 else ''} now" if n else "no live order")
+    riders, qh, qd = [], ql.lstrip("@"), "".join(ch for ch in ql if ch.isdigit())
+    known = {r["id"]: r.get("name") or "" for r in store.riders()}
+    known.update({rid: r.get("name") or known.get(rid, "") for rid, r in list(STATE["riders"].items())})
+    for rid, nm in known.items():
+        nm = full_name(rid, nm)
+        lg = login_of(rid).lower()
+        ph = "".join(ch for ch in ((STATE["riders"].get(rid) or {}).get("phone") or projector.phones.get(rid) or "") if ch.isdigit())
+        if ql in nm.lower() or (len(qh) >= 3 and qh in lg) or (len(qd) >= 4 and qd == ql and ph.endswith(qd)):
+            riders.append((-(live.get(rid) or 0), nm, rid))
+    for _, name, rid in sorted(riders)[:8]:
+        n, h = live.get(rid) or 0, handle(rid)
+        out.append({"kind": "Rider", "id": rid, "title": name + (f"  {h}" if h else ""), "q": h or name,
+                    "meta": (f"on {n} order{'s' if n > 1 else ''} now" if n else "no live order")
                     + (f" · {store.fleet_map[rid]}" if store.fleet_map.get(rid) else "")})
     hits = [r for r in _v2_restaurant_list() if ql in r[3]][:5]
     for name, cty, n, _ in hits:

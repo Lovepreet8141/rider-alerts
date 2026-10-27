@@ -23,6 +23,27 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.8.1 — Every rider told apart (@login next to the name) · "accounts that move together" by GPS
+
+* **@login next to every rider name.** Three riders called "Virat" are now Virat @virat.muc2, Virat @virat_k and Virat ☎ …4471.
+  - The login is the Intercom username, else the MotionTools login (the part of the email before @, read from MotionTools
+    automatically). Without either, the end of his phone number, else the start of his MotionTools id.
+  - Shown in: "What happened, rider by rider" (hand-backs), the order panel, live orders, Orders, alerts, Riders,
+    rankings, the weekly review, accounts that move together, restaurant orders, PTOD under 30.
+  - Search by it: the ⌘K search, the Riders search, the Orders search and the live search all find "@virat.muc2",
+    "virat.muc2" or the last 4+ digits of the phone number.
+  - Order history shows the full name as MotionTools has it (first + last), not only the first name.
+* **Accounts that move together now uses GPS first** — a person on two accounts carries both phones, whatever restaurant
+  or order he does first.
+  - Every night the system saves, for the day before, how many minutes each two accounts were moving within 150 m of
+    each other. Raw GPS is still deleted after 2 days; this summary is kept 40 days, so 7 / 14 / 28 days all have GPS
+    (it fills up from the day you deploy).
+  - **Very likely**: together 70 %+ of the time both were moving, on 2+ days. **Likely**: 50 %+.
+  - The same-restaurant rule is now one clue next to: same start/end of the day, same phone number (raises the level by
+    one). A same-restaurant pair whose GPS says they ride apart drops to "check".
+  - Click a pair: day-by-day minutes together and both riders' orders that day, plus the same-restaurant orders.
+  - Still evidence only: nothing is blocked, nobody is messaged.
+
 ## 9.8.0 — Fair rider score · weekly review · accounts that move together (Riders & fleets page)
 
 * **Fair score.** Kitchen waits are no longer counted against riders. Anything a rider waited at a restaurant beyond a

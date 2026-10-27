@@ -87,6 +87,7 @@ kbd{font-family:'Geist Mono',monospace;font-size:10px;color:var(--muted);border:
 @keyframes pageIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:14px}
 .over{font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--accentText)}
+.hdl{color:var(--accentText);font-weight:500;white-space:nowrap}
 h1{margin:4px 0 2px;font-size:32px;font-weight:600;letter-spacing:-.03em;line-height:1.15}
 .sub{font-size:14px;color:var(--muted)}
 .filters{display:flex;flex-wrap:wrap;align-items:center;gap:10px;position:relative}
@@ -305,7 +306,7 @@ button.chip:hover{border-color:var(--edge2);color:#fff}
 }
 @media (max-width:620px){
   .rvr{flex-wrap:wrap;row-gap:0}.rvr::after{content:"";order:8;flex:1 1 100%}.rvr>:first-child{flex:1 1 0!important}.rvr>.rvf{order:9;flex:1 1 0!important;min-width:0;padding-left:42px!important;margin-top:6px}.rvr>:last-child{order:10;flex:0 0 auto!important;margin-top:6px}.th.rvr>.rvf,.th.rvr::after{display:none}
-  .twr{flex-wrap:wrap;row-gap:6px}.twr>.twa{flex:1 1 100%!important}.th.twr>.twa{display:none}.twr>.r{text-align:left}.twr>.two{flex:0 0 100px!important}.twr>.twd{flex:0 0 44px!important}.twr>.twl{flex:1 1 auto!important}
+  .twr{flex-wrap:wrap;row-gap:6px}.twr>.twa{flex:1 1 100%!important}.th.twr>.twa{display:none}.twr>.r{text-align:left}.twr>.two{flex:1 1 auto!important}.twr>.twa>span:first-child{white-space:normal}.twr>.twl{flex:1 1 auto!important}
 }
 @media (max-width:520px){ .filters{width:100%} .seg{width:100%} .seg button{flex:1 1 auto;padding:0 8px} .sel{flex:1 1 140px;max-width:none} .search{flex-basis:100%;order:3} }
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
@@ -411,6 +412,7 @@ const MO = ["January", "February", "March", "April", "May", "June", "July", "Aug
 const longDay = s => { const d = dD(s); return `${WD[d.getUTCDay()]}, ${d.getUTCDate()} ${MO[d.getUTCMonth()]}`; };
 const shortDay = s => { const d = dD(s); return `${WD[d.getUTCDay()].slice(0, 3)} ${d.getUTCDate()} ${MO[d.getUTCMonth()].slice(0, 3)}`; };
 const dm = s => { const d = dD(s); return `${d.getUTCDate()} ${MO[d.getUTCMonth()].slice(0, 3)}`; };
+const hmin = m => { m = Math.round(m || 0); return m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min` : `${m} min`; };
 
 /* ======================================================================== state & URL */
 const S = {page: "performance", period: "today", city: "", from: "", to: "", fleet: "", min: 10, sel: "", sort: "score", cmp: true, metric: "within"};
@@ -578,6 +580,14 @@ function delta(cur, prev, kind, betterUp = true) {
   return `<span class="delta ${tone}" title="compared with ${esc(LASTP ? LASTP.compare_label : "")}">${txt}</span>`;
 }
 const ini = s => (String(s || "?").trim()[0] || "?").toUpperCase();
+/* what tells a rider apart from riders with the same name: "@login" (Intercom / MotionTools) or "☎ …4471" */
+let HANDLES = {};
+const hd = rid => rid ? (HANDLES[rid] || "#" + String(rid).slice(0, 6)) : "";
+const hdS = rid => hd(rid) ? ` <span class="hdl">${esc(hd(rid))}</span>` : "";
+const who2 = (name, rid) => `<span style="display:block;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(name || "–")}</span>${hd(rid) ? `<span class="hdl" style="display:block;font-size:11px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(hd(rid))}</span>` : ""}`;
+async function loadHandles() {
+  try { const r = await fetch("/api/handles", {credentials: "same-origin"}); if (!r.ok) return; const d = await r.json(); const first = !Object.keys(HANDLES).length; HANDLES = d.h || {}; if (first && SHELL && Object.keys(HANDLES).length) refresh({}); } catch (e) {}
+}
 const ptodColor = (v, t) => v == null ? C.edge : v >= t + 5 ? C.bad : v >= t ? C.amber : C.good;
 const withinText = v => v == null ? "muted" : v >= 80 ? "good" : v >= 50 ? "warnt" : "badt";
 function ylabels(max, ticks, h, bottom = 22) {
@@ -667,7 +677,7 @@ async function palSearch(q) {
     const d = await api("/api/v2/search?q=" + encodeURIComponent(q)); if (!PAL || PAL.q !== q) return;
     const res = d.results.map(r => ({kind: r.kind, title: r.title, meta: r.meta, go: () => {
       if (r.kind === "Order") openOrder(r.id);
-      else if (r.kind === "Rider") { S.page === "riders" ? (RFILTER.q = r.title, PAGES.riders.table()) : (RFILTER.q = r.title, location.hash = hashFor("riders")); }
+      else if (r.kind === "Rider") { const fq = r.q || r.title; S.page === "riders" ? (RFILTER.q = fq, PAGES.riders.table()) : (RFILTER.q = fq, location.hash = hashFor("riders")); }
       else if (r.kind === "Restaurant") { S.sel = r.id + "|" + (r.city || ""); RSTATE.keep = true; RSTATE.q = ""; if (S.page !== "restaurants") location.hash = hashFor("restaurants"); else { REST.rank(false); REST.detail(false); } }
       else if (r.kind === "City") setFilters({city: r.id});
     }}));
@@ -704,7 +714,7 @@ async function openOrder(id) {
     const steps = [["Dispatched", tm.dispatched, null], ["Accepted", tm.accepted, ph.to_accept], ["At the restaurant", tm.at_restaurant, ph.to_restaurant],
                    ["Picked up", tm.picked_up, ph.at_restaurant, (ph.at_restaurant || 0) >= 10], ["At the customer", tm.at_customer, ph.to_customer], ["Delivered", tm.delivered, ph.handover]];
     if (o.phase === "cancelled") steps.push(["Cancelled", tm.cancelled, null]);
-    const hist = (o.history || []).filter(h => HW[h.what]).map(h => `<div class="tr" style="padding:7px 0;background:none"><span class="mono muted" style="flex:0 0 44px">${esc(berlinHM(h.at))}</span><span>${esc(HW[h.what])} <b>${esc(h.rider || "")}</b></span></div>`).join("");
+    const hist = (o.history || []).filter(h => HW[h.what]).map(h => `<div class="tr" style="padding:7px 0;background:none"><span class="mono muted" style="flex:0 0 44px">${esc(berlinHM(h.at))}</span><span>${esc(HW[h.what])} <b>${esc(h.rider || "")}</b>${hdS(h.rider_id)}</span></div>`).join("");
     $("#drawer header").innerHTML = `<div style="min-width:0"><div class="over">Order · ${esc(o.city || "")}</div><h2 style="margin:4px 0 2px;font-size:24px;letter-spacing:-.02em" class="mono">${esc(o.ref)}</h2><div class="sub">${esc(o.restaurant || "")}</div></div><button type="button" class="x" data-act="closedrawer" aria-label="Close">✕</button>`;
     $("#dBody").innerHTML = `
       <div class="row" style="gap:10px"><span class="chip">${esc(o.phase_label || o.phase)}</span>${o.reassigned ? `<span class="chip strained">handed back ${o.reassigned}×</span>` : ""}${o.stacked ? '<span class="chip">double order</span>' : ""}</div>
@@ -714,7 +724,7 @@ async function openOrder(id) {
         <div class="stat"><div>vs promised time</div><b class="${ph.vs_plan > (o.plan_grace || 5) ? "bad" : ""}">${ph.vs_plan == null ? "–" : (ph.vs_plan > 0 ? "+" : "") + Math.round(ph.vs_plan) + "′"}</b></div>
       </div>
       <div><h3 style="margin:0 0 10px;font-size:14px">Timeline</h3><div class="tl">${steps.map(([l, at, m, w]) => `<div><span class="o ${at ? (w ? "warn" : "done") : ""}"></span><div class="c"><span>${l}${m != null && at ? ` <em>+${Math.round(m)}′</em>` : ""}</span><b class="mono">${esc(at || "–")}</b></div></div>`).join("")}</div></div>
-      <div class="row" style="gap:10px;align-items:center">${o.rider ? `<span class="av">${esc(ini(o.rider))}</span><div style="flex:1;min-width:0"><b>${esc(o.rider)}</b><div class="muted" style="font-size:12px">${esc(o.fleet || "")}</div></div><button type="button" class="btn ghost sm" data-msg="${esc(o.rider_id)}" data-name="${esc(o.rider)}" data-phone="${esc(o.phone || "")}" data-ref="${esc(o.ref)}">Message</button>` : '<span class="muted">No rider yet</span>'}</div>
+      <div class="row" style="gap:10px;align-items:center">${o.rider ? `<span class="av">${esc(ini(o.rider))}</span><div style="flex:1;min-width:0"><b>${esc(o.rider)}</b>${hdS(o.rider_id)}<div class="muted" style="font-size:12px">${esc(o.fleet || "")}</div></div><button type="button" class="btn ghost sm" data-msg="${esc(o.rider_id)}" data-name="${esc(o.rider)}" data-phone="${esc(o.phone || "")}" data-ref="${esc(o.ref)}">Message</button>` : '<span class="muted">No rider yet</span>'}</div>
       ${hist ? `<div><h3 style="margin:0 0 4px;font-size:14px">What happened</h3>${hist}</div>` : ""}
       <div class="row" style="gap:10px">${o.mt_url ? `<a class="btn white sm" href="${esc(o.mt_url)}" target="_blank" rel="noopener">Open in MotionTools ↗</a>` : ""}${o.route_url ? `<a class="btn ghost sm" href="${esc(o.route_url)}" target="_blank" rel="noopener">Rider's route ↗</a>` : ""}</div>`;
   } catch (e) { $("#dBody").innerHTML = `<div class="errbox">Could not load this order: ${esc(e.message)}</div>`; }
@@ -1026,7 +1036,7 @@ const REST = {
     const more = rows.length > 20 ? `<button type="button" class="more" data-act="rrows">${RSTATE.rowsAll ? "Show the latest 20 →" : `Show ${all && r.rows_capped ? "the latest " : "all "}${N(rows.length)} orders →`}</button>` : "";
     const capped = all && r.rows_capped ? `<span class="muted" style="font-size:12px;margin-left:12px">${N(r.n)} long waits in total — the PDF and the CSV have every one</span>` : "";
     $("#rOrders").innerHTML = rows.length ? `<div class="tbl"><div class="tblin" style="--mw:${all ? 1180 : 1040}px"><div class="th"><span style="flex:0 0 84px">Date</span><span style="flex:0 0 86px">Order</span>${all ? `<span style="flex:1 1 200px">Restaurant</span>` : ""}<span style="flex:0 0 110px">Rider</span><span style="flex:0 0 66px" class="r hm">Accepted</span><span style="flex:0 0 66px" class="r">Arrived</span><span style="flex:0 0 74px" class="r hm">Picked up</span><span style="flex:0 0 150px">Waited</span><span style="flex:0 0 70px" class="r hm">Delivered</span><span style="flex:0 0 66px" class="r hm">Total</span><span style="flex:${all ? "0 1 150px" : "1 1 180px"}" class="hm">Note</span><span style="flex:0 0 62px" class="r">Tour</span></div>
-      ${shown.map(x => `<div class="tr ${x.id ? "click" : ""}" ${x.id ? `data-order="${esc(x.id)}"` : ""}><span class="t2" style="flex:0 0 84px">${esc(x.date)}</span><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${all ? `<span style="flex:1 1 200px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.restaurant)}${S.city ? "" : `<span class="muted" style="font-size:11px"> · ${esc(x.city)}</span>`}</span>` : ""}<span style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.rider)}</span>
+      ${shown.map(x => `<div class="tr ${x.id ? "click" : ""}" ${x.id ? `data-order="${esc(x.id)}"` : ""}><span class="t2" style="flex:0 0 84px">${esc(x.date)}</span><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${all ? `<span style="flex:1 1 200px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.restaurant)}${S.city ? "" : `<span class="muted" style="font-size:11px"> · ${esc(x.city)}</span>`}</span>` : ""}<span style="flex:0 0 110px;min-width:0">${who2(x.rider, x.rider_id)}</span>
         <span class="mono t2 r hm" style="flex:0 0 66px">${esc(x.accepted)}</span><span class="mono t2 r" style="flex:0 0 66px">${esc(x.arrived)}</span><span class="mono t2 r hm" style="flex:0 0 74px">${esc(x.picked)}</span>
         <span style="flex:0 0 150px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f" style="width:${Math.min(100, (x.wait || 0) / 60 * 100).toFixed(1)}%;background:${x.wait >= 45 ? C.bad : x.wait >= 30 ? C.amber : C.accent}"></span></span><b style="flex:0 0 36px;text-align:right">${M(x.wait)}</b></span>
         <span class="mono t2 r hm" style="flex:0 0 70px">${esc(x.delivered)}</span><span class="t2 r hm" style="flex:0 0 66px">${esc(x.ptod)}</span><span class="warnt hm" style="flex:${all ? "0 1 150px" : "1 1 180px"}">${esc(x.note)}</span>
@@ -1074,7 +1084,7 @@ const RID = {
       <section class="row data">
         <div class="card" style="flex:1 1 100%"><div class="ch" style="align-items:center"><h2>Riders <span class="muted" style="font-weight:500;font-size:13px" id="dCount"></span></h2><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><label class="sr" for="dQ">Filter riders</label><input id="dQ" class="filterin" type="search" placeholder="Filter riders…" value="${esc(RFILTER.q)}"><div class="seg dark" role="group" aria-label="Sort riders by" id="dSort"></div></div></div><div id="dTable"><div class="sk" style="height:420px;margin-top:14px"></div></div></div>
       </section>
-      <section class="card data" id="dTwinCard"><div class="ch" style="align-items:center"><div><h2>Accounts that move together</h2><p class="d">two accounts, one person? · same restaurant within 4′ and delivered within 8′ of each other, again and again · check before you act — nothing happens automatically</p></div><div class="seg dark" role="group" aria-label="Days" id="dTwinSeg"></div></div><div id="dTwins" style="margin-top:12px"><div class="sk" style="height:120px"></div></div></section>
+      <section class="card data" id="dTwinCard"><div class="ch" style="align-items:center"><div><h2>Accounts that move together</h2><p class="d">two accounts, one person? · their phones move together, whatever restaurant or order he does first · check before you act — nothing happens automatically</p></div><div class="seg dark" role="group" aria-label="Days" id="dTwinSeg"></div></div><div id="dTwins" style="margin-top:12px"><div class="sk" style="height:120px"></div></div></section>
       <section class="card data"><div class="ch"><h2>Fleets side by side</h2><span class="muted" style="font-size:12px">fleet names from Settings → Riders</span></div><div class="row" id="dFleets" style="gap:12px;margin-top:16px"><div class="sk" style="height:140px;flex:1"></div></div></section>
       <div class="shortcuts"><span><kbd>S</kbd> change sort</span><span><kbd>⌘K</kbd> find a rider</span><span><kbd>←</kbd> <kbd>→</kbd> previous / next day</span></div>`;
   },
@@ -1136,7 +1146,7 @@ const RID = {
   sorted() {
     const d = RFILTER.data; if (!d) return [];
     const q = RFILTER.q.trim().toLowerCase();
-    let rs = q ? d.riders.filter(r => (r.name + " " + r.city + " " + r.fleet).toLowerCase().includes(q)) : d.riders.slice();
+    let rs = q ? d.riders.filter(r => (r.name + " " + r.city + " " + r.fleet + " " + hd(r.id) + " " + (r.phone || "")).toLowerCase().includes(q)) : d.riders.slice();
     const s = S.sort, v = x => x == null ? -1 : x;
     if (s === "delivered") rs.sort((a, b) => b.delivered - a.delivered || v(b.score) - v(a.score));
     else if (s === "fastest") rs.sort((a, b) => ((a.delivered >= 3 ? 0 : 1) - (b.delivered >= 3 ? 0 : 1)) || (a.avg_ptod ?? 999) - (b.avg_ptod ?? 999));
@@ -1152,7 +1162,7 @@ const RID = {
     $("#dCount").textContent = `· ${N(rs.length)}${RFILTER.q ? " found" : ""}`;
     const scol = s => s == null ? C.edge : s >= 80 ? C.good : s >= 60 ? C.v2 : s >= 40 ? C.amber : C.bad;
     $("#dTable").innerHTML = rs.length ? `<div class="tbl"><div class="tblin" style="--mw:1000px"><div class="th"><span style="flex:1 0 180px">Rider</span><span style="flex:0 0 110px" class="hm">City</span><span style="flex:0 0 80px" class="r">Deliveries</span><span style="flex:0 0 64px" class="r hm">Per hour</span><span style="flex:0 0 70px" class="r">Avg time</span><span style="flex:0 0 74px" class="r hm">Within ${t}′</span><span style="flex:0 0 62px" class="r hm">Accept</span><span style="flex:0 0 82px" class="r hm">Hand-backs</span><span style="flex:0 0 120px" class="hm">Score</span><span style="flex:0 0 84px" class="hm"></span></div>
-      ${shown.map(r => `<div class="tr click" data-rider="${esc(r.id)}"><span style="flex:1 0 180px;display:flex;align-items:center;gap:10px;min-width:0"><span class="av">${esc(ini(r.name))}</span><span style="min-width:0"><b style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.name)}</b><span class="muted" style="font-size:11px">${esc(r.fleet || "")}${r.user ? " · @" + esc(r.user) : ""}</span></span></span>
+      ${shown.map(r => `<div class="tr click" data-rider="${esc(r.id)}"><span style="flex:1 0 180px;display:flex;align-items:center;gap:10px;min-width:0"><span class="av">${esc(ini(r.name))}</span><span style="min-width:0"><b style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.name)}</b><span class="muted" style="font-size:11px">${hd(r.id) ? `<span class="hdl">${esc(hd(r.id))}</span> · ` : ""}${esc(r.fleet || "")}</span></span></span>
         <span class="t2 hm" style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.city)}</span><b style="flex:0 0 80px" class="r">${N(r.delivered)}${r.live ? `<span class="muted" style="font-weight:500"> +${r.live}</span>` : ""}${multi ? `<span class="muted" style="font-weight:500;font-size:11px;display:block">${r.days} days</span>` : ""}</b>
         <span class="t2 r hm" style="flex:0 0 64px">${F1(r.per_hour)}</span><b class="r" style="flex:0 0 70px;color:${ptodColor(r.avg_ptod, t)}">${M1(r.avg_ptod)}</b><span class="r hm ${withinText(r.within_pct)}" style="flex:0 0 74px">${P0(r.within_pct)}</span>
         <span class="r hm ${r.accept >= 4 ? "badt" : r.accept >= 2.5 ? "warnt" : "t2"}" style="flex:0 0 62px">${M1(r.accept)}</span><b class="r hm ${r.handbacks >= 2 ? "warn" : ""}" style="flex:0 0 82px">${r.handbacks || "·"}${r.handbacks_excused ? `<span class="muted" style="font-weight:500;font-size:11px"> +${r.handbacks_excused}</span>` : ""}</b>
@@ -1195,7 +1205,7 @@ const RID = {
     const what = {talk: "Under 60 two weeks running — talk to them this week. A third week under 60 is your block rule.", watch: "60–79, or under 60 for the first time — tell them the one thing below.", top: "80 and more — first pick of peak and rain shifts."}[R.tab];
     const trend = r => r.scores.map((v, i) => `<span style="display:inline-flex;flex-direction:column;align-items:center;gap:2px;width:28px"><b style="font-size:${i === 2 ? 14 : 11.5}px;color:${i === 2 ? scol(v) : "var(--muted)"}">${v ?? "–"}</b></span>`).join('<span class="muted" style="font-size:10px">→</span>');
     $("#dReview").innerHTML = `<p class="d" style="margin:0 0 8px;font-size:12.5px">${what}</p>` + (rows.length ? `<div class="tbl" style="margin-top:0"><div class="tblin" style="--mw:900px"><div class="th rvr"><span style="flex:1 0 170px">Rider</span><span style="flex:0 0 110px" class="hm">City</span><span style="flex:0 0 120px" class="r">Score · 3 weeks</span><span class="rvf" style="flex:2 1 300px;padding-left:16px">The one thing to fix</span><span style="flex:0 0 76px" class="r hm">Deliveries</span><span style="flex:0 0 84px"></span></div>
-      ${rows.map(r => `<div class="tr rvr"><span style="flex:1 0 170px;display:flex;align-items:center;gap:10px;min-width:0"><span class="av">${esc(ini(r.name))}</span><span style="min-width:0"><b style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.name)}</b><span class="muted" style="font-size:11px">${esc(r.fleet || "")}</span></span></span>
+      ${rows.map(r => `<div class="tr rvr"><span style="flex:1 0 170px;display:flex;align-items:center;gap:10px;min-width:0"><span class="av">${esc(ini(r.name))}</span><span style="min-width:0"><b style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.name)}</b><span class="muted" style="font-size:11px">${hd(r.id) ? `<span class="hdl">${esc(hd(r.id))}</span> · ` : ""}${esc(r.fleet || "")}</span></span></span>
         <span class="t2 hm" style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.city)}</span><span class="r" style="flex:0 0 120px;display:flex;justify-content:flex-end;align-items:center;gap:2px">${trend(r)}</span>
         <span class="rvf" style="flex:2 1 300px;padding-left:16px;font-size:13px;line-height:1.35">${r.block ? `<span class="chip critical" style="margin-right:6px;white-space:nowrap">3rd week under 60</span>` : r.first_time ? `<span class="chip strained" style="margin-right:6px;white-space:nowrap">first week under 60</span>` : ""}${esc(r.fix || "–")}</span>
         <span class="r hm t2" style="flex:0 0 76px">${N(r.delivered)}</span><span style="flex:0 0 84px;text-align:right"><button type="button" class="btn ghost sm" data-msg="${esc(r.id)}" data-name="${esc(r.name)}" data-phone="${esc(r.phone || "")}" aria-label="Message ${esc(r.name)}">Message</button></span></div>`).join("")}</div></div>` : `<div class="empty">${R.tab === "talk" ? "Nobody under 60 two weeks running. 👍" : "Nobody here."}</div>`);
@@ -1211,32 +1221,45 @@ const RID = {
     const T = RID.tw, d = T && T.data; if (!d || !$("#dTwins")) return;
     $("#dTwinSeg").innerHTML = [7, 14, 28].map(n => `<button type="button" data-twdays="${n}" aria-pressed="${T.days === n}">${n} days</button>`).join("");
     const lv = {strong: ["critical", "very likely"], likely: ["strained", "likely"], check: ["", "check"]};
-    const ps = d.pairs;
-    $("#dTwins").innerHTML = ps.length ? `<div class="tbl" style="margin-top:0"><div class="tblin" style="--mw:980px"><div class="th twr"><span class="twa" style="flex:1 0 230px">Accounts</span><span style="flex:0 0 110px" class="hm">City</span><span style="flex:0 0 120px" class="r two">Orders together</span><span style="flex:0 0 70px" class="r twd">Days</span><span style="flex:0 0 96px" class="r hm">Same hours</span><span style="flex:0 0 90px" class="r hm">GPS together</span><span style="flex:0 0 96px" class="hm" style="padding-left:12px">Same phone</span><span style="flex:0 0 110px"></span></div>
-      ${ps.map((p, i) => `<div class="tr click twr" data-twin="${i}"><span class="twa" style="flex:1 0 230px;min-width:0"><b>${esc(p.name_a)}</b> <span class="muted">+</span> <b>${esc(p.name_b)}</b><span class="muted" style="font-size:11px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.fleet_a || "")}${p.fleet_b && p.fleet_b !== p.fleet_a ? " · " + esc(p.fleet_b) : ""} · mostly ${esc(p.restaurants.slice(0, 2).join(", "))}</span></span>
-        <span class="t2 hm" style="flex:0 0 110px">${esc(p.city)}</span><span class="r two" style="flex:0 0 120px"><b>${p.share} %</b><span class="muted" style="font-size:11px;display:block">${N(p.together)} of ${N(Math.min(p.deliveries_a, p.deliveries_b))}</span></span>
-        <b class="r twd" style="flex:0 0 70px">${p.days}</b><span class="r hm t2" style="flex:0 0 96px">${p.shared_days ? `${p.same_hours_days} of ${p.shared_days}` : "–"}</span>
-        <span class="r hm ${p.gps_together >= 70 ? "badt" : "t2"}" style="flex:0 0 90px">${p.gps_together == null ? '<span class="muted">no GPS</span>' : p.gps_together + " %"}</span>
+    const ps = d.pairs, gpsNote = d.gps_days ? `GPS of ${d.gps_days} day${d.gps_days === 1 ? "" : "s"} (from ${dm(d.gps_first)})` : "GPS is being collected — the first day shows tomorrow";
+    const nm = (n, id) => `<b>${esc(n)}</b>${hdS(id)}`;
+    $("#dTwins").innerHTML = ps.length ? `<div class="tbl" style="margin-top:0"><div class="tblin" style="--mw:1080px"><div class="th twr"><span class="twa" style="flex:1 0 260px">Accounts</span><span style="flex:0 0 110px" class="hm">City</span><span style="flex:0 0 170px" class="r two">GPS together</span><span style="flex:0 0 120px" class="r twd hm">Same restaurant</span><span style="flex:0 0 96px" class="r hm">Same hours</span><span style="flex:0 0 96px" class="hm" style="padding-left:12px">Same phone</span><span style="flex:0 0 110px"></span></div>
+      ${ps.map((p, i) => `<div class="tr click twr" data-twin="${i}"><span class="twa" style="flex:1 0 260px;min-width:0"><span style="display:block;${ell}">${nm(p.name_a, p.a)} <span class="muted">+</span> ${nm(p.name_b, p.b)}</span><span class="muted" style="font-size:11px;display:block;${ell}">${esc(p.fleet_a || "")}${p.fleet_b && p.fleet_b !== p.fleet_a ? " · " + esc(p.fleet_b) : ""} · ${N(p.deliveries_a)} + ${N(p.deliveries_b)} deliveries</span></span>
+        <span class="t2 hm" style="flex:0 0 110px">${esc(p.city)}</span>
+        <span class="r two" style="flex:0 0 170px">${p.gps_together == null ? '<span class="muted">no GPS</span>' : `<b class="${p.gps_together >= 70 ? "badt" : p.gps_together >= 50 ? "warnt" : ""}">${p.gps_together} %</b><span class="muted" style="font-size:11px;display:block">${hmin(p.gps_minutes)} · ${p.gps_days} of ${p.gps_days_both} days</span>`}</span>
+        <span class="r twd hm" style="flex:0 0 120px">${p.together ? `<b>${p.share} %</b><span class="muted" style="font-size:11px;display:block">${N(p.together)} orders</span>` : '<span class="muted">–</span>'}</span>
+        <span class="r hm t2" style="flex:0 0 96px">${p.shared_days ? `${p.same_hours_days} of ${p.shared_days}` : "–"}</span>
         <span class="hm" style="flex:0 0 96px;padding-left:12px">${p.same_phone ? '<b class="badt">yes</b>' : '<span class="muted">no</span>'}</span>
         <span class="twl" style="flex:0 0 110px;text-align:right"><span class="chip ${lv[p.level][0]}">${lv[p.level][1]}</span></span></div>`).join("")}</div></div>
-      <p class="d" style="font-size:12px;margin:8px 0 0">${N(d.riders)} riders checked · ${esc(d.rule)} · GPS = share of the minutes both were moving and less than 120 m apart (the last 2 days) · click a pair for the orders</p>`
-      : `<div class="empty">No two accounts moved together in the last ${d.days} days (${N(d.riders)} riders checked). 👍</div>`;
+      <p class="d" style="font-size:12px;margin:8px 0 0">${N(d.riders)} riders checked · ${gpsNote} · GPS together = of the time both accounts were moving, how much they were within 150 m of each other · same restaurant = picked up at the same restaurant within 4 min and delivered within 8 min · click a pair for the details</p>`
+      : `<div class="empty">No two accounts moved together in the last ${d.days} days (${N(d.riders)} riders checked). 👍<div class="muted" style="font-size:12px;margin-top:6px">${gpsNote}</div></div>`;
   },
   twinDrawer(i) {
     const p = RID.tw && RID.tw.data && RID.tw.data.pairs[i]; if (!p) return;
-    openDrawer(`<div><div class="over">Accounts that move together · ${esc(p.city)}</div><h2 style="margin:4px 0 0;font-size:20px">${esc(p.name_a)} + ${esc(p.name_b)}</h2></div>`,
-      `<div class="row" style="gap:10px"><div class="stat"><div>Orders together</div><b>${p.share} %</b></div><div class="stat"><div>Days</div><b>${p.days}</b></div><div class="stat"><div>GPS together</div><b>${p.gps_together == null ? "–" : p.gps_together + " %"}</b></div></div>
-       <div class="sub">${N(p.together)} times both accounts picked up at the same restaurant within 4 minutes and delivered within 8 minutes of each other — out of ${N(p.deliveries_a)} deliveries (${esc(p.name_a)}) and ${N(p.deliveries_b)} (${esc(p.name_b)}).
-       ${p.shared_days ? ` Same start and end of the day (±15 min) on ${p.same_hours_days} of ${p.shared_days} days both worked.` : ""}${p.same_phone ? " <b>Both accounts have the same phone number.</b>" : ""}</div>
-       <div class="sub" style="font-size:12px;margin-bottom:-6px">Each order: top line ${esc(p.name_a)}, bottom line ${esc(p.name_b)}.</div>
+    const A = esc(p.name_a), B = esc(p.name_b);
+    const said = [];
+    if (p.gps_together != null) said.push(`Of the time both accounts were moving, they were within 150 m of each other <b>${p.gps_together} %</b> of it — ${hmin(p.gps_minutes)} in total. They moved together on ${p.gps_days} of the ${p.gps_days_both} days both accounts worked.`);
+    else said.push("No GPS for both accounts in these days.");
+    if (p.together) said.push(`${N(p.together)} times both picked up at the same restaurant within 4 minutes and delivered within 8 minutes of each other (${p.share} % of their orders).`);
+    if (p.shared_days) said.push(`Same start and end of the day (±15 min) on ${p.same_hours_days} of ${p.shared_days} days both worked.`);
+    if (p.same_phone) said.push("<b>Both accounts have the same phone number.</b>");
+    const gtbl = p.gps_by_day.length ? `<div><h3 style="margin:0 0 4px;font-size:14px">Day by day</h3><div class="tbl" style="margin-top:4px"><div class="tblin" style="--mw:340px"><div class="th"><span style="flex:0 0 60px">Day</span><span style="flex:1 1 120px" class="r">Moving together</span><span style="flex:0 0 60px" class="r">Share</span><span style="flex:0 0 90px" class="r">Orders</span></div>
+       ${p.gps_by_day.map(g => `<div class="tr"><span class="t2" style="flex:0 0 60px">${dm(g.day)}</span><span class="r" style="flex:1 1 120px">${hmin(g.minutes)}</span><b class="r ${g.pct >= 70 ? "badt" : g.pct >= 50 ? "warnt" : ""}" style="flex:0 0 60px">${g.pct} %</b><span class="r t2 mono" style="flex:0 0 90px">${g.orders_a} · ${g.orders_b}</span></div>`).join("")}</div></div>
+       <div class="sub" style="font-size:12px;margin-top:6px">Orders: ${A} · ${B}. Different restaurants and different customers still count — what matters is that the two phones travel together.</div></div>` : "";
+    const otbl = p.examples.length ? `<div><h3 style="margin:0 0 4px;font-size:14px">Same restaurant, same time</h3><div class="sub" style="font-size:12px;margin-bottom:-6px">Each order: top line ${A}, bottom line ${B}.</div>
        <div class="tbl"><div class="tblin" style="--mw:340px"><div class="th"><span style="flex:0 0 52px">Day</span><span style="flex:1 1 120px">Restaurant</span><span style="flex:0 0 64px" class="r">Picked up</span><span style="flex:0 0 64px" class="r">Delivered</span></div>
-       ${p.examples.map(e => `<div class="tr"><span class="t2" style="flex:0 0 52px">${dm(e.day)}</span><span style="flex:1 1 120px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.restaurant)}<span class="muted mono" style="font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis">${esc(e.ref_a)} · ${esc(e.ref_b)}</span></span><span class="r mono" style="flex:0 0 64px;line-height:1.45">${e.pick_a}<br>${e.pick_b}</span><span class="r mono" style="flex:0 0 64px;line-height:1.45">${e.drop_a}<br>${e.drop_b}</span></div>`).join("")}</div></div>
-       <div class="sub" style="font-size:12px">Friends riding together or a trainee shadowing someone can look the same — look at the orders in MotionTools before you act.</div>`);
+       ${p.examples.map(e => `<div class="tr"><span class="t2" style="flex:0 0 52px">${dm(e.day)}</span><span style="flex:1 1 120px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.restaurant)}<span class="muted mono" style="font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis">${esc(e.ref_a)} · ${esc(e.ref_b)}</span></span><span class="r mono" style="flex:0 0 64px;line-height:1.45">${e.pick_a}<br>${e.pick_b}</span><span class="r mono" style="flex:0 0 64px;line-height:1.45">${e.drop_a}<br>${e.drop_b}</span></div>`).join("")}</div></div></div>` : "";
+    openDrawer(`<div><div class="over">Accounts that move together · ${esc(p.city)}</div><h2 style="margin:4px 0 0;font-size:20px">${A} + ${B}</h2><div class="sub">${hd(p.a) ? `<span class="hdl">${esc(hd(p.a))}</span>` : esc(p.name_a)} + ${hd(p.b) ? `<span class="hdl">${esc(hd(p.b))}</span>` : esc(p.name_b)}</div></div>`,
+      `<div class="row" style="gap:10px"><div class="stat"><div>GPS together</div><b class="${(p.gps_together || 0) >= 70 ? "bad" : ""}">${p.gps_together == null ? "–" : p.gps_together + " %"}</b></div><div class="stat"><div>Moving together</div><b>${p.gps_minutes ? (p.gps_minutes >= 60 ? `${Math.floor(p.gps_minutes / 60)} h ${p.gps_minutes % 60}′` : p.gps_minutes + "′") : "–"}</b></div><div class="stat"><div>Same restaurant</div><b>${p.together ? p.share + " %" : "–"}</b></div></div>
+       <div class="sub">${said.join(" ")}</div>
+       ${[[p.a, A], [p.b, B]].some(([id]) => RFILTER.data && RFILTER.data.riders.some(x => x.id === id)) ? `<div class="row" style="gap:8px">${[[p.a, A], [p.b, B]].filter(([id]) => RFILTER.data && RFILTER.data.riders.some(x => x.id === id)).map(([id, n]) => `<button type="button" class="btn ghost sm" data-rider="${esc(id)}">${n} →</button>`).join("")}</div>` : ""}
+       ${gtbl}${otbl}
+       <div class="sub" style="font-size:12px">Friends who always ride together, or a trainee shadowing someone, can look the same — look at their orders in MotionTools before you act.</div>`);
   },
   riderDrawer(id) {
     const d = RFILTER.data, r = d && d.riders.find(x => x.id === id); if (!r) return;
     const t = d.target;
-    openDrawer(`<div style="display:flex;gap:12px;align-items:center;min-width:0"><span class="av" style="flex-basis:44px;height:44px;font-size:16px">${esc(ini(r.name))}</span><div style="min-width:0"><div class="over">Rider · ${esc(r.fleet || "no fleet")}</div><h2 style="margin:4px 0 0;font-size:22px">${esc(r.name)}</h2><div class="sub">${esc(r.city)}${r.user ? " · @" + esc(r.user) : ""}</div></div></div>`,
+    openDrawer(`<div style="display:flex;gap:12px;align-items:center;min-width:0"><span class="av" style="flex-basis:44px;height:44px;font-size:16px">${esc(ini(r.name))}</span><div style="min-width:0"><div class="over">Rider · ${esc(r.fleet || "no fleet")}</div><h2 style="margin:4px 0 0;font-size:22px">${esc(r.name)}</h2><div class="sub">${esc(r.city)}${hd(r.id) ? ` · <span class="hdl">${esc(hd(r.id))}</span>` : ""}</div></div></div>`,
       `<div class="sub">${esc(d.period.label)}</div>
        <div class="row" style="gap:10px"><div class="stat"><div>Deliveries</div><b>${N(r.delivered)}${r.live ? `<span class="muted" style="font-size:14px"> +${r.live} live</span>` : ""}</b></div><div class="stat"><div>Per working hour</div><b>${F1(r.per_hour)}</b></div><div class="stat"><div>Score</div><b>${r.score ?? "–"}</b></div></div>
        <div class="row" style="gap:10px"><div class="stat"><div>Avg delivery time</div><b style="color:${ptodColor(r.avg_ptod, t)}">${M1(r.avg_ptod)}</b></div><div class="stat"><div>Within ${t}′</div><b>${P0(r.within_pct)}</b></div><div class="stat"><div>On time vs plan</div><b>${P0(r.on_time_pct)}</b></div></div>
@@ -1464,7 +1487,7 @@ const UND = {
     const multi = !S.city;
     const row = x => `<div class="tr click" data-order="${esc(x.id)}"><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${multi ? `<span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.city)}</span>` : ""}<span style="flex:1 1 130px;${ell}">${esc(x.restaurant)}</span>
       <span class="hm" style="flex:0 0 132px;font-size:12.5px">${FX[x.stage].icon} ${STG[x.stage]}</span><span class="r" style="flex:0 0 78px"><b class="${x.elapsed > t ? "badt" : x.left <= 6 ? "warnt" : ""}">${x.elapsed}′</b><span class="muted" style="font-size:12px"> / ${t}′</span></span><span class="r hm t2" style="flex:0 0 64px">≈ ${x.projected}′</span>
-      <span style="flex:2 1 300px;min-width:0;font-size:13px;font-weight:500;padding-left:14px;line-height:1.35">${esc(x.action)}</span><span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.rider || "–")}</span></div>`;
+      <span style="flex:2 1 300px;min-width:0;font-size:13px;font-weight:500;padding-left:14px;line-height:1.35">${esc(x.action)}</span><span class="t2 hm" style="flex:0 0 120px;min-width:0">${who2(x.rider, x.rider_id)}</span></div>`;
     const head = `<div class="th"><span style="flex:0 0 86px">Order</span>${multi ? `<span class="hm" style="flex:0 0 120px">City</span>` : ""}<span style="flex:1 1 130px">Restaurant</span><span class="hm" style="flex:0 0 132px">Step</span><span class="r" style="flex:0 0 78px">Since dispatch</span><span class="r hm" style="flex:0 0 64px">Expected</span><span style="flex:2 1 300px;padding-left:14px">What to do</span><span class="hm" style="flex:0 0 120px">Rider</span></div>`;
     if (!L.live) { el.innerHTML = `<div class="empty">No live orders right now.</div>`; return; }
     el.innerHTML = `${L.risk.length ? `<div class="tbl" style="margin-top:0"><div class="tblin" style="--mw:${multi ? 1060 : 940}px">${head}${L.risk.map(row).join("")}</div></div>` : `<div class="empty" style="padding:16px 10px">✓ No live order is heading over ${t}′ right now.</div>`}
@@ -1522,7 +1545,7 @@ const UND = {
     const whenTbl = (f, avgLabel) => tbl(560, `<span style="flex:1 1 200px">When</span><span class="r" style="flex:0 0 80px">Saved</span><span class="r" style="flex:0 0 110px">${avgLabel}</span><span class="r hm" style="flex:0 0 90px">Within ${d.target}′</span>`,
       f.hours.map(x => `<div class="tr click" data-city="${esc(x.city)}"><span style="flex:1 1 200px;${ell}"><b>${hh(x.hour)}–${hh(x.hour + 1)}</b>${multi ? `<span class="t2"> · ${esc(x.city)}</span>` : ""}</span><b class="r good" style="flex:0 0 80px">${N(x.saved)}</b><span class="r" style="flex:0 0 110px">${M1(x.avg)} <span class="muted" style="font-size:11.5px">late ${M1(x.avg_late)}</span></span><span class="r hm ${withinText(x.within_pct)}" style="flex:0 0 90px">${P0(x.within_pct)}</span></div>`).join(""));
     const riderTbl = (f, avgLabel) => tbl(640, `<span style="flex:1 1 200px">Rider</span><span class="hm" style="flex:0 0 120px">Fleet</span><span class="r" style="flex:0 0 70px">Saved</span><span class="r" style="flex:0 0 90px">${avgLabel}</span><span class="r hm" style="flex:0 0 80px">Orders</span><span class="r hm" style="flex:0 0 90px">Hand-backs</span>`,
-      f.riders.map(x => `<div class="tr"><span style="flex:1 1 200px;${ell}"><b>${esc(x.rider)}</b>${multi ? `<span class="t2"> · ${esc(x.city)}</span>` : ""}</span><span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.fleet || "–")}</span><b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><span class="r" style="flex:0 0 90px">${M1(x.avg)}</span><span class="r hm t2" style="flex:0 0 80px">${N(x.n)}</span><span class="r hm ${x.handbacks >= 3 ? "warnt" : "t2"}" style="flex:0 0 90px">${N(x.handbacks)}</span></div>`).join(""));
+      f.riders.map(x => `<div class="tr"><span style="flex:1 1 200px;${ell}"><b>${esc(x.rider)}</b>${hdS(x.rider_id)}${multi ? `<span class="t2"> · ${esc(x.city)}</span>` : ""}</span><span class="t2 hm" style="flex:0 0 120px;${ell}">${esc(x.fleet || "–")}</span><b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><span class="r" style="flex:0 0 90px">${M1(x.avg)}</span><span class="r hm t2" style="flex:0 0 80px">${N(x.n)}</span><span class="r hm ${x.handbacks >= 3 ? "warnt" : "t2"}" style="flex:0 0 90px">${N(x.handbacks)}</span></div>`).join(""));
     const body = f => {
       if (f.key === "wt") return f.restaurants.length ? tbl(900, `<span style="flex:1 1 220px">Restaurant</span><span class="r" style="flex:0 0 70px">Saved</span><span class="r" style="flex:0 0 80px">Avg wait</span><span class="r hm" style="flex:0 0 90px">Rider-h lost</span><span style="flex:1 1 230px;padding-left:16px">Send riders later</span><span style="flex:0 0 70px"></span>`,
         f.restaurants.map(x => `<div class="tr">${restName(x)}<b class="r good" style="flex:0 0 70px">${N(x.saved)}</b><b class="r warnt" style="flex:0 0 80px">${M1(x.avg_wait)}</b><span class="r hm t2" style="flex:0 0 90px">${F1(x.lost_h)} h</span>
@@ -1630,7 +1653,8 @@ function show() {
 }
 window.addEventListener("hashchange", show);
 async function loadMeta() { try { META = await api("/api/v2/meta"); renderSys(); renderFilters(); } catch (e) {} }
-loadMeta(); show();
+loadMeta(); loadHandles(); show();
+setInterval(loadHandles, 600000);
 setInterval(tickLive, 1000);
 setInterval(loadMeta, 60000);
 setInterval(() => { if (document.hidden || PAL) return; if (rangeHasToday(LASTP)) refresh({}); }, 30000);

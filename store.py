@@ -475,7 +475,7 @@ class Store:
             where += " AND city=?"; args.append(city)
         return int(self._rows(f"SELECT count(*) n FROM orders WHERE {where}", args)[0]["n"])
 
-    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "", limit: int = 0, rider_id: str = "") -> list:
+    def orders_in(self, period: str, now: datetime, q: str = "", city: str = "", limit: int = 0, rider_id: str = "", q_ids: set = None) -> list:
         start, end = period_range(period, now)
         where = "((dispatched_at >= ? AND dispatched_at < ?) OR closed=0 OR (dispatched_at IS NULL AND first_seen >= ? AND first_seen < ?))"
         args = [iso(start), iso(end), iso(start), iso(end)]
@@ -489,7 +489,8 @@ class Store:
         if q:
             ql = q.lower()
             out = [o for o in out if ql in (o["ref"] or "").lower() or ql in (o["rider"] or "").lower()
-                   or ql in (o["restaurant"] or "").lower() or ql in (o["customer_addr"] or "").lower()]
+                   or ql in (o["restaurant"] or "").lower() or ql in (o["customer_addr"] or "").lower()
+                   or (q_ids and o.get("rider_id") in q_ids)]
         return out
 
     def orders_at_restaurant(self, period: str, now: datetime, city: str = "", min_wait: int = 0,

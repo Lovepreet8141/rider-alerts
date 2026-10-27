@@ -1334,7 +1334,7 @@ def late_risk(orders: list, now: datetime, target: int, avgs: dict, city_of) -> 
             stage, since = "acc", el; rem = A["tr"] + A["wt"] + A["tc"] + A["ho"]; stuck = el >= 3
             act = f"No rider after {round(el)}′ — assign one now"
         proj = el + rem
-        row = {"id": o.get("id"), "ref": o.get("ref") or "", "city": c, "restaurant": o.get("restaurant") or "", "rider": o.get("rider") or "",
+        row = {"id": o.get("id"), "ref": o.get("ref") or "", "city": c, "restaurant": o.get("restaurant") or "", "rider": o.get("rider") or "", "rider_id": o.get("rider_id") or "",
                "rider_id": o.get("rider_id") or "", "stage": stage, "since": round(since or 0), "elapsed": round(el), "projected": round(proj),
                "left": round(target - el), "action": act}
         if el > target:
@@ -1356,31 +1356,129 @@ def _jd_hm(m):
     return datetime.fromtimestamp((m / 1440 - 2440587.5) * 86400, _tz.utc).astimezone(BERLIN).strftime("%H:%M")
 
 
-def twins(store, now: datetime, days: int = 14, city: str = "", phones: dict = None, pick_win: float = 4, drop_win: float = 8) -> dict:
-    """Pairs of rider accounts that keep doing the same orders at the same time: picked up at the same restaurant within
-    `pick_win` min of each other and delivered within `drop_win` min of each other. Once or twice is normal (orders paired
-    at peak); on most of their orders, on several days, two accounts move as one. GPS (kept 2 days) and working hours
-    are added as extra evidence. Only shown in the dashboard — nobody is blocked or messaged automatically."""
+GPS_NEAR_M, GPS_MOVE_M = 150, 100          # "together": within 150 m of each other, both having moved 100 m+ in the last 4 minutes
+_GPS_LOCK = threading.Lock()
+
+
+def _gps_table(store):
+    store._exec("CREATE TABLE IF NOT EXISTS gps_pair_days (day TEXT PRIMARY KEY, data TEXT, computed_at REAL)")
+
+
+def gps_pairs_build(store, day: str) -> dict:
+    """One finished day of GPS: for every rider the minutes he was moving, and for every two riders the minutes they were
+    moving within 150 m of each other. Streams the positions in time order (low memory, ~2 s at 10k orders a day).
+    Raw positions are deleted after 2 days; this summary is what lets 7 / 14 / 28 days have GPS."""
+    from collections import deque
+    from datetime import time as _t, timezone as _tz
+    d0 = datetime.combine(_d(day), _t(0), BERLIN).astimezone(_tz.utc)
+    d1 = datetime.combine(_d(day) + timedelta(days=1), _t(0), BERLIN).astimezone(_tz.utc)
+    dl, dg = 0.00135, 0.0023                   # grid cell ≈ 150 m (longitude cell sized for 47–55° N)
+    hist, mov, tog = {}, Counter(), Counter()
+    cur_m, grid, prev, seen, movm, points = None, {}, {}, set(), set(), 0
+    sql = ("SELECT rider_id, CAST(julianday(at) * 1440 AS INTEGER), lat, lng FROM positions "
+           "WHERE at >= ? AND at < ? AND rider_id IS NOT NULL AND rider_id != '' AND lat IS NOT NULL ORDER BY at")
+    for rid, m, lat, lng in store._reader().execute(sql, (d0.isoformat(timespec="seconds"), d1.isoformat(timespec="seconds"))):
+        if m != cur_m:
+            prev = grid if cur_m is not None and m == cur_m + 1 else {}
+            grid, seen, movm, cur_m = {}, set(), set(), m
+        points += 1
+        h = hist.get(rid)
+        if h is None:
+            h = hist[rid] = deque()
+        while len(h) >= 2 and h[1][0] <= m - 4:
+            h.popleft()
+        ref = h[0] if h and m - 60 <= h[0][0] <= m - 4 else None
+        h.append((m, lat, lng))
+        cl = math.cos(math.radians(lat)) * 111320
+        if ref is None or math.hypot((lng - ref[2]) * cl, (lat - ref[1]) * 111320) <= GPS_MOVE_M:
+            continue
+        if rid not in movm:
+            movm.add(rid); mov[rid] += 1
+        ca, cb = int(lat / dl), int(lng / dg)
+        for g in (grid, prev):
+            for x in (ca - 1, ca, ca + 1):
+                for y in (cb - 1, cb, cb + 1):
+                    for r2, la2, lo2 in g.get((x, y), ()):
+                        if r2 == rid:
+                            continue
+                        k = (rid, r2) if rid < r2 else (r2, rid)
+                        if k not in seen and math.hypot((lo2 - lng) * cl, (la2 - lat) * 111320) <= GPS_NEAR_M:
+                            seen.add(k); tog[k] += 1
+        grid.setdefault((ca, cb), []).append((rid, lat, lng))
+    return {"points": points, "riders": len(hist), "mov": dict(mov),
+            "pairs": {f"{a}|{b}": n for (a, b), n in tog.items() if n >= 5}}
+
+
+def gps_pairs_day(store, day: str, today: str):
+    """The saved GPS summary of a finished day; computed once while the positions are still there (today − 2 days),
+    None for today and for older days without one."""
+    key = ("gpsp", day, "")
+    hit = _CUBE.get(key)
+    if hit:
+        return hit[1]
+    if day >= today:
+        return None
+    with _GPS_LOCK:
+        hit = _CUBE.get(key)
+        if hit:
+            return hit[1]
+        _gps_table(store)
+        r = store._rows("SELECT data FROM gps_pair_days WHERE day = ?", (day,))
+        data = None
+        if r:
+            try:
+                data = json.loads(r[0]["data"])
+            except Exception:
+                data = None
+        if data is None and day >= (_d(today) - timedelta(days=2)).isoformat():
+            data = gps_pairs_build(store, day)
+            store._exec("INSERT OR REPLACE INTO gps_pair_days (day, data, computed_at) VALUES (?, ?, ?)",
+                        (day, json.dumps(data, separators=(",", ":")), time.time()))
+        if data is not None:
+            _CUBE[key] = (time.monotonic(), data)
+        return data
+
+
+def gps_pairs_ensure(store, now: datetime):
+    """Hourly: save yesterday's (and the day before's) GPS summary before the raw positions are deleted; keep 40 days."""
+    today = day_key(now)
+    for i in (1, 2):
+        gps_pairs_day(store, (_d(today) - timedelta(days=i)).isoformat(), today)
+    try:
+        store._exec("DELETE FROM gps_pair_days WHERE day < ?", ((_d(today) - timedelta(days=40)).isoformat(),))
+    except Exception:
+        pass
+
+
+def twins(store, now: datetime, days: int = 14, city: str = "", phones: dict = None, names: dict = None,
+          pick_win: float = 4, drop_win: float = 8) -> dict:
+    """Pairs of rider accounts that look like one person. Main signal: GPS — of the time both accounts were moving, how
+    much they were within 150 m of each other (one person carries both phones, whatever restaurant or order he does
+    first). Extra clues: the same restaurant within `pick_win` min and delivered within `drop_win` min of each other,
+    the same start and end of the day, the same phone number. Only shown in the dashboard — nobody is blocked or
+    messaged automatically."""
     today = day_key(now)
     a = (_d(today) - timedelta(days=days)).isoformat()
     b = (_d(today) - timedelta(days=1)).isoformat()
     w, args = ("day BETWEEN ? AND ? AND phase='delivered' AND rider_id IS NOT NULL AND rider_id != '' "
                "AND picked_up_at IS NOT NULL AND delivered_at IS NOT NULL"), [a, b]
-    if city:
-        w += " AND city=?"; args.append(city)
     rows = store._rows("SELECT id, ref, rider_id, rider, fleet, city, restaurant, day, julianday(picked_up_at) * 1440 AS pm, "
                        f"julianday(delivered_at) * 1440 AS dm FROM orders WHERE {w} ORDER BY city, restaurant, pm", args)
-    total, name, fleet, rcity = Counter(), {}, {}, {}
+    total, name, fleet, rcity, dcount = Counter(), dict(names or {}), {}, {}, Counter()
     span = {}                                      # (rider, day) -> [first pickup, last delivery]
     for r in rows:
         rid = r["rider_id"]
         total[rid] += 1
-        name[rid] = r["rider"] or name.get(rid) or rid[:8]
+        dcount[(rid, r["day"])] += 1
+        if r["rider"] and len(r["rider"]) > len(name.get(rid) or ""):
+            name[rid] = r["rider"]
         fleet[rid] = r["fleet"] or fleet.get(rid, "")
         rcity[rid] = r["city"] or rcity.get(rid, "")
         s = span.setdefault((rid, r["day"]), [r["pm"], r["dm"]])
         s[0] = min(s[0], r["pm"]); s[1] = max(s[1], r["dm"])
-    pairs = {}
+    in_city = (lambda rid: rcity.get(rid) == city) if city else (lambda rid: True)
+    # 1) the same restaurant at the same time (a clue: one person often takes two orders from one kitchen)
+    rest = {}
     n = len(rows)
     for i in range(n):
         x = rows[i]
@@ -1392,60 +1490,81 @@ def twins(store, now: datetime, days: int = 14, city: str = "", phones: dict = N
                 continue
             k = tuple(sorted((x["rider_id"], y["rider_id"])))
             o1, o2 = (x, y) if x["rider_id"] == k[0] else (y, x)
-            p = pairs.setdefault(k, {"a": set(), "b": set(), "days": set(), "ex": [], "rest": Counter()})
+            p = rest.setdefault(k, {"a": set(), "b": set(), "days": set(), "ex": [], "rest": Counter()})
             p["a"].add(o1["id"]); p["b"].add(o2["id"]); p["days"].add(x["day"]); p["rest"][x["restaurant"]] += 1
             if len(p["ex"]) < 400:
                 p["ex"].append((x["day"], x["restaurant"], o1["ref"], o2["ref"], o1["pm"], o2["pm"], o1["dm"], o2["dm"]))
-    out = []
-    for (ra, rb), p in pairs.items():
+    # 2) GPS, day by day (finished days that have a saved summary)
+    G = {}
+    for i in range(days):
+        dd = (_d(a) + timedelta(days=i)).isoformat()
+        g = gps_pairs_day(store, dd, today)
+        if g and g.get("points"):
+            G[dd] = g
+    gtog, gdays = Counter(), Counter()
+    for dd, g in G.items():
+        mv = g["mov"]
+        for k, m in g["pairs"].items():
+            ra, rb = k.split("|")
+            lo = min(mv.get(ra, 0), mv.get(rb, 0))
+            if lo:
+                gtog[(ra, rb)] += min(m, lo)
+                gdays[(ra, rb)] += m >= 15
+    cand = set()
+    for k, p in rest.items():
         tw = min(len(p["a"]), len(p["b"]))
-        base = min(total[ra], total[rb]) or 1
-        share = tw / base
-        if tw < 6 or len(p["days"]) < 2 or share < 0.3:
+        if tw >= 6 and len(p["days"]) >= 2 and tw / (min(total[k[0]], total[k[1]]) or 1) >= 0.3:
+            cand.add(k)
+    for k, m in gtog.items():
+        if m >= 60 and gdays[k] >= 2:
+            cand.add(k)
+    digits = lambda s: "".join(ch for ch in str(s or "") if ch.isdigit())[-9:]
+    out = []
+    for k in cand:
+        ra, rb = k
+        if not (in_city(ra) or in_city(rb)):
+            continue
+        by_day, den, both_days = [], 0, 0
+        for dd in sorted(G, reverse=True):
+            mv = G[dd]["mov"]
+            ma, mb = mv.get(ra, 0), mv.get(rb, 0)
+            if not ma or not mb:
+                continue
+            lo = min(ma, mb); t = min(G[dd]["pairs"].get(f"{ra}|{rb}", 0), lo)
+            den += lo; both_days += 1
+            by_day.append({"day": dd, "minutes": t, "pct": round(100 * t / lo), "orders_a": dcount[(ra, dd)], "orders_b": dcount[(rb, dd)]})
+        gpct = round(100 * gtog[k] / den) if den >= 60 else None
+        p = rest.get(k)
+        tw = min(len(p["a"]), len(p["b"])) if p else 0
+        rshare = round(100 * tw / (min(total[ra], total[rb]) or 1)) if p else 0
+        if gpct is not None and gpct < 50 and not (p and k in cand and rshare >= 30):
             continue
         both = [d for (r_, d) in span if r_ == ra and (rb, d) in span]
         same = sum(1 for d in both if abs(span[(ra, d)][0] - span[(rb, d)][0]) <= 15 and abs(span[(ra, d)][1] - span[(rb, d)][1]) <= 15)
-        ex = sorted(p["ex"], key=lambda e: (e[0], e[4]), reverse=True)[:12]
         pa, pb = (phones or {}).get(ra, ""), (phones or {}).get(rb, "")
-        digits = lambda s: "".join(ch for ch in str(s or "") if ch.isdigit())[-9:]
-        out.append({"a": ra, "b": rb, "name_a": name[ra], "name_b": name[rb], "fleet_a": fleet[ra], "fleet_b": fleet[rb],
-                    "city": rcity[ra] or rcity[rb], "together": tw, "share": round(share * 100), "days": len(p["days"]),
-                    "deliveries_a": total[ra], "deliveries_b": total[rb], "shared_days": len(both), "same_hours_days": same,
-                    "same_phone": bool(digits(pa)) and digits(pa) == digits(pb),
-                    "restaurants": [r_ for r_, _ in p["rest"].most_common(3)],
-                    "level": "strong" if share >= 0.6 and len(p["days"]) >= 3 else "likely" if share >= 0.45 else "check",
+        same_phone = bool(digits(pa)) and digits(pa) == digits(pb)
+        if gpct is not None:                    # GPS decides
+            lvl = 0 if gpct >= 70 and gdays[k] >= 2 else 1 if gpct >= 50 else 2
+        else:                                    # no GPS for both: the restaurant clue alone, never above "likely" by itself
+            lvl = 1 if rshare >= 45 else 2
+        if same_phone:
+            lvl = max(0, lvl - 1)
+        ex = sorted(p["ex"], key=lambda e: (e[0], e[4]), reverse=True)[:12] if p else []
+        out.append({"a": ra, "b": rb, "name_a": name.get(ra) or ra[:8], "name_b": name.get(rb) or rb[:8],
+                    "fleet_a": fleet.get(ra, ""), "fleet_b": fleet.get(rb, ""), "city": rcity.get(ra) or rcity.get(rb) or "",
+                    "deliveries_a": total[ra], "deliveries_b": total[rb],
+                    "gps_together": gpct, "gps_minutes": gtog[k], "gps_days": gdays[k], "gps_days_both": both_days, "gps_by_day": by_day[:28],
+                    "together": tw, "share": rshare, "days": len(p["days"]) if p else 0,
+                    "shared_days": len(both), "same_hours_days": same, "same_phone": same_phone,
+                    "restaurants": [r_ for r_, _ in p["rest"].most_common(3)] if p else [],
+                    "level": ("strong", "likely", "check")[lvl],
                     "examples": [{"day": e[0], "restaurant": e[1], "ref_a": e[2], "ref_b": e[3], "pick_a": _jd_hm(e[4]), "pick_b": _jd_hm(e[5]),
                                   "drop_a": _jd_hm(e[6]), "drop_b": _jd_hm(e[7])} for e in ex]})
-    # GPS: how often both accounts were within 120 m of each other while moving (positions are kept 2 days)
-    ids = sorted({x for p in out for x in (p["a"], p["b"])})
-    gps = {}
-    if ids:
-        since = (now - timedelta(days=2)).isoformat(timespec="seconds")
-        q = ",".join("?" * len(ids))
-        for r in store._rows(f"SELECT rider_id, CAST(julianday(at) * 1440 AS INTEGER) AS m, lat, lng FROM positions WHERE at >= ? AND rider_id IN ({q})",
-                             [since] + ids):
-            gps.setdefault(r["rider_id"], {})[r["m"]] = (r["lat"], r["lng"])
-    for p in out:
-        ga, gb = gps.get(p["a"], {}), gps.get(p["b"], {})
-        both = close = 0
-        for m, (la, lo) in ga.items():
-            q2 = gb.get(m) or gb.get(m - 1) or gb.get(m + 1)
-            if not q2:
-                continue
-            prev = ga.get(m - 5) or ga.get(m - 4) or ga.get(m - 6)
-            moving = prev is not None and _meters(prev, (la, lo)) > 100
-            if not moving:
-                continue
-            both += 1
-            close += _meters((la, lo), q2) <= 120
-        p["gps_minutes"] = both
-        p["gps_together"] = round(close / both * 100) if both >= 15 else None
-        if p["gps_together"] is not None and p["gps_together"] >= 70 and p["level"] != "strong":
-            p["level"] = "likely" if p["level"] == "check" else "strong"
     rank = {"strong": 0, "likely": 1, "check": 2}
-    out.sort(key=lambda p: (rank[p["level"]], -p["share"], -p["together"]))
+    out.sort(key=lambda p: (rank[p["level"]], -(p["gps_together"] or 0), -p["share"], -p["together"]))
     return {"from": a, "to": b, "days": days, "city": city, "pairs": out[:60], "riders": len(total),
-            "rule": f"picked up at the same restaurant within {pick_win:g} min and delivered within {drop_win:g} min of each other"}
+            "gps_days": len(G), "gps_first": min(G) if G else None,
+            "rule": f"GPS: both moving within {GPS_NEAR_M} m of each other · same restaurant within {pick_win:g} min and delivered within {drop_win:g} min"}
 
 
 def _meters(p, q):
