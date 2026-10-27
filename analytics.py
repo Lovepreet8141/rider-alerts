@@ -7,6 +7,8 @@ app.py from memory. No customer data leaves here.
 from __future__ import annotations
 
 import json
+import math
+import os
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -677,3 +679,409 @@ def fleets(store, rules, P: dict, city: str = "") -> list:
                     "per_rider": round((r["delivered"] or 0) / r["riders"], 1) if r["riders"] else None})
     out.sort(key=lambda f: -f["delivered"])
     return out
+
+
+# ====================================================================== 9.5 — staffing forecast (with the weather)
+# Tomorrow's orders per city and hour = the last 4 same weekdays (recent ones count more) × the city's trend of the
+# last 7 days × the weather in that hour (Deutscher Wetterdienst forecast via Bright Sky). Riders needed = orders ÷
+# what one rider delivers per hour (Settings). Only shown on the dashboard — nobody is messaged.
+_KNOWN_LL = {
+    "aachen": (50.776, 6.084), "arnsberg": (51.396, 8.064), "augsburg": (48.371, 10.898), "berlin": (52.520, 13.405),
+    "bielefeld": (52.022, 8.532), "bischofsheim": (49.993, 8.364), "bochum": (51.482, 7.216), "bonn": (50.737, 7.098),
+    "braunschweig": (52.269, 10.521), "bremen": (53.079, 8.802), "celle": (52.625, 10.081), "chemnitz": (50.828, 12.921),
+    "darmstadt": (49.873, 8.651), "dessau": (51.835, 12.246), "dormagen": (51.096, 6.840), "dortmund": (51.514, 7.468),
+    "dresden": (51.050, 13.738), "duisburg": (51.435, 6.763), "düsseldorf": (51.227, 6.774), "erfurt": (50.979, 11.033),
+    "essen": (51.456, 7.012), "frankfurt": (50.111, 8.682), "freiburg": (47.999, 7.842), "georgsmarienhütte": (52.203, 8.045),
+    "göttingen": (51.541, 9.916), "halle": (51.482, 11.970), "hamburg": (53.551, 9.994), "harburg": (53.460, 9.983),
+    "hannover": (52.375, 9.732), "heidelberg": (49.399, 8.672), "karlsruhe": (49.007, 8.404), "kassel": (51.312, 9.480),
+    "kiel": (54.323, 10.123), "koblenz": (50.356, 7.594), "köln": (50.938, 6.960), "leipzig": (51.340, 12.375),
+    "lippstadt": (51.674, 8.344), "lübeck": (53.866, 10.687), "magdeburg": (52.121, 11.628), "mainz": (49.993, 8.247),
+    "mannheim": (49.488, 8.466), "minden": (52.289, 8.914), "mönchengladbach": (51.180, 6.442), "münchen": (48.137, 11.576),
+    "munich": (48.137, 11.576), "münster": (51.961, 7.626), "neumünster": (54.073, 9.984), "neunkirchen": (49.344, 7.180),
+    "nürnberg": (49.452, 11.077), "oldenburg": (53.144, 8.214), "osnabrück": (52.279, 8.047), "paderborn": (51.719, 8.754),
+    "plauen": (50.495, 12.136), "potsdam": (52.391, 13.064), "regensburg": (49.013, 12.102), "remscheid": (51.179, 7.189),
+    "rheine": (52.281, 7.440), "rostock": (54.092, 12.099), "rüsselsheim": (49.992, 8.413), "saarbrücken": (49.240, 6.997),
+    "solingen": (51.171, 7.084), "stuttgart": (48.776, 9.183), "ulm": (48.401, 9.987), "waiblingen": (48.831, 9.317),
+    "wiesbaden": (50.078, 8.240), "wolfsburg": (52.423, 10.787), "wuppertal": (51.256, 7.151), "würzburg": (49.792, 9.953),
+    "zwickau": (50.719, 12.496),
+}
+
+
+def _wmedian(vals: list) -> float:
+    vals = sorted(vals)
+    half, acc = sum(w for _, w in vals) / 2, 0
+    for v, w in vals:
+        acc += w
+        if acc >= half:
+            return v
+    return vals[-1][0]
+
+
+def city_coords(store, place_ll: dict, now: datetime) -> dict:
+    """city -> (lat, lon): the middle of its restaurants (from the place positions MotionTools gave us); a city with no
+    known restaurant position falls back to the town's centre."""
+    def build():
+        pts = {}
+        for r in store._rows("SELECT city, place_id, COUNT(*) AS n FROM orders WHERE day >= ? AND place_id IS NOT NULL AND place_id != '' "
+                             "GROUP BY city, place_id", (day_key(now - timedelta(days=14)),)):
+            ll = place_ll.get(r["place_id"])
+            if ll:
+                pts.setdefault(r["city"] or "?", []).append((ll[0], ll[1], r["n"]))
+        out = {c: (_wmedian([(a, n) for a, _, n in p]), _wmedian([(b, n) for _, b, n in p])) for c, p in pts.items() if p}
+        for r in store._rows("SELECT DISTINCT city FROM orders WHERE day >= ? AND city IS NOT NULL AND city != ''", (day_key(now - timedelta(days=14)),)):
+            c = r["city"]
+            if c in out:
+                continue
+            words = [w for w in c.lower().replace("/", " ").replace("-", " ").split() if w]
+            for w in [" ".join(words)] + words:
+                if w in _KNOWN_LL:
+                    out[c] = _KNOWN_LL[w]; break
+        return out
+    return cached(("coords", day_key(now)), 6 * 3600, build)
+
+
+_WX: dict = {}                      # city -> {"at": epoch, "hours": {"YYYY-MM-DDTHH": {"mm", "temp", "cond", "icon"}}}
+WX_SOURCE = "Deutscher Wetterdienst (DWD) via Bright Sky"
+
+
+WX_URL = os.environ.get("WX_URL", "").strip() or "https://api.brightsky.dev/weather"   # override only for tests
+
+
+def refresh_weather(coords: dict, today: str, days: int = 8) -> int:
+    """Hourly forecast (rain, temperature, condition) for every city for the next `days` days. Free, no key; DWD open
+    data. Returns how many cities were updated. Failures keep the previous forecast."""
+    import httpx
+    ok = 0
+    d2 = (_d(today) + timedelta(days=days)).isoformat()
+    with httpx.Client(timeout=10, headers={"User-Agent": "quickzi-ops/9.5"}) as c:
+        for city, (lat, lon) in coords.items():
+            try:
+                r = c.get(WX_URL, params={"lat": round(lat, 3), "lon": round(lon, 3), "date": today,
+                                                                     "last_date": d2, "tz": "Europe/Berlin"})
+                if r.status_code != 200:
+                    continue
+                hours = {}
+                for w in r.json().get("weather") or []:
+                    try:
+                        t = datetime.fromisoformat(w["timestamp"]).astimezone(BERLIN)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    hours[t.strftime("%Y-%m-%dT%H")] = {"mm": w.get("precipitation"), "temp": w.get("temperature"),
+                                                         "cond": w.get("condition") or "", "icon": w.get("icon") or ""}
+                if hours:
+                    _WX[city] = {"at": time.time(), "hours": hours}; ok += 1
+            except Exception:
+                continue
+            time.sleep(0.15)
+    return ok
+
+
+def wx_factor(w: dict | None) -> float:
+    """How the weather moves orders in that hour: rain +8 %, heavy rain / snow / sleet / hail +15 %, frost +5 %,
+    heat (28 °C+) −5 %."""
+    if not w:
+        return 1.0
+    mm, cond, t = w.get("mm") or 0, (w.get("cond") or "").lower(), w.get("temp")
+    f = 1.0
+    if cond in ("snow", "sleet", "hail") or mm >= 2.5:
+        f += 0.15
+    elif cond in ("rain", "thunderstorm") or mm >= 0.5:
+        f += 0.08
+    if t is not None and t <= 0:
+        f += 0.05
+    if t is not None and t >= 28:
+        f -= 0.05
+    return round(f, 2)
+
+
+_STAGES = ("tr_s", "tr_n", "wt_s", "wt_n", "tc_s", "tc_n", "ho_s", "ho_n")
+
+
+def rider_busy_day(store, day: str, today: str) -> dict:
+    """{city: [rider minutes busy (overlaps counted once), minutes summed per order, deliveries]} for one day.
+    A rider carrying two orders at once is busy once, not twice — this is how much merged orders save."""
+    from orders import ts
+
+    def build():
+        out, cur = {}, None
+        for r in store._rows("SELECT city, rider_id, accepted_at, delivered_at FROM orders WHERE day = ? AND phase='delivered' "
+                             "AND rider_id IS NOT NULL AND rider_id != '' AND accepted_at IS NOT NULL AND delivered_at IS NOT NULL "
+                             "ORDER BY city, rider_id, accepted_at", [day]):
+            a, b = ts(r["accepted_at"]), ts(r["delivered_at"])
+            if not a or not b or b <= a or (b - a).total_seconds() > 3 * 3600:
+                continue
+            c = r["city"] or "?"
+            g = out.setdefault(c, [0.0, 0.0, 0])
+            g[1] += (b - a).total_seconds() / 60; g[2] += 1
+            k = (c, r["rider_id"])
+            if cur and cur[0] == k and a < cur[2]:
+                cur[2] = max(cur[2], b)
+            else:
+                if cur:
+                    out[cur[0][0]][0] += (cur[2] - cur[1]).total_seconds() / 60
+                cur = [k, a, b]
+        if cur:
+            out[cur[0][0]][0] += (cur[2] - cur[1]).total_seconds() / 60
+        return {c: [round(u, 1), round(sm, 1), n] for c, (u, sm, n) in out.items()}
+    return cube(store, "busy", day, "", today, build, 60)
+BUSY_SHARE = 0.8                 # a rider is busy with deliveries ~80 % of an hour; the rest is waiting for the next one
+
+
+def forecast(store, rules, now: datetime, day: str = "", city: str = "", shifts: list = None) -> dict:
+    """Orders and riders needed per hour for one day (default tomorrow), per city and in total."""
+    today = day_key(now)
+    T = day or (_d(today) + timedelta(days=1)).isoformat()
+    T = max(today, min(T, (_d(today) + timedelta(days=6)).isoformat()))
+    D = lambda d: perf_day(store, rules, d, today)
+    weights_all = [0.4, 0.3, 0.2, 0.1]
+    base = [((_d(T) - timedelta(days=7 * k)).isoformat(), weights_all[k - 1]) for k in range(1, 5)]
+    base = [(d, w) for d, w in base if d < today and D(d)["tot"]]            # days before the first recorded one don't count
+    wsum = sum(w for _, w in base) or 1.0
+    cap = max(0.5, float(getattr(rules, "riders_capacity_per_hour", 1.5) or 1.5))
+    # trend: the last 7 finished days vs the 4 weeks before them, per city (bounded ±15 %)
+    last7 = [D((_d(today) - timedelta(days=i)).isoformat()) for i in range(1, 8)]
+    prev28 = [D((_d(today) - timedelta(days=i)).isoformat()) for i in range(8, 36)]
+    tot = lambda days, c: sum(x["tot"].get(c, [0] * _NF)[I["orders"]] for x in days)
+    per = {}                                                                     # (city, hour) -> [weighted orders, weighted riders, lo, hi]
+    cities = set()
+    st_h, st_c = {}, {}                          # delivery-time stages (sum, n) per (city, hour) and per city, same weekdays
+    for d, w in base:
+        rows = {}
+        for row in D(d)["rows"]:
+            if row[1] is None or (city and row[0] != city):
+                continue
+            rows[(row[0], row[1])] = (row[2 + I["orders"]], row[2 + I["rider_h"]])
+            cities.add(row[0])
+            for acc in (st_h.setdefault((row[0], row[1]), [0.0] * 9), st_c.setdefault(row[0], [0.0] * 9)):
+                for j, k in enumerate(_STAGES):
+                    acc[j] += row[2 + I[k]] or 0
+                acc[8] += row[2 + I["delivered"]] or 0
+        for k, (o, r) in rows.items():
+            x = per.setdefault(k, [0.0, 0.0, None, None, 0])
+            x[0] += w * o; x[1] += w * r; x[4] += 1
+            x[2] = o if x[2] is None else min(x[2], o); x[3] = o if x[3] is None else max(x[3], o)
+    # weekly average over the days that were recorded (a city opened 3 weeks ago is not "+33 %")
+    n7 = sum(1 for x in last7 if x["tot"]); n28 = sum(1 for x in prev28 if x["tot"])
+    trend = {}
+    for c in cities:
+        a = tot(last7, c) / n7 * 7 if n7 >= 5 else 0
+        b = tot(prev28, c) / n28 * 7 if n28 >= 14 else 0
+        trend[c] = round(max(0.85, min(1.15, a / b)), 2) if a and b else 1.0
+    # today: the hours already over steer the rest of the day
+    actual, today_f = {}, {}
+    if T == today:
+        for row in D(today)["rows"]:
+            if row[1] is not None and (not city or row[0] == city):
+                actual[(row[0], row[1])] = row[2 + I["orders"]]
+        cur_h = now.astimezone(BERLIN).hour
+        for c in cities:
+            done = [h for h in range(0, cur_h) if per.get((c, h))]
+            fc = sum(per[(c, h)][0] / wsum * trend[c] for h in done)
+            ac = sum(actual.get((c, h), 0) for h in done)
+            today_f[c] = round(max(0.7, min(1.3, ac / fc)), 2) if len(done) >= 3 and fc >= 5 else 1.0
+    planned = {}
+    for s in shifts or []:
+        try:
+            sh, sm = map(int, (s.get("start") or "")[:5].split(":")); eh, em = map(int, (s.get("end") or "")[:5].split(":"))
+        except (ValueError, AttributeError):
+            continue
+        a, b = sh * 60 + sm, eh * 60 + em
+        if b <= a:
+            b += 24 * 60
+        c = s.get("city") or ""
+        if city and c and c != city:
+            continue
+        for h in range(0, 24):
+            if min(b, (h + 1) * 60) - max(a, h * 60) >= 30:                      # at least half of the hour on shift
+                planned[(c, h)] = planned.get((c, h), 0) + 1
+    has_sheet = bool(planned)
+    cur_h = now.astimezone(BERLIN).hour if T == today else -1
+
+    merged = {}                                  # per city: share of rider time left once overlapping orders count once
+    for c in cities:
+        u = sm = n = 0
+        for d, _ in base:
+            x = rider_busy_day(store, d, today).get(c)
+            if x:
+                u += x[0]; sm += x[1]; n += x[2]
+        merged[c] = round(max(0.4, min(1.0, u / sm)), 2) if n >= 20 and sm else 1.0
+
+    def busy(c, h):
+        """Minutes one delivery keeps a rider busy (accept → at restaurant → wait → ride → hand-over) in that city and
+        hour on the same weekdays; the city's whole day when the hour has too few deliveries; None without timings."""
+        for acc, need in ((st_h.get((c, h)), 8), (st_c.get(c), 5)):
+            if acc and acc[8] >= need and all(acc[j + 1] > 0 for j in range(0, 8, 2)):
+                return sum(acc[j] / acc[j + 1] for j in range(0, 8, 2)) * merged.get(c, 1.0), ("hour" if acc is st_h.get((c, h)) else "city")
+        return None, "settings"
+    out_c, hours_sum = [], {}
+    for c in sorted(cities):
+        wx = (_WX.get(c) or {}).get("hours", {})
+        rows_c = []
+        for h in range(0, 24):
+            x = per.get((c, h))
+            if not x:
+                continue
+            w = wx.get(f"{T}T{h:02d}")
+            f = wx_factor(w)
+            o = x[0] / wsum * trend.get(c, 1.0) * f * (today_f.get(c, 1.0) if h >= cur_h >= 0 else 1.0)
+            if h < cur_h:                                                          # an hour already over: what really happened
+                o = actual.get((c, h), 0)
+            mins, src = busy(c, h)
+            per_rider = max(0.6, min(4.0, BUSY_SHARE * 60 / mins)) if mins else cap   # deliveries one rider manages in the hour
+            need = math.ceil(o / per_rider - 0.15) if o >= 0.3 else 0
+            p = planned.get((c, h), 0)
+            rows_c.append({"hour": h, "orders": round(o, 1), "lo": round(x[2] * trend.get(c, 1.0) * f, 1), "hi": round(x[3] * trend.get(c, 1.0) * f, 1),
+                           "had": round(x[1] / wsum, 1), "needed": need, "planned": p, "actual": actual.get((c, h)), "past": h < cur_h,
+                           "min": round(mins, 1) if mins else None, "per_rider": round(per_rider, 2), "src": src,
+                           "mm": (w or {}).get("mm"), "temp": (w or {}).get("temp"), "cond": (w or {}).get("cond"), "icon": (w or {}).get("icon"), "wx": f})
+        if not rows_c:
+            continue
+        total = sum(r["orders"] for r in rows_c)
+        peak = max(rows_c, key=lambda r: r["orders"])
+        need_h = sum(r["needed"] for r in rows_c if not r["past"])
+        plan_h = sum(planned.get((c, r["hour"]), 0) for r in rows_c if not r["past"])
+        rain_h = [r for r in rows_c if (r["wx"] or 1) > 1.0 and 11 <= r["hour"] <= 22]
+        tm = [(r["min"], r["orders"]) for r in rows_c if r["min"]]
+        city_min = sum(m * o for m, o in tm) / sum(o for _, o in tm) if tm and sum(o for _, o in tm) else None
+        temps = [r["temp"] for r in rows_c if r["temp"] is not None and 11 <= r["hour"] <= 22]
+        out_c.append({"city": c, "orders": round(total), "peak_hour": peak["hour"], "peak_orders": round(peak["orders"], 1), "peak_needed": peak["needed"],
+                      "rider_hours": need_h, "planned_hours": plan_h if has_sheet else None, "gap_hours": (plan_h - need_h) if has_sheet else None,
+                      "trend": trend.get(c, 1.0), "today_factor": today_f.get(c), "rain_hours": len(rain_h),
+                      "min": round(city_min, 1) if city_min else None, "peak_min": peak["min"], "peak_per_rider": peak["per_rider"],
+                      "merged_saves": round(1 - merged.get(c, 1.0), 2),
+                      "rain_mm": round(sum((r["mm"] or 0) for r in rows_c if 11 <= r["hour"] <= 22), 1),
+                      "temp_min": min(temps) if temps else None, "temp_max": max(temps) if temps else None,
+                      "weather": bool(wx), "hours": rows_c})
+        for r in rows_c:
+            s = hours_sum.setdefault(r["hour"], {"hour": r["hour"], "orders": 0.0, "lo": 0.0, "hi": 0.0, "had": 0.0, "needed": 0, "planned": 0,
+                                                  "actual": None, "past": r["past"], "mm": None, "temp": None, "cond": None, "icon": None, "wx": None,
+                                                  "_mo": 0.0, "_o": 0.0})
+            if r["min"]:
+                s["_mo"] += r["min"] * r["orders"]; s["_o"] += r["orders"]
+            for k in ("orders", "lo", "hi", "had", "needed", "planned"):
+                s[k] += r[k] or 0
+            if r["actual"] is not None:
+                s["actual"] = (s["actual"] or 0) + r["actual"]
+            if city:
+                s.update(mm=r["mm"], temp=r["temp"], cond=r["cond"], icon=r["icon"], wx=r["wx"])
+    out_c.sort(key=lambda c: -c["orders"])
+    hours = [dict({k: x for k, x in v.items() if not k.startswith("_")}, orders=round(v["orders"], 1), lo=round(v["lo"], 1), hi=round(v["hi"], 1),
+                  had=round(v["had"], 1), min=round(v["_mo"] / v["_o"], 1) if v["_o"] else None)
+             for _, v in sorted(hours_sum.items()) if v["orders"] >= 0.5 or v["actual"]]
+    if not city:                                    # all cities: how many cities have rain in that hour
+        for h in hours:
+            n = sum(1 for c in out_c for r in c["hours"] if r["hour"] == h["hour"] and (r["wx"] or 1) > 1.0)
+            h["rain_cities"] = n
+    peak = max(hours, key=lambda r: r["orders"]) if hours else None
+    need_h = sum(h["needed"] for h in hours if not h["past"])
+    plan_h = sum(h["planned"] for h in hours if not h["past"])
+    return {"day": T, "today": today, "weekday": _d(T).strftime("%A"), "label": _fmt(_d(T)), "city": city,
+            "basis": [d for d, _ in base], "capacity_per_hour": cap, "busy_share": BUSY_SHARE,
+            "min": (lambda tm: round(sum(c["min"] * c["orders"] for c in tm) / sum(c["orders"] for c in tm), 1) if tm and sum(c["orders"] for c in tm) else None)(
+                [c for c in out_c if c["min"]]),
+            "no_timing": [c["city"] for c in out_c if not c["min"]],
+            "totals": {"orders": round(sum(h["orders"] for h in hours)), "peak_hour": peak["hour"] if peak else None,
+                       "peak_orders": round(peak["orders"]) if peak else None, "peak_needed": peak["needed"] if peak else None,
+                       "rider_hours": need_h, "planned_hours": plan_h if has_sheet else None, "gap_hours": (plan_h - need_h) if has_sheet else None,
+                       "same_day_avg": round(sum(tot([D(d)], c) for d, _ in base for c in cities) / max(1, len(base))) if base else None},
+            "hours": hours, "cities": out_c, "has_sheet": has_sheet,
+            "weather": {"cities": sum(1 for c in out_c if c["weather"]), "source": WX_SOURCE,
+                        "rule": "rain +8 %, heavy rain / snow +15 %, frost +5 %, heat (28 °C+) −5 %"}}
+
+
+# ====================================================================== 9.5 — Lieferando evidence pack
+def evidence(store, rules, now: datetime, a: str, b: str, city: str = "", min_wait: int = 10, normal: int = 5, arrive_max: int = 20) -> dict:
+    """Late deliveries (PTOD over target) that were late BECAUSE of the restaurant: the rider was at the restaurant within
+    `arrive_max` min of dispatch, waited `min_wait`+ min for the food, and without the waiting beyond a normal
+    `normal`-minute hand-over the order would have been on target. Only order numbers, restaurants and times — no
+    customer data, no rider names."""
+    from orders import ts
+    tgt = rules.ptod_target_min
+    w, args = "day BETWEEN ? AND ? AND phase='delivered' AND ptod_min > ? AND kitchen_wait >= ?", [a, b, tgt, min_wait]
+    if city:
+        w += " AND city=?"; args.append(city)
+    rows = []
+    for r in store._rows("SELECT id, ref, city, restaurant, dispatched_at, accepted_at, picked_up_at, at_customer_at, delivered_at, ptod_min, kitchen_wait, "
+                         "(SELECT COUNT(*) FROM handbacks h WHERE h.order_id = orders.id) AS hb "
+                         f"FROM orders WHERE {w} ORDER BY dispatched_at", args):
+        disp, pick = ts(r["dispatched_at"]), ts(r["picked_up_at"])
+        if not disp or not pick:
+            continue
+        kw = r["kitchen_wait"] or 0
+        arrived = pick - timedelta(minutes=kw)                              # the first rider's arrival
+        to_rest = (arrived - disp).total_seconds() / 60
+        delay = max(0.0, kw - normal)
+        without = r["ptod_min"] - delay
+        if to_rest > arrive_max or without > tgt:
+            continue
+        hm = lambda t: t.astimezone(BERLIN).strftime("%H:%M") if t else "–"
+        rows.append({"day": disp.astimezone(BERLIN).strftime("%a %d.%m."), "date": disp.astimezone(BERLIN).date().isoformat(),
+                     "ref": r["ref"] or "", "id": r["id"], "city": r["city"] or "", "restaurant": r["restaurant"] or "?",
+                     "dispatched": hm(disp), "accepted": hm(ts(r["accepted_at"])), "arrived": hm(arrived), "to_rest": round(to_rest),
+                     "picked": hm(pick), "delivered": hm(ts(r["delivered_at"])), "wait": round(kw), "delay": round(delay),
+                     "ptod": round(r["ptod_min"]), "without": round(without), "over": round(r["ptod_min"] - tgt),
+                     "note": f"handed back {r['hb']}× while waiting" if r["hb"] else ""})
+    vec, _, _ = _agg([perf_day(store, rules, d, day_key(now)) for d in _days(a, b)], city)
+    delivered, late, within = vec[I["delivered"]], vec[I["late"]], vec[I["within"]]
+    n_ptod = vec[I["ptod_n"]]
+    groups = {}
+    for x in rows:
+        g = groups.setdefault((x["restaurant"], x["city"]), {"restaurant": x["restaurant"], "city": x["city"], "n": 0, "delay": 0, "wait": 0})
+        g["n"] += 1; g["delay"] += x["delay"]; g["wait"] += x["wait"]
+    for g in groups.values():
+        g["avg_wait"] = round(g["wait"] / g["n"])
+    return {"from": a, "to": b, "city": city, "target": tgt, "min_wait": min_wait, "normal": normal, "arrive_max": arrive_max,
+            "delivered": delivered, "late": late, "n": len(rows), "late_share": round(100 * len(rows) / late) if late else None,
+            "delay_min": sum(x["delay"] for x in rows), "within_pct": round(100 * within / n_ptod) if n_ptod else None,
+            "within_if_excused": round(100 * (within + len(rows)) / n_ptod) if n_ptod else None,
+            "restaurants": sorted(groups.values(), key=lambda g: (-g["n"], -g["delay"])), "rows": rows}
+
+
+# ====================================================================== 9.5 — Monday report: waiting time
+def weekly_waits(store, rules, now: datetime, a: str, b: str, pa: str, pb: str, normal: int = 5) -> dict:
+    """Last week vs the week before, about restaurant waiting: minutes per order, rider-hours lost beyond a normal
+    hand-over, the restaurants and cities that cost the most, the hour they are slowest."""
+    q = store._rows
+    sel = ("SELECT restaurant, city, COUNT(*) AS n, SUM(kitchen_wait >= 10) AS long, AVG(kitchen_wait) AS avg, "
+           f"SUM(MAX(kitchen_wait - {int(normal)}, 0)) AS lost FROM orders WHERE day BETWEEN ? AND ? AND phase='delivered' "
+           "AND kitchen_wait IS NOT NULL AND kitchen_wait BETWEEN 0 AND 180 GROUP BY restaurant, city")
+    cur = {(r["restaurant"] or "?", r["city"] or ""): r for r in q(sel, (a, b))}
+    prev = {(r["restaurant"] or "?", r["city"] or ""): r for r in q(sel, (pa, pb))}
+    today = day_key(now)
+    def tot(days):
+        v, _, _ = _agg([perf_day(store, rules, d, today) for d in days])
+        g = lambda k: v[I[k]]
+        return {"delivered": g("delivered"), "avg_ptod": round(g("ptod_s") / g("ptod_n"), 1) if g("ptod_n") else None,
+                "within_pct": round(100 * g("within") / g("ptod_n")) if g("ptod_n") else None,
+                "avg_wait": round(g("wt_s") / g("wt_n"), 1) if g("wt_n") else None, "long": g("long"),
+                "long_pct": round(100 * g("long") / g("delivered")) if g("delivered") else None}
+    T, PT = tot(_days(a, b)), tot(_days(pa, pb))
+    T["lost_h"] = round(sum(r["lost"] or 0 for r in cur.values()) / 60)
+    PT["lost_h"] = round(sum(r["lost"] or 0 for r in prev.values()) / 60)
+    top = sorted(cur.values(), key=lambda r: -(r["lost"] or 0))[:5]
+    top_rows = []
+    for r in top:
+        k = (r["restaurant"] or "?", r["city"] or "")
+        hrs = q("SELECT hour, AVG(kitchen_wait) AS avg, COUNT(*) AS n FROM orders WHERE day BETWEEN ? AND ? AND restaurant=? AND city=? "
+                "AND phase='delivered' AND kitchen_wait IS NOT NULL AND hour IS NOT NULL GROUP BY hour HAVING n >= 3 ORDER BY avg DESC LIMIT 1",
+                (a, b, r["restaurant"], r["city"]))
+        p = prev.get(k)
+        top_rows.append({"restaurant": k[0], "city": k[1], "lost_h": round((r["lost"] or 0) / 60, 1), "avg": round(r["avg"] or 0),
+                         "long": r["long"] or 0, "n": r["n"], "slow_hour": hrs[0]["hour"] if hrs else None,
+                         "slow_avg": round(hrs[0]["avg"]) if hrs else None,
+                         "prev_lost_h": round((p["lost"] or 0) / 60, 1) if p else None})
+    change = []
+    for k in set(cur) | set(prev):
+        c, p = (cur.get(k) or {}).get("lost") or 0, (prev.get(k) or {}).get("lost") or 0
+        change.append((round((c - p) / 60, 1), k))
+    change.sort()
+    cities = {}
+    for (rest, cty), r in cur.items():
+        x = cities.setdefault(cty or "?", [0, 0.0, 0.0])
+        x[0] += r["n"]; x[1] += (r["avg"] or 0) * r["n"]; x[2] += r["lost"] or 0
+    city_rows = sorted(({"city": c, "avg": round(v[1] / v[0], 1) if v[0] else None, "lost_h": round(v[2] / 60)} for c, v in cities.items() if v[0] >= 30),
+                       key=lambda c: -(c["avg"] or 0))
+    return {"from": a, "to": b, "prev_from": pa, "prev_to": pb, "normal": normal, "week": T, "prev": PT, "top": top_rows,
+            "worse": [{"restaurant": k[0], "city": k[1], "delta_h": d} for d, k in change[::-1][:3] if d > 0],
+            "better": [{"restaurant": k[0], "city": k[1], "delta_h": d} for d, k in change[:3] if d < 0],
+            "cities": city_rows[:3]}

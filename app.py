@@ -202,7 +202,7 @@ def housekeeping(now: datetime, startup: bool = False):
     return rep
 SYNC_SECONDS = int(env("SYNC_SECONDS", "30") or 30)
 CITY = env("CITY_NAME", "Munich") or "Munich"
-VERSION = "9.4.0"
+VERSION = "9.5.0"
 STARTED = datetime.now(UTC)
 
 mt = MotionTools(MT_TOKEN)
@@ -1097,11 +1097,25 @@ def prewarm_v2():
         log.warning("restaurant index: %s", e)
     try:
         analytics.warm(store, rules, datetime.now(UTC))
+        _t = day_key(datetime.now(UTC))                 # rider busy time of the last 5 weeks, for the staffing forecast
+        for i in range(1, 36):
+            analytics.rider_busy_day(store, (_date.fromisoformat(_t) - timedelta(days=i)).isoformat(), _t)
         _v2_performance_data(period="today", city="", frm="", to="")
         _v2_restaurants_data(period="today", city="", minutes=10, frm="", to="")
         _v2_rider_stats(period="today", city="", fleet="", frm="", to="")
     except Exception as e:
         log.warning("v2 prewarm: %s", e)
+    while True:                                        # weather for the staffing forecast: every hour
+        try:
+            now = datetime.now(UTC)
+            n = analytics.refresh_weather(analytics.city_coords(store, projector.place_ll, now), day_key(now))
+            STATE["weather"] = {"at": iso(now), "cities": n}
+            if n:                                      # the forecast changes with the weather: don't serve the old one
+                for k in [k for k in list(_RCACHE) if k[0] == "api_v2_staffing"]:
+                    _RCACHE.pop(k, None)
+        except Exception as e:
+            log.warning("weather refresh: %s", e)
+        time.sleep(3600)
 
 
 def prewarm_reports():
@@ -1331,6 +1345,7 @@ async def startup():
     asyncio.create_task(intercom_match_loop())
     asyncio.create_task(loop_lag_monitor())
     asyncio.create_task(slack_loop())
+    asyncio.create_task(weekly_report_loop())
 
 
 def set_mode(m: str):
@@ -1506,7 +1521,7 @@ async def api_slack_save(request: Request):
         rest = str(max(1, min(120, int(b.get("rest_min") or 10))))
     except (TypeError, ValueError):
         rest = "10"
-    ev = ",".join(e for e in ("new", "norider", "rest", "cancel") if e in (b.get("events") or []))
+    ev = ",".join(e for e in ("new", "norider", "rest", "cancel", "weekly") if e in (b.get("events") or []))
     store.set_settings({"slack_restaurants": names, "slack_no_rider_min": mins, "slack_rest_min": rest, "slack_events": ev})
     return slack.status(list(STATE["orders"].values()))
 
@@ -1516,6 +1531,122 @@ async def api_slack_test():
     if not slack_notify_webhook():
         return {"ok": False, "error": "SLACK_WEBHOOK_URL is not set in Railway (web service → Variables)"}
     ok = await slack.send("✅ Quickzi dashboard is connected — orders of your priority restaurants will appear here.")
+    return {"ok": ok, "error": "" if ok else slack.stats.get("last_error", "")}
+
+
+def _public_url() -> str:
+    """The dashboard's own address for links in Slack (Railway sets RAILWAY_PUBLIC_DOMAIN by itself)."""
+    d = env("PUBLIC_URL") or env("RAILWAY_PUBLIC_DOMAIN")
+    return "" if not d else (d.rstrip("/") if d.startswith("http") else "https://" + d.rstrip("/"))
+
+
+def _fmt_n(n) -> str:
+    return "–" if n is None else f"{n:,}"
+
+
+def _hrs(h) -> str:
+    return "–" if h is None else (f"{round(h):,}" if abs(h) >= 10 else f"{h:g}")
+
+
+def _rc(restaurant: str, city: str) -> str:
+    """'Vapiano Hamburg' stays as it is; 'McDonald's®' becomes 'McDonald's® (Münster)'."""
+    first = (city or "").replace("/", " ").replace("-", " ").split()
+    return restaurant if not first or first[0].lower() in (restaurant or "").lower() else f"{restaurant} ({city})"
+
+
+def _arrow(cur, prev, unit="", better_down=True, digits=0):
+    if cur is None or prev is None:
+        return ""
+    d = round(cur - prev, digits)
+    if not d:
+        return " (±0 vs the week before)"
+    good = (d < 0) == better_down
+    if unit == " pts" and abs(d) == 1:
+        unit = " pt"
+    return f" ({'▲' if d > 0 else '▼'} {abs(d):g}{unit} {'✅' if good else '⚠️'})"
+
+
+def weekly_report(now: datetime = None) -> dict:
+    """The Monday report: last week's restaurant waiting, for the internal Slack channel."""
+    now = now or datetime.now(UTC)
+    P = analytics.resolve("lastweek", now)
+    w = analytics.weekly_waits(store, rules, now, P["a"], P["b"], P["pa"], P["pb"])
+    ev = analytics.evidence(store, rules, now, P["a"], P["b"])
+    W, PW, base = w["week"], w["prev"], _public_url()
+    span = P["label"].split(" · ", 1)[-1]
+    link = lambda path, text: f"<{base}{path}|{text}>" if base else text
+    L = [f"*📊 Weekly waiting report · {span}*",
+         f"Riders waited *{W['avg_wait']}′ per order* at restaurants{_arrow(W['avg_wait'], PW['avg_wait'], '′', digits=1)}",
+         f"*{_fmt_n(W['lost_h'])} rider-hours* lost beyond a normal {w['normal']}′ hand-over{_arrow(W['lost_h'], PW['lost_h'], ' h')}",
+         f"*{_fmt_n(W['long'])} orders* waited 10+ min ({W['long_pct']} %) · {_fmt_n(W['delivered'])} delivered · "
+         f"avg delivery {W['avg_ptod']}′ · within {rules.ptod_target_min}′ *{W['within_pct']} %*{_arrow(W['within_pct'], PW['within_pct'], ' pts', better_down=False)}",
+         "", "*Restaurants that cost the most rider-time*"]
+    for i, r in enumerate(w["top"], 1):
+        delta = f" · {'▲' if r['lost_h'] > (r['prev_lost_h'] or 0) else '▼'} {abs(round(r['lost_h'] - (r['prev_lost_h'] or 0)))} h" if r["prev_lost_h"] is not None else ""
+        slow = f" · slowest ~{r['slow_hour']}:00 ({r['slow_avg']}′)" if r["slow_hour"] is not None else ""
+        L.append(f"{i}. *{_rc(r['restaurant'], r['city'])}* — {_hrs(r['lost_h'])} h lost · avg {r['avg']}′ · {_fmt_n(r['long'])} long waits{slow}{delta}")
+    if w["worse"]:
+        L.append("*Getting worse:* " + " · ".join(f"{_rc(x['restaurant'], x['city'])} +{_hrs(x['delta_h'])} h" for x in w["worse"]))
+    if w["better"]:
+        L.append("*Getting better:* " + " · ".join(f"{_rc(x['restaurant'], x['city'])} −{_hrs(-x['delta_h'])} h" for x in w["better"]))
+    if w["cities"]:
+        L.append("*Cities with the longest waits:* " + " · ".join(f"{c['city']} {c['avg']}′" for c in w["cities"]))
+    L += ["", f"*Evidence for Lieferando:* {_fmt_n(ev['n'])} late orders were late because of the restaurant"
+              + (f" ({ev['late_share']} % of the late ones)" if ev["late_share"] is not None else "")
+              + (f" — within {ev['target']}′ would be *{ev['within_if_excused']} %* instead of {ev['within_pct']} %." if ev["within_pct"] is not None else ".")
+              + " " + link(f"/v2#evidence?wk={P['a']}", "Open the evidence pack")]
+    acts = []
+    if w["top"]:
+        t = w["top"][0]
+        acts.append(f"Call *{_rc(t['restaurant'], t['city'])}*: {_hrs(t['lost_h'])} rider-hours waiting last week"
+                    + (f", worst around {t['slow_hour']}:00." if t["slow_hour"] is not None else "."))
+    slow = sorted((r for r in w["top"] if r["slow_hour"] is not None), key=lambda r: -(r["slow_avg"] or 0))
+    if slow:
+        s0 = slow[0]
+        acts.append(f"Send riders a few minutes later to *{_rc(s0['restaurant'], s0['city'])}* around {s0['slow_hour']}:00 (avg wait {s0['slow_avg']}′ then).")
+    if ev["n"]:
+        acts.append(f"Send the evidence pack ({_fmt_n(ev['n'])} orders) to Lieferando.")
+    if acts:
+        L += ["", "*This week:*"] + [f"• {a}" for a in acts]
+    L += ["", link(f"/v2#restaurants?period=lastweek", "Restaurants · last week") + "  ·  " + link("/v2#staffing", "Staffing forecast")]
+    return {"text": "\n".join(L), "week": P["a"]}
+
+
+async def weekly_report_loop():
+    """Mondays from 08:30 (Berlin): last week's waiting report to the team's own Slack channel — once per week."""
+    from starlette.concurrency import run_in_threadpool
+    await asyncio.sleep(90)
+    while True:
+        try:
+            now = datetime.now(UTC)
+            loc = now.astimezone(BERLIN)
+            st = store.get_settings()
+            events = set((st.get("slack_events") or "new,norider,rest,cancel,weekly").split(","))
+            monday = (loc - timedelta(days=loc.weekday())).date().isoformat()
+            due = loc.weekday() == 1 or (loc.weekday() == 0 and (loc.hour, loc.minute) >= (8, 30))
+            if slack_notify_webhook() and "weekly" in events and due and st.get("slack_weekly_sent") != monday:
+                rep = await run_in_threadpool(weekly_report, now)
+                if await slack.send(rep["text"]):
+                    store.set_settings({"slack_weekly_sent": monday})
+                    log.info("weekly waiting report posted to Slack")
+        except Exception as e:
+            log.warning("weekly report: %s", e)
+        await asyncio.sleep(300)
+
+
+@app.get("/api/slack/weekly", dependencies=[Depends(require_login)])
+def api_slack_weekly_preview():
+    rep = weekly_report()
+    return {"text": rep["text"], "sent_week": store.get_settings().get("slack_weekly_sent", "")}
+
+
+@app.post("/api/slack/weekly", dependencies=[Depends(require_login)])
+async def api_slack_weekly_send():
+    if not slack_notify_webhook():
+        return {"ok": False, "error": "SLACK_WEBHOOK_URL is not set in Railway (web service → Variables)"}
+    from starlette.concurrency import run_in_threadpool
+    rep = await run_in_threadpool(weekly_report)
+    ok = await slack.send(rep["text"])
     return {"ok": ok, "error": "" if ok else slack.stats.get("last_error", "")}
 
 
@@ -3279,7 +3410,7 @@ async def export_waits_pdf(period: str = "today", city: str = "", minutes: int =
         data["where"] = f"{restaurant or '?'}{(' · ' + city) if city else ''}"
         data["title"] = f"Quickzi – long restaurant waits – {restaurant or '?'}{(' · ' + city) if city else ''} – {data['plabel']}"
     body = await _render_pdf_elsewhere(data)
-    slug = lambda x: re.sub(r"[^a-z0-9]+", "-", (x or "").lower()).strip("-")[:40] or "all"
+    slug = _file_slug
     span = f"{min(frm, to)}_{max(frm, to)}" if frm and to else period
     name = f'quickzi-long-waits-{slug(restaurant) + "-" if restaurant else ""}{slug(city)}-{span}.pdf'
     return _Response(content=body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}"'})
@@ -3450,6 +3581,14 @@ def _v2_rider_ttl(kw: dict):
     return 30 if (p == "today" or (kw.get("frm") and kw.get("frm") == kw.get("to"))) else 120
 
 
+def _file_slug(x: str) -> str:
+    """München → muenchen, BURGER KING ® Rostock → burger-king-rostock (for download file names)."""
+    x = (x or "").lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        x = x.replace(a, b)
+    return re.sub(r"[^a-z0-9]+", "-", x).strip("-")[:40] or "all"
+
+
 def _v2_range(period: str, frm: str, to: str, now: datetime) -> tuple:
     """(label for the PDF, start, end) of a named period or a custom from–to (operating days)."""
     from store import period_range
@@ -3605,10 +3744,12 @@ def api_v2_restaurants(period: str = "today", city: str = "", minutes: int = 10,
 @report_cache(30, 600, live_if=_v2_live_if)
 def api_v2_restaurant(name: str = "", city: str = "", period: str = "today", minutes: int = 10,
                       frm: str = Query("", alias="from"), to: str = ""):
-    """One restaurant: its long-wait orders (every one), wait by hour, long waits per week."""
+    """One restaurant: its long-wait orders (every one), wait by hour, long waits per week. name=* = all restaurants."""
     _v2_check(period, frm, to)
     now = datetime.now(UTC)
     m = max(1, min(120, int(minutes or 10)))
+    if name == "*":
+        return _v2_all_restaurants(period, city, m, frm, to, now)
     data, orders = _waits_data(period, city, m, frm, to, restaurant=name, now=now, with_orders=True)
     g = next((x for x in data["groups"] if x["restaurant"] == (name or "?") and (not city or x["city"] == city)), None)
     by_ref = {(o.get("ref") or ""): o for o in orders}
@@ -3628,6 +3769,97 @@ def api_v2_restaurant(name: str = "", city: str = "", period: str = "today", min
             "share": round(100 * g["n"] / g["of_all"]) if g and g["of_all"] else None,
             "avg": g["avg"] if g else None, "max": g["max"] if g else None, "rows": rows, "min_wait": m,
             "by_hour": det["by_hour"], "weeks": det["weeks"], "slowest_hour": slow["hour"] if slow else None, "period": P}
+
+
+ALL_ROWS_MAX = 300
+
+
+@report_cache(600, 600)
+def _v2_waits_per_week(end: str = "", city: str = "", minutes: int = 10) -> list:
+    """All restaurants: long waits and delivered orders per week, the 8 weeks up to `end`."""
+    e = _date.fromisoformat(end)
+    start = e - timedelta(days=e.weekday() + 7 * 7)
+    w, a = "day BETWEEN ? AND ? AND phase='delivered'", [start.isoformat(), end]
+    if city:
+        w += " AND city=?"; a.append(city)
+    per = {r["wk"]: (r["long"] or 0, r["n"] or 0) for r in store._rows(
+        "SELECT CAST((julianday(day) - julianday(?)) / 7 AS INTEGER) AS wk, SUM(kitchen_wait >= ?) AS long, COUNT(*) AS n "
+        f"FROM orders WHERE {w} GROUP BY wk", [start.isoformat(), minutes] + a)}
+    return [{"label": (start + timedelta(days=7 * i)).strftime("%d %b").lstrip("0"), "long": per.get(i, (0, 0))[0],
+             "orders": per.get(i, (0, 0))[1]} for i in range(8)]
+
+
+def _v2_all_restaurants(period: str, city: str, m: int, frm: str, to: str, now: datetime) -> dict:
+    """All restaurants together: the totals of the ranking, wait by hour (day cube), long waits per week, and the
+    latest long-wait orders (newest first, read straight from the stored columns — no order is loaded). The PDF
+    and the CSV export carry every one."""
+    P = analytics.resolve(period, now, frm, to)
+    summ = _v2_restaurants_data(period=period, city=city, minutes=m, frm=frm, to=to)
+    hs = {}
+    for d in analytics._days(P["a"], P["b"]):
+        for row in analytics.perf_day(store, rules, d, P["today"])["rows"]:
+            if (city and row[0] != city) or row[1] is None:
+                continue
+            x = hs.setdefault(row[1], [0.0, 0])
+            x[0] += row[2 + analytics.I["wt_s"]]; x[1] += row[2 + analytics.I["wt_n"]]
+    by_hour = [{"hour": h, "avg": round(v[0] / v[1], 1), "n": v[1]} for h, v in sorted(hs.items()) if v[1]]
+    slow = max((b for b in by_hour if b["n"] >= 5), key=lambda b: b["avg"], default=None)
+    rows = []
+    # still waiting right now (today)
+    if P["has_today"]:
+        for o in live_orders(city):
+            if o["phase"] == "at_restaurant" and o.get("at_restaurant_at") and not o.get("picked_up_at"):
+                w = mins(o["at_restaurant_at"], now)
+                if w >= m:
+                    rows.append({"date": o["at_restaurant_at"].astimezone(BERLIN).strftime("%a %d.%m."), "ref": o.get("ref") or "",
+                                 "restaurant": o.get("restaurant") or "?", "city": city_of(o), "rider": o.get("rider") or "–",
+                                 "dispatched": hm(o.get("dispatched_at")), "accepted": hm(o.get("accepted_at")), "arrived": hm(o["at_restaurant_at"]),
+                                 "picked": "–", "wait": int(round(w)), "delivered": "–", "ptod": "–", "note": "still waiting",
+                                 "id": o["id"], "mt_url": mt_link(o)})
+        rows.sort(key=lambda r: -r["wait"])
+    w, a = "day BETWEEN ? AND ? AND phase='delivered' AND kitchen_wait >= ?", [P["a"], P["b"], m]
+    if city:
+        w += " AND city=?"; a.append(city)
+    for r in store._rows("SELECT id, ref, rider, restaurant, city, dispatched_at, accepted_at, picked_up_at, delivered_at, ptod_min, kitchen_wait, "
+                         "(SELECT COUNT(*) FROM handbacks h WHERE h.order_id = orders.id) AS hb "
+                         f"FROM orders WHERE {w} ORDER BY picked_up_at DESC LIMIT ?", a + [ALL_ROWS_MAX]):
+        pick, kw = ts(r["picked_up_at"]), r["kitchen_wait"] or 0
+        arrived = pick - timedelta(minutes=kw) if pick else None          # the FIRST rider's arrival (kitchen_wait starts there)
+        rows.append({"date": (arrived or pick or now).astimezone(BERLIN).strftime("%a %d.%m."), "ref": r["ref"] or "",
+                     "restaurant": r["restaurant"] or "?", "city": r["city"] or "", "rider": r["rider"] or "–",
+                     "dispatched": hm(ts(r["dispatched_at"])), "accepted": hm(ts(r["accepted_at"])), "arrived": hm(arrived), "picked": hm(pick),
+                     "wait": int(round(kw)), "delivered": hm(ts(r["delivered_at"])),
+                     "ptod": f"{round(r['ptod_min'])} min" if r["ptod_min"] is not None else "–",
+                     "note": (f"handed back {r['hb']}×" if r["hb"] else ""), "id": r["id"],
+                     "mt_url": mt_link({"id": r["id"]})})
+    return {"name": "*", "all": True, "city": city, "n": summ["n"], "of_all": summ["reached"], "share": summ["share"], "avg": summ["avg"],
+            "max": summ["max"], "max_where": summ["max_where"], "restaurants": summ["restaurants"], "rows": rows,
+            "rows_capped": summ["n"] > len(rows), "min_wait": m, "by_hour": by_hour,
+            "weeks": _v2_waits_per_week(end=P["b"], city=city, minutes=m), "slowest_hour": slow["hour"] if slow else None, "period": P}
+
+
+@app.get("/export/waits.csv", dependencies=[Depends(require_login)])
+async def export_waits_csv(period: str = "today", city: str = "", minutes: int = 10, restaurant: str = None,
+                           frm: str = Query("", alias="from"), to: str = ""):
+    """Every long-wait order (all restaurants, or one) as a CSV for Excel — the same orders as the PDF."""
+    _v2_check(period, frm, to)
+    from starlette.concurrency import run_in_threadpool
+    import csv as _csv
+    import io as _io
+    m = max(1, min(120, int(minutes or 10)))
+    data = await run_in_threadpool(lambda: _waits_data(period, city, m, frm, to, restaurant=restaurant))
+    buf = _io.StringIO()
+    wr = _csv.writer(buf, delimiter=";")
+    wr.writerow(["Restaurant", "City", "Date", "Order", "Rider", "Dispatched", "Accepted", "Arrived", "Picked up", "Waited (min)",
+                 "Delivered", "Delivery time", "Note"])
+    for g in data["groups"]:
+        for r in g["rows"]:
+            wr.writerow([g["restaurant"], g["city"], r[0], r[1], r[2], r[3], r[4], r[5], r[6], str(r[7]).split()[0], r[8], r[9], r[10]])
+    slug = _file_slug
+    span = f"{min(frm, to)}_{max(frm, to)}" if frm and to else period
+    name = f'quickzi-long-waits-{slug(restaurant) + "-" if restaurant else ""}{slug(city)}-{span}.csv'
+    return _Response(content=("\ufeff" + buf.getvalue()).encode("utf-8"), media_type="text/csv",
+                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @report_cache(30, 900, live_if=_v2_rider_ttl)
@@ -3772,6 +4004,85 @@ def _v2_restaurant_list() -> list:
     rows = store._rows("SELECT restaurant, city, COUNT(*) AS n FROM orders WHERE day >= ? AND restaurant IS NOT NULL AND restaurant != '' "
                        "GROUP BY restaurant, city ORDER BY n DESC", (day_key(datetime.now(UTC) - timedelta(days=14)),))
     return [(r["restaurant"], r["city"] or "", r["n"], (r["restaurant"] + " " + (r["city"] or "")).lower()) for r in rows]
+
+
+@app.get("/api/v2/staffing", dependencies=[Depends(require_login)])
+@fast_json
+@report_cache(60, 60)
+def api_v2_staffing(day: str = "", city: str = ""):
+    """Forecast for one day (default tomorrow): orders and riders needed per hour, per city, with the weather and the
+    shift sheet — only shown here, nobody is messaged. Also the next 7 days at a glance."""
+    if day:
+        try:
+            _date.fromisoformat(day)
+        except ValueError:
+            raise HTTPException(400, "day must be YYYY-MM-DD")
+    now = datetime.now(UTC)
+    today = day_key(now)
+    T = day or (_date.fromisoformat(today) + timedelta(days=1)).isoformat()
+    out = analytics.forecast(store, rules, now, T, city, shifts=store.shifts_between(T, T, city=city))
+    week = []
+    for i in range(7):
+        d = (_date.fromisoformat(today) + timedelta(days=i)).isoformat()
+        f = out if d == out["day"] else analytics.forecast(store, rules, now, d, city, shifts=store.shifts_between(d, d, city=city))
+        week.append({"day": d, "weekday": f["weekday"], "label": f["label"], "orders": f["totals"]["orders"],
+                     "peak_needed": f["totals"]["peak_needed"], "rider_hours": f["totals"]["rider_hours"],
+                     "gap_hours": f["totals"]["gap_hours"], "rain_cities": sum(1 for c in f["cities"] if c["rain_hours"])})
+    out["week"] = week
+    out["weather"]["updated"] = (STATE.get("weather") or {}).get("at")
+    out["generated"] = iso(now)
+    return out
+
+
+def _evidence_range(period: str, frm: str, to: str, now: datetime) -> tuple:
+    P = analytics.resolve(period or "lastweek", now, frm, to)
+    return P, P["a"], P["b"]
+
+
+@report_cache(120, 900, live_if=_v2_live_if)
+def _v2_evidence_data(period: str = "lastweek", city: str = "", frm: str = "", to: str = "") -> dict:
+    now = datetime.now(UTC)
+    P, a, b = _evidence_range(period, frm, to, now)
+    out = analytics.evidence(store, rules, now, a, b, city)
+    out["period"] = P
+    return out
+
+
+@app.get("/api/v2/evidence", dependencies=[Depends(require_login)])
+@fast_json
+def api_v2_evidence(period: str = "lastweek", city: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    """Late deliveries caused by restaurant waiting — the evidence for Lieferando (no customer data, no rider names)."""
+    _v2_check(period, frm, to)
+    return _v2_evidence_data(period=period, city=city, frm=frm, to=to)
+
+
+@app.get("/export/evidence.pdf", dependencies=[Depends(require_login)])
+async def export_evidence_pdf(period: str = "lastweek", city: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    _v2_check(period, frm, to)
+    from starlette.concurrency import run_in_threadpool
+    data = await run_in_threadpool(lambda: _v2_evidence_data(period=period, city=city, frm=frm, to=to))
+    data = dict(data, created=datetime.now(UTC).astimezone(BERLIN).strftime("%d %b %Y %H:%M"), kind="evidence")
+    body = await _render_pdf_elsewhere(data)
+    name = f'quickzi-evidence-{_file_slug(city)}-{data["from"]}_{data["to"]}.pdf'
+    return _Response(content=body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.get("/export/evidence.csv", dependencies=[Depends(require_login)])
+def export_evidence_csv(period: str = "lastweek", city: str = "", frm: str = Query("", alias="from"), to: str = ""):
+    _v2_check(period, frm, to)
+    import csv as _csv
+    import io as _io
+    data = _v2_evidence_data(period=period, city=city, frm=frm, to=to)
+    buf = _io.StringIO()
+    wr = _csv.writer(buf, delimiter=";")
+    wr.writerow(["Date", "Order", "City", "Restaurant", "Dispatched", "Accepted", "Rider at restaurant", "Min after dispatch", "Picked up",
+                 "Waited (min)", "Kitchen delay (min)", "Delivered", "Delivery time (min)", "Without the kitchen delay (min)", "Note"])
+    for r in data["rows"]:
+        wr.writerow([r["date"], r["ref"], r["city"], r["restaurant"], r["dispatched"], r["accepted"], r["arrived"], r["to_rest"], r["picked"],
+                     r["wait"], r["delay"], r["delivered"], r["ptod"], r["without"], r["note"]])
+    name = f'quickzi-evidence-{_file_slug(city)}-{data["from"]}_{data["to"]}.csv'
+    return _Response(content=("\ufeff" + buf.getvalue()).encode("utf-8"), media_type="text/csv",
+                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.get("/api/v2/search", dependencies=[Depends(require_login)])

@@ -23,6 +23,33 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
+## 9.5.0 — Staffing forecast · Lieferando evidence pack · Monday waiting report in Slack
+
+* **Staffing (key 6)** — orders and riders needed per city and hour for tomorrow (or any of the next 7 days, ← →).
+  Orders = the last 4 same weekdays (40 · 30 · 20 · 10 %) × the city's trend of the last 7 days (max ±15 %) × the
+  weather in that hour. **Riders needed are worked out per city from its own history**: orders in the hour × the
+  minutes a delivery really takes a rider in that city at that hour (accept → restaurant → waiting → ride → hand-over,
+  same weekdays; orders a rider carries together count once) ÷ 48 (a rider is busy ~80 % of an hour). Cities are
+  planned one by one and then added up. The grid "Riders needed per city, hour by hour" shows every city at a glance;
+  with a shift sheet it marks hours with fewer riders planned than needed. Only shown in the dashboard — no rider is
+  messaged. Weather: Deutscher Wetterdienst via Bright Sky (free, no key), refreshed every hour.
+* **Evidence pack (key 7)** — per week, every late order where the rider was at the restaurant within 20 min and the
+  kitchen made him wait 10+ min, and the order would have been on time without that waiting. Timeline per order
+  (dispatched, accepted, at restaurant, picked up, delivered), per-restaurant totals, "within 30′ would have been X %".
+  PDF and CSV to send to Lieferando. Order numbers, restaurants and times only — no customer data, no rider names.
+* **Monday report in Slack** — Mondays from 08:30 (Tuesday if missed), once per week, to your own Slack channel:
+  average restaurant wait, rider-hours lost, the 5 restaurants that cost the most rider time (with their slowest
+  hour), getting worse / better, cities with the longest waits, the evidence summary and 3 actions. Settings → Slack:
+  "Monday report" on/off, preview and "send now". No customer data.
+
+## 9.4.1 — Restaurants: "All restaurants"
+
+* The ranking starts with **All restaurants** (selected when the page opens): every long-wait order of the period and
+  city with its restaurant, wait by hour and long waits per week for all restaurants together, PDF and CSV of all.
+  Click a restaurant to see only that one; ↑ ↓ move between "All" and the restaurants.
+* New download: /export/waits.csv — every long-wait order (all restaurants or one) for Excel.
+* File names keep umlauts readable (muenchen instead of m-nchen).
+
 ## 9.4.0 — one dashboard, one design
 
 * Every page now has the premium look of /v2: the same left sidebar everywhere (Now · City board · Performance ·

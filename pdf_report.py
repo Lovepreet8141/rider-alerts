@@ -135,7 +135,120 @@ def _latin(s) -> str:
     return s.encode("latin-1", "replace").decode("latin-1")
 
 
+def _setup(pdf):
+    if os.path.exists(FONT) and os.path.exists(FONT_B):            # every letter (ệ, ş, ł, ...)
+        pdf.add_font("DejaVu", "", FONT); pdf.add_font("DejaVu", "B", FONT_B)
+        return "DejaVu", (lambda s: str(s if s is not None else ""))
+    return "Helvetica", (lambda s: _latin(s if s is not None else ""))
+
+
+def render_evidence(data: dict) -> bytes:
+    """Late deliveries caused by restaurant waiting — the evidence for Lieferando. Only order numbers, restaurants
+    and times: no customer data, no rider names."""
+    from datetime import date as _dt
+    pdf = _Doc(orientation="L", format="A4")
+    fam, T = _setup(pdf)
+    pdf.fam, pdf.txt = fam, T
+    d = lambda s: _dt.fromisoformat(s).strftime("%a %d %b %Y")
+    span = d(data["from"]) + ("" if data["from"] == data["to"] else " – " + d(data["to"]))
+    where = data.get("city") or "All cities"
+    title = f"Quickzi – late deliveries caused by restaurant waiting – {where} – {span}"
+    pdf.title_line = title
+    pdf.set_title(T(title)); pdf.set_author("Quickzi")
+    pdf.set_auto_page_break(True, margin=13)
+    pdf.set_margins(12, 11, 12)
+    pdf.add_page()
+    W = pdf.w - 24
+
+    def fit(text, width):
+        text = T(text)
+        if not text or pdf.get_string_width(text) <= width:
+            return text
+        while text and pdf.get_string_width(text + "…") > width:
+            text = text[:-1]
+        return text + "…"
+
+    tgt, n = data["target"], data["n"]
+    pdf.set_fill_color(*PURPLE); pdf.rect(0, 0, pdf.w, 3, "F")
+    pdf.set_font(fam, "B", 18); pdf.set_text_color(*INK)
+    pdf.cell(0, 10, T("Late deliveries caused by restaurant waiting"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font(fam, "", 9.5); pdf.set_text_color(*GREY)
+    pdf.cell(0, 5.5, T(f"Quickzi  ·  {where}  ·  {span}  ·  created {data.get('created', '')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    # ---- the numbers
+    boxes = [("Delivered", _num(data["delivered"])), (f"Late (over {tgt} min)", _num(data["late"])),
+             ("Late because of the restaurant", f"{_num(n)}" + (f"  ({data['late_share']} % of late)" if data.get("late_share") is not None else "")),
+             ("Restaurant delay, total", f"{_num(round(data['delay_min'] / 60))} h"),
+             (f"Within {tgt} min", f"{data['within_pct']} %  →  {data['within_if_excused']} %" if data.get("within_pct") is not None else "–")]
+    bw = (W - 4 * 3) / 5
+    y = pdf.get_y()
+    for i, (lab, val) in enumerate(boxes):
+        x = 12 + i * (bw + 3)
+        pdf.set_fill_color(*LILAC); pdf.rect(x, y, bw, 17, "F")
+        pdf.set_xy(x + 3, y + 2.5); pdf.set_font(fam, "", 8.5); pdf.set_text_color(*GREY); pdf.cell(bw - 6, 4, fit(lab, bw - 6))
+        pdf.set_xy(x + 3, y + 8); pdf.set_font(fam, "B", 13 if len(val) < 18 else 11); pdf.set_text_color(*INK); pdf.cell(bw - 6, 6, fit(val, bw - 6))
+    pdf.set_xy(12, y + 20)
+    pdf.set_font(fam, "", 8.5); pdf.set_text_color(*GREY)
+    pdf.multi_cell(0, 4.4, T(
+        f"Which orders are listed: delivered more than {tgt} min after dispatch, AND the rider reached the restaurant at most "
+        f"{data['arrive_max']} min after dispatch, AND waited {data['min_wait']} min or more for the food (first rider's arrival → pickup; "
+        f"a rider who gave up and handed the order back still counts), AND without the waiting beyond a normal {data['normal']}-minute "
+        f"hand-over the order would have been delivered within {tgt} min. Restaurant delay = waiting minus {data['normal']} min. "
+        f"\"Within {tgt} min\" shows the share of delivered orders on target now → if these orders are excused. "
+        "All times are Berlin time, recorded from the dispatch system's events. No customer data and no rider names are included."),
+        new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    def table_head(cols, widths, aligns, size):
+        pdf.set_font(fam, "B", size); pdf.set_fill_color(*PURPLE); pdf.set_text_color(255, 255, 255)
+        for c, w, a in zip(cols, widths, aligns):
+            pdf.cell(w, 5.6, T(c), align=a, fill=True)
+        pdf.ln(5.6)
+        pdf.set_font(fam, "", size); pdf.set_text_color(*INK); pdf.set_fill_color(*LILAC)
+
+    if not n:
+        pdf.set_font(fam, "B", 12); pdf.set_text_color(*INK)
+        pdf.cell(0, 8, T("No late delivery in this period was caused by restaurant waiting."), new_x="LMARGIN", new_y="NEXT")
+        return bytes(pdf.output())
+    pdf.set_font(fam, "B", 11); pdf.set_text_color(*INK)
+    pdf.cell(0, 7, T(f"By restaurant ({len(data['restaurants'])})"), new_x="LMARGIN", new_y="NEXT")
+    rc = ("Restaurant", "City", "Late orders", "Avg wait", "Restaurant delay")
+    rw = (W - 60 - 30 * 3, 60, 30, 30, 30)
+    ra = ("L", "L", "R", "R", "R")
+    table_head(rc, rw, ra, 8.5)
+    for i, g in enumerate(data["restaurants"]):
+        if pdf.get_y() + 5 > pdf.page_break_trigger:
+            pdf.add_page(); table_head(rc, rw, ra, 8.5)
+        vals = (g["restaurant"], g["city"], str(g["n"]), f"{g['avg_wait']} min", f"{_num(g['delay'])} min")
+        for v, w, a in zip(vals, rw, ra):
+            pdf.cell(w, 5, fit(v, w - 1.5) if a == "L" else T(v), align=a, fill=(i % 2 == 1))
+        pdf.ln(5)
+    # ---- every order
+    pdf.add_page()
+    pdf.set_font(fam, "B", 11); pdf.set_text_color(*INK)
+    pdf.cell(0, 7, T(f"All {_orders(n)}"), new_x="LMARGIN", new_y="NEXT")
+    oc = ("Date", "Order", "City", "Restaurant", "Dispatched", "Accepted", "At restaurant", "Picked up", "Waited", "Delay",
+          "Delivered", "Delivery time", "Without delay", "Note")
+    fixed = (18, 17, 26, 0, 16, 15, 22, 16, 13, 12, 16, 19, 19, 30)
+    rest_w = W - sum(fixed)
+    ow = tuple(rest_w if w == 0 else w for w in fixed)
+    oa = ("L", "L", "L", "L", "R", "R", "R", "R", "R", "R", "R", "R", "R", "L")
+    H = 4.7
+    table_head(oc, ow, oa, 7.4)
+    for i, r in enumerate(data["rows"]):
+        if pdf.get_y() + H > pdf.page_break_trigger:
+            pdf.add_page(); table_head(oc, ow, oa, 7.4)
+        vals = (r["day"], r["ref"], r["city"], r["restaurant"], r["dispatched"], r["accepted"], f"{r['arrived']} (+{r['to_rest']})", r["picked"],
+                f"{r['wait']} min", f"{r['delay']} min", r["delivered"], f"{r['ptod']} min", f"{r['without']} min", r["note"])
+        for j, (v, w, a) in enumerate(zip(vals, ow, oa)):
+            pdf.cell(w, H, fit(v, w - 1.4) if a == "L" else T(v), align=a, fill=(i % 2 == 1))
+        pdf.ln(H)
+    return bytes(pdf.output())
+
+
 def render(data: dict) -> bytes:
+    if data.get("kind") == "evidence":
+        return render_evidence(data)
     pdf = _Doc(orientation="L", format="A4")
     if os.path.exists(FONT) and os.path.exists(FONT_B):            # every letter (ệ, ş, ł, ...)
         pdf.add_font("DejaVu", "", FONT); pdf.add_font("DejaVu", "B", FONT_B)

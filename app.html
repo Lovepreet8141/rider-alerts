@@ -195,6 +195,8 @@ button.chip:hover{border-color:var(--edge2);color:#fff}
 .rank{width:100%;display:flex;align-items:center;gap:12px;padding:10px 12px;border:0;border-radius:12px;color:var(--text);min-height:54px;margin-top:2px;background:transparent;text-align:left;transition:background .15s}
 .rank:hover{background:#171323}
 .rank[aria-pressed=true]{background:var(--sel);box-shadow:inset 0 0 0 1px var(--selEdge)}
+.rank.allrow{border-bottom:1px solid var(--hair);border-radius:12px 12px 0 0;margin-bottom:4px}
+.rank.allrow[aria-pressed=true]{border-radius:12px;background:linear-gradient(90deg,#241A40,#1D1630)}
 .av{flex:0 0 32px;height:32px;border-radius:50%;background:var(--sel);color:var(--accentText);font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 0 0 1px var(--selEdge)}
 .selcard{background:linear-gradient(180deg,#191329,#15111F 30%);border:1px solid var(--selEdge);border-radius:var(--r);padding:20px;display:flex;flex-direction:column;gap:16px;box-shadow:0 0 0 4px rgba(143,91,255,.06),0 20px 50px rgba(0,0,0,.25);min-width:0}
 .selcard h2{margin:0;font-size:16px;font-weight:600;letter-spacing:-.01em}
@@ -211,6 +213,10 @@ button.chip:hover{border-color:var(--edge2);color:#fff}
 .check-item{display:flex;align-items:center;gap:12px;background:var(--raise);border:1px solid var(--line);border-radius:14px;padding:10px 12px;animation:fade .4s ease both}
 .check-item .w{flex:1 1 auto;min-width:0}.check-item .w b{display:block;font-size:14px}.check-item .w span{display:block;font-size:12px;color:var(--text2)}
 .badge{font-size:12px;font-weight:600;color:var(--amberText);background:var(--amberBg);border-radius:999px;padding:3px 9px}
+.wday{flex:1 1 120px;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px;color:var(--text);text-align:left;transition:border-color .2s,background .2s}
+.wday b{font-size:20px;font-weight:600;letter-spacing:-.02em}
+.wday:hover{border-color:var(--edge2)}
+.wday.on{background:var(--sel);border-color:var(--selEdge);box-shadow:0 0 0 3px rgba(143,91,255,.08)}
 .fleet{flex:1 1 230px;min-width:0;background:var(--raise);border:1px solid var(--line);border-radius:14px;padding:16px;transition:border-color .2s}
 .fleet:hover{border-color:var(--selEdge)}
 .fm{display:flex;align-items:center;gap:10px;font-size:12px}.fm span{flex:0 0 82px;color:var(--text2)}.fm b{flex:0 0 40px;text-align:right;font-weight:600}
@@ -292,12 +298,16 @@ button.chip:hover{border-color:var(--edge2);color:#fff}
   .tile svg.sp{width:calc(100% + 28px);margin:8px -14px 0;height:36px}
   .mini{flex:1 1 150px;flex-direction:column;align-items:flex-start;gap:6px;padding:12px 14px}.mini b{font-size:22px}
   .tblin{min-width:0!important}.hm{display:none!important}.rank .cb{display:none!important}
+  .tblin.keep{min-width:var(--mw)!important}
   .mbrand{display:flex!important}
   .hbar{flex-wrap:wrap;gap:4px 12px}.hbar .lb{flex-basis:100%}
   .scat{height:300px}.scat .q{font-size:10px;max-width:44%;line-height:1.25}
 }
 @media (max-width:520px){ .filters{width:100%} .seg{width:100%} .seg button{flex:1 1 auto;padding:0 8px} .sel{flex:1 1 140px;max-width:none} .search{flex-basis:100%;order:3} }
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+.stick{position:sticky;left:0;z-index:2;background:var(--card);align-self:stretch;display:flex;align-items:center}
+.gc{display:flex;align-items:center;justify-content:center;height:28px;border-radius:7px;font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--text)}
+.gc:focus-visible{outline:2px solid var(--accentText);outline-offset:1px}
 </style>
 </head>
 <body>
@@ -356,7 +366,7 @@ const ICON = {
   search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.5-3.5",
   city: "M12 21s-7-6.2-7-11a7 7 0 1 1 14 0c0 4.8-7 11-7 11zM12 12.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z",
   rep: "M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7", shifts: "M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",
-  fleet: "M3 17h18M5 17V9l7-5 7 5v8M9 17v-5h6v5", ins: "M12 3a6 6 0 0 0-3 11v3h6v-3a6 6 0 0 0-3-11zM10 21h4", menu: "M4 7h16M4 12h16M4 17h16"
+  fleet: "M3 17h18M5 17V9l7-5 7 5v8M9 17v-5h6v5", staff: "M3 20h18M6 16V9M10 16V5M14 16v-6M18 16v-9", proof: "M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4", ins: "M12 3a6 6 0 0 0-3 11v3h6v-3a6 6 0 0 0-3-11zM10 21h4", menu: "M4 7h16M4 12h16M4 17h16"
 };
 const svgI = (d, s = 18) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" aria-hidden="true"><path d="${d}"/></svg>`;
 const NAV = [                                       // the same sidebar as the live pages (dashboard.html)
@@ -365,6 +375,8 @@ const NAV = [                                       // the same sidebar as the l
   {id: "performance", label: "Performance", href: "#performance", icon: ICON.perf},
   {id: "restaurants", label: "Restaurants", href: "#restaurants", icon: ICON.rest},
   {id: "riders", label: "Riders & fleets", href: "#riders", icon: ICON.riders},
+  {id: "staffing", label: "Staffing", href: "#staffing", icon: ICON.staff},
+  {id: "evidence", label: "Evidence pack", href: "#evidence", icon: ICON.proof},
   {id: "orders", label: "Orders", href: "/#orders", icon: ICON.orders, ext: true},
   {id: "intercom", label: "Intercom bot", href: "/#intercom", icon: ICON.ic, ext: true},
   {id: "daily", label: "Reports", href: "/#daily", icon: ICON.rep, ext: true},
@@ -397,6 +409,7 @@ function readHash() {
   const p = new URLSearchParams(qs || "");
   S.period = p.get("period") || "today"; S.city = p.get("city") || ""; S.from = p.get("from") || ""; S.to = p.get("to") || "";
   S.fleet = p.get("fleet") || ""; S.min = +(p.get("min") || 10) || 10; S.sel = p.get("sel") || "";
+  S.sday = p.get("day") || ""; S.wk = p.get("wk") || "";
 }
 function hashFor(page) {
   const p = new URLSearchParams();
@@ -404,6 +417,9 @@ function hashFor(page) {
   if (S.city) p.set("city", S.city);
   if (page === "riders" && S.fleet) p.set("fleet", S.fleet);
   if (page === "restaurants") { if (S.min !== 10) p.set("min", S.min); if (S.sel) p.set("sel", S.sel); }
+  if (page === "staffing" || page === "evidence") { p.delete("period"); p.delete("from"); p.delete("to"); }
+  if (page === "staffing" && S.sday) p.set("day", S.sday);
+  if (page === "evidence" && S.wk) p.set("wk", S.wk);
   const q = p.toString(); return "#" + page + (q ? "?" + q : "");
 }
 function qs(extra = {}) {
@@ -454,7 +470,7 @@ let PF = null;
 function prefetch() {
   clearTimeout(PF);
   PF = setTimeout(() => {
-    for (const id of Object.keys(PAGES)) {
+    for (const id of ["performance", "restaurants", "riders"]) {
       if (id === S.page) continue;
       const url = PAGES[id].url(), hit = CACHE.get(url);
       if (!hit || Date.now() - hit.t > PAGES[id].fresh) api(url).catch(() => {});
@@ -554,9 +570,9 @@ function ylabels(max, ticks, h, bottom = 22) {
 /* ======================================================================== shell: nav, filters, systems */
 function renderNav() {
   const a = (n, i, cls) => `<a href="${n.href}" data-nav="${n.id}" class="${cls || ""}" ${S.page === n.id ? 'aria-current="page"' : ""}>${svgI(n.icon)}<span>${n.label}</span>${i != null ? `<kbd>${i + 1}</kbd>` : ""}</a>`;
-  $("#nav").innerHTML = NAV.map((n, i) => `${i === 2 || i === 5 ? '<div class="navsep"></div>' : ""}${a(n, i)}`).join("") +
+  $("#nav").innerHTML = NAV.map((n, i) => `${i === 2 || i === 7 ? '<div class="navsep"></div>' : ""}${a(n, i < 9 ? i : null)}`).join("") +
     `<div class="navh">More</div>` + MORE.map(n => a(n, null, "more")).join("");
-  const tabs = [NAV[0], NAV[1], NAV[2], NAV[5]];
+  const tabs = ["now", "live", "performance", "orders"].map(id => NAV.find(n => n.id === id));
   $("#tabbar").innerHTML = tabs.map(n => `<a href="${n.href}" data-nav="${n.id}" ${S.page === n.id ? 'aria-current="page"' : ""}>${svgI(n.icon, 20)}<span>${n.id === "live" ? "City" : n.label}</span></a>`).join("") +
     `<button type="button" data-act="menu">${svgI(ICON.menu, 20)}<span>Menu</span></button>`;
 }
@@ -730,7 +746,8 @@ function openExport() {
   const m = $("#exMenu"); if (!m.classList.contains("hidden")) return closeMenus();
   closeMenus();
   const lab = LASTP ? LASTP.label : "this period", multi = S.from && S.to && S.from !== S.to;
-  m.innerHTML = `<button type="button" role="menuitem" data-ex="pdf"><b>Long restaurant waits · PDF</b><small>${esc(lab)} · ${esc(S.city || "all cities")} · ${S.min || 10}+ min</small></button>
+  const ev = S.page === "evidence" ? `<button type="button" role="menuitem" data-act="epdf"><b>Evidence for Lieferando · PDF</b><small>${dm(EVID.wk())} – ${dm(addDays(EVID.wk(), 6))} · ${esc(S.city || "all cities")}</small></button><button type="button" role="menuitem" data-act="ecsv"><b>Evidence · CSV</b><small>the same orders for Excel</small></button>` : "";
+  m.innerHTML = ev + `<button type="button" role="menuitem" data-ex="pdf"><b>Long restaurant waits · PDF</b><small>${esc(lab)} · ${esc(S.city || "all cities")} · ${S.min || 10}+ min</small></button>
     <button type="button" role="menuitem" data-ex="last"><b>Last week, Monday – Sunday · PDF</b><small>every order that waited ${S.min || 10}+ min</small></button>
     <button type="button" role="menuitem" data-ex="csv" ${multi ? "disabled" : ""}><b>All orders · CSV</b><small>${multi ? "pick a named period or one day" : esc(lab)}</small></button>`;
   m.classList.remove("hidden"); $("#btnExport").setAttribute("aria-expanded", "true"); m.querySelector("button").focus();
@@ -896,7 +913,7 @@ const REST = {
     return `<div class="head"><div><div class="over">Restaurants</div><h1>Where riders wait</h1><div class="sub" id="rSub">&nbsp;</div></div><div class="filters" id="filters">${this.filters()}</div></div>
       <section class="row data" id="rKpi" aria-label="Key numbers">${[1, 2, 3, 4].map(() => `<div class="tile plain"><div class="sk" style="height:14px;width:60%"></div><div class="sk" style="height:44px;width:50%;margin-top:12px"></div></div>`).join("")}</section>
       <section class="row data" style="align-items:flex-start">
-        <div class="card" style="flex:3 1 640px"><div class="ch"><h2>Ranking</h2><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="muted" style="font-size:12px">most long waits first · select one</span><label class="sr" for="rQ">Filter restaurants</label><input id="rQ" class="filterin" type="search" placeholder="Filter restaurants…" value="${esc(RSTATE.q)}"></div></div>
+        <div class="card" style="flex:3 1 640px"><div class="ch"><h2>Ranking</h2><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="muted" style="font-size:12px">all restaurants, or select one</span><label class="sr" for="rQ">Filter restaurants</label><input id="rQ" class="filterin" type="search" placeholder="Filter restaurants…" value="${esc(RSTATE.q)}"></div></div>
           <div class="tbl"><div class="tblin" style="--mw:600px"><div class="th"><span style="flex:0 0 26px">#</span><span style="flex:1 1 200px">Restaurant</span><span class="cb" style="flex:0 0 128px">Long waits</span><span class="cb" style="flex:0 0 128px">Of its orders</span><span style="flex:0 0 46px" class="r">Avg</span><span style="flex:0 0 58px" class="r">Longest</span></div><div id="rRank"><div class="sk" style="height:480px;margin-top:8px"></div></div></div></div><div id="rMore"></div></div>
         <aside class="selcard" style="flex:2 1 380px" id="rSel" aria-label="Selected restaurant"><div class="sk" style="height:480px"></div></aside>
       </section>
@@ -925,8 +942,7 @@ const REST = {
     countUp($("#view"), anim);
     // the selected restaurant
     const groups = d.groups, cur = S.sel && groups.find(g => g.restaurant + "|" + g.city === S.sel);
-    if (!cur && groups.length && !(RSTATE.keep && S.sel)) { S.sel = groups[0].restaurant + "|" + groups[0].city; history.replaceState(null, "", hashFor("restaurants")); this.rank(false); }
-    if (!groups.length) { $("#rSel").innerHTML = `<div class="empty">No restaurant had a wait of ${d.min_wait}+ min in this period.</div>`; $("#rOrders").innerHTML = ""; $("#rOTitle").textContent = "Long-wait orders"; return; }
+    if (S.sel && !cur && !RSTATE.keep) { S.sel = ""; history.replaceState(null, "", hashFor("restaurants")); this.rank(false); }
     RSTATE.keep = false;
     this.detail(o.update);
   },
@@ -940,19 +956,24 @@ const REST = {
     const d = RSTATE.data; if (!d) return;
     const rows = this.shown(), mx = Math.max(1, ...d.groups.slice(0, 1).map(g => g.n));
     const shc = s => s == null ? C.v2 : s >= 60 ? C.bad : s >= 40 ? C.amber : C.v2, sht = s => s == null ? "" : s >= 60 ? "badt" : s >= 40 ? "warnt" : "";
-    $("#rRank").innerHTML = rows.length ? rows.map((g, i) => {
+    const allRow = RSTATE.q.trim() ? "" : `<button type="button" class="rank allrow" data-sel="*" aria-pressed="${!S.sel}"><span style="flex:0 0 26px;font-size:14px;color:var(--accentText)">✦</span>
+        <span class="nm2"><b style="font-size:14px">All restaurants</b><span class="muted" style="font-size:12px">${esc(S.city || "All cities")} · ${N(d.restaurants)} with long waits</span></span>
+        <span class="cb" style="flex:0 0 128px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f" style="width:100%;background:linear-gradient(90deg,${C.accent},${C.at})"></span></span><b style="flex:0 0 40px;text-align:right;font-size:13px">${N(d.n)}</b></span>
+        <span class="cb" style="flex:0 0 128px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f" style="width:${d.share || 0}%;background:${shc(d.share)}"></span></span><b class="${sht(d.share)}" style="flex:0 0 40px;text-align:right;font-size:13px">${P0(d.share)}</b></span>
+        <span class="t2" style="flex:0 0 46px;text-align:right;font-size:13px">${M(d.avg)}</span><b class="${d.max >= 90 ? "badt" : ""}" style="flex:0 0 58px;text-align:right;font-size:13px">${M(d.max)}</b></button>`;
+    $("#rRank").innerHTML = allRow + (rows.length ? rows.map((g, i) => {
       const key = g.restaurant + "|" + g.city, rk = d.groups.indexOf(g) + 1;
       return `<button type="button" class="rank" data-sel="${esc(key)}" aria-pressed="${key === S.sel}"><span style="flex:0 0 26px;font-size:13px;color:var(--muted)">${rk}</span>
         <span class="nm2"><b style="font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(g.restaurant)}</b><span class="muted" style="font-size:12px">${esc(g.city)}</span></span>
         <span class="cb" style="flex:0 0 128px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f ${anim ? "growx" : ""}" style="--i:${i};width:${(g.n / mx * 100).toFixed(1)}%;background:${C.accent}"></span></span><b style="flex:0 0 34px;text-align:right;font-size:13px">${N(g.n)}</b></span>
         <span class="cb" style="flex:0 0 128px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f ${anim ? "growx" : ""}" style="--i:${i};width:${g.share || 0}%;background:${shc(g.share)}"></span></span><b class="${sht(g.share)}" style="flex:0 0 40px;text-align:right;font-size:13px">${P0(g.share)}</b></span>
         <span class="t2" style="flex:0 0 46px;text-align:right;font-size:13px">${M(g.avg)}</span><b class="${g.max >= 90 ? "badt" : ""}" style="flex:0 0 58px;text-align:right;font-size:13px">${M(g.max)}</b></button>`;
-    }).join("") : `<div class="empty">No restaurant matches “${esc(RSTATE.q)}”.</div>`;
+    }).join("") : `<div class="empty">${RSTATE.q ? `No restaurant matches “${esc(RSTATE.q)}”.` : `No restaurant had a wait of ${d.min_wait}+ min in this period.`}</div>`);
     $("#rMore").innerHTML = !RSTATE.q && d.groups.length > 12 ? `<button type="button" class="more" data-act="rall">${RSTATE.all ? "Show the top 12 →" : `Show all ${N(d.groups.length)} restaurants →`}</button>` : "";
   },
   async detail(silent) {
-    if (S.page !== "restaurants" || !S.sel) return;
-    const [name, city] = S.sel.split("|");
+    if (S.page !== "restaurants") return;
+    const key = S.sel, [name, city] = key ? key.split("|") : ["*", S.city];
     const p = new URLSearchParams(S.from && S.to ? {from: S.from, to: S.to} : {period: S.period});
     p.set("name", name); p.set("city", city || ""); p.set("minutes", S.min);
     const url = "/api/v2/restaurant?" + p;
@@ -960,38 +981,49 @@ const REST = {
     if (hit) this.drawDetail(hit.d, !silent);
     else { $("#rSel").style.opacity = ".6"; }
     if (hit && Date.now() - hit.t < 30000) return;
-    try { const dd = await api(url); if (S.page !== "restaurants" || S.sel !== name + "|" + city) return; this.drawDetail(dd, !hit && !silent); }
-    catch (e) { if (!hit && $("#rSel")) $("#rSel").innerHTML = `<div class="errbox">Could not load ${esc(name)}: ${esc(e.message)}</div>`; }
+    try { const dd = await api(url); if (S.page !== "restaurants" || S.sel !== key) return; this.drawDetail(dd, !hit && !silent); }
+    catch (e) { if (!hit && $("#rSel")) $("#rSel").innerHTML = `<div class="errbox">Could not load ${esc(key ? name : "all restaurants")}: ${esc(e.message)}</div>`; }
     finally { const el = $("#rSel"); if (el) el.style.opacity = ""; }
   },
   drawDetail(r, anim) {
     RSTATE.detail = r;
-    const g = RSTATE.data && RSTATE.data.groups.find(x => x.restaurant === r.name && x.city === r.city);
+    const all = !!r.all;
+    const g = !all && RSTATE.data && RSTATE.data.groups.find(x => x.restaurant === r.name && x.city === r.city);
     if (g) r = {...r, n: g.n, share: g.share, avg: g.avg, max: g.max};          // same numbers as its ranking row
     const shc = r.share == null ? "" : r.share >= 60 ? "badt" : r.share >= 40 ? "warnt" : "";
     const bh = r.by_hour.filter(b => b.hour >= 10 && b.hour <= 23), mb = Math.max(1, ...bh.map(b => b.avg)), wk = r.weeks, mw = Math.max(1, ...wk.map(w => w.long));
-    $("#rSel").innerHTML = `<div><div class="over">Selected</div><h2 style="margin:6px 0 2px;font-size:22px;letter-spacing:-.02em">${esc(r.name || "?")}</h2><div class="sub">${esc(r.city)} · ${esc(r.period.label)}</div></div>
-      <div class="row" style="gap:10px"><div class="stat"><div>Long waits</div><b>${N(r.n)}</b></div><div class="stat"><div>Of its orders</div><b class="${shc}">${P0(r.share)}</b></div><div class="stat"><div>Average</div><b>${M(r.avg)}</b></div><div class="stat"><div>Longest</div><b class="${r.max >= 90 ? "badt" : ""}">${M(r.max)}</b></div></div>
-      <div><h3>Average wait by hour</h3><p class="d" style="margin:0 0 12px;font-size:12px">${r.slowest_hour != null && bh.length >= 3 ? `Slowest around ${r.slowest_hour}:00 — send riders a few minutes later at that time.` : "All its delivered orders in the period"}</p>
+    const where = all ? (S.city || "All cities") : r.city;
+    $("#rSel").innerHTML = `<div><div class="over">${all ? "All restaurants" : "Selected"}</div><h2 style="margin:6px 0 2px;font-size:22px;letter-spacing:-.02em">${all ? "All restaurants" : esc(r.name || "?")}</h2><div class="sub">${esc(where)} · ${esc(r.period.label)}</div></div>
+      <div class="row" style="gap:10px"><div class="stat"><div>Long waits</div><b>${N(r.n)}</b></div><div class="stat"><div>${all ? "Of all orders" : "Of its orders"}</div><b class="${shc}">${P0(r.share)}</b></div><div class="stat"><div>Average</div><b>${M(r.avg)}</b></div><div class="stat" ${all && r.max_where ? `title="${esc(r.max_where)}"` : ""}><div>Longest</div><b class="${r.max >= 90 ? "badt" : ""}">${M(r.max)}</b></div></div>
+      <div><h3>Average wait by hour</h3><p class="d" style="margin:0 0 12px;font-size:12px">${r.slowest_hour != null && bh.length >= 3 ? `Slowest around ${r.slowest_hour}:00 — ${all ? "the hour to check kitchens and dispatch timing." : "send riders a few minutes later at that time."}` : all ? "Every delivered order in the period" : "All its delivered orders in the period"}</p>
         ${bh.length ? `<div class="vbars" style="height:120px">${bh.map((b, i) => `<div ${tipAttr([{t: `${b.hour}:00 – ${b.hour + 1}:00`}, {v: M1(b.avg), l: "average wait", k: b.avg >= 20 ? C.amber : C.accent}, {v: N(b.n), l: "orders"}])}><span>${Math.round(b.avg)}</span><i class="${anim ? "grow" : ""}" style="--i:${i};height:${Math.max(2, b.avg / mb * 92)}px;background:${b.avg >= 20 ? C.amber : b.avg >= 10 ? C.v2 : C.v3}"></i></div>`).join("")}</div><div class="vlab">${bh.map(b => `<span>${b.hour}</span>`).join("")}</div>` : `<div class="empty">No delivered orders.</div>`}</div>
-      <div><h3 style="margin-bottom:12px">Long waits per week</h3><div class="vbars" style="height:84px;gap:8px">${wk.map((w, i) => `<div ${tipAttr([{t: "Week of " + w.label}, {v: N(w.long), l: `waited ${r.min_wait}+ min`, k: C.accent}, {v: N(w.orders), l: "delivered orders"}])}><span>${w.long || ""}</span><i class="${anim ? "grow" : ""}" style="--i:${i};height:${Math.max(w.long ? 2 : 0, w.long / mw * 60)}px;background:${i === wk.length - 1 ? C.accent : "#3A2D5C"}"></i></div>`).join("")}</div><div class="vlab" style="gap:8px">${wk.map(w => `<span>${esc(w.label)}</span>`).join("")}</div></div>
-      <div class="row" style="gap:8px"><button type="button" class="btn violet" style="flex:1 1 170px" data-act="rpdf">${svgI("M12 3v12M7 10l5 5 5-5M5 21h14", 16)}PDF for this restaurant</button><button type="button" class="btn ghost" style="flex:1 1 130px" data-act="rcsv" ${r.rows.length ? "" : "disabled"}>CSV of the orders</button></div>`;
-    $("#rOTitle").textContent = `Long-wait orders · ${r.name}, ${r.city}`;
+      <div><h3 style="margin-bottom:12px">Long waits per week</h3><div class="vbars" style="height:84px;gap:8px">${wk.map((w, i) => `<div ${tipAttr([{t: "Week of " + w.label}, {v: N(w.long), l: `waited ${r.min_wait}+ min`, k: C.accent}, {v: N(w.orders), l: "delivered orders"}])}><span>${w.long ? (w.long >= 10000 ? Math.round(w.long / 1000) + "k" : w.long) : ""}</span><i class="${anim ? "grow" : ""}" style="--i:${i};height:${Math.max(w.long ? 2 : 0, w.long / mw * 60)}px;background:${i === wk.length - 1 ? C.accent : "#3A2D5C"}"></i></div>`).join("")}</div><div class="vlab" style="gap:8px">${wk.map(w => `<span>${esc(w.label)}</span>`).join("")}</div></div>
+      <div class="row" style="gap:8px"><button type="button" class="btn violet" style="flex:1 1 170px" data-act="rpdf">${svgI("M12 3v12M7 10l5 5 5-5M5 21h14", 16)}${all ? "PDF of all long waits" : "PDF for this restaurant"}</button><button type="button" class="btn ghost" style="flex:1 1 130px" data-act="rcsv" ${r.n ? "" : "disabled"}>${all ? "CSV of all orders" : "CSV of the orders"}</button></div>`;
+    $("#rOTitle").textContent = all ? `Long-wait orders · all restaurants, ${where}` : `Long-wait orders · ${r.name}, ${r.city}`;
     this.orders();
   },
   orders() {
     const r = RSTATE.detail; if (!r) return;
-    const rows = [...r.rows].reverse(), shown = RSTATE.rowsAll ? rows : rows.slice(0, 20);
-    $("#rOrders").innerHTML = rows.length ? `<div class="tbl"><div class="tblin" style="--mw:1040px"><div class="th"><span style="flex:0 0 84px">Date</span><span style="flex:0 0 86px">Order</span><span style="flex:0 0 110px">Rider</span><span style="flex:0 0 66px" class="r hm">Accepted</span><span style="flex:0 0 66px" class="r">Arrived</span><span style="flex:0 0 74px" class="r hm">Picked up</span><span style="flex:0 0 150px">Waited</span><span style="flex:0 0 70px" class="r hm">Delivered</span><span style="flex:0 0 66px" class="r hm">Total</span><span style="flex:1 1 180px">Note</span><span style="flex:0 0 62px" class="r">Tour</span></div>
-      ${shown.map(x => `<div class="tr ${x.id ? "click" : ""}" ${x.id ? `data-order="${esc(x.id)}"` : ""}><span class="t2" style="flex:0 0 84px">${esc(x.date)}</span><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b><span style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.rider)}</span>
+    const all = !!r.all;
+    const rows = all ? r.rows : [...r.rows].reverse(), shown = RSTATE.rowsAll ? rows : rows.slice(0, 20);
+    const more = rows.length > 20 ? `<button type="button" class="more" data-act="rrows">${RSTATE.rowsAll ? "Show the latest 20 →" : `Show ${all && r.rows_capped ? "the latest " : "all "}${N(rows.length)} orders →`}</button>` : "";
+    const capped = all && r.rows_capped ? `<span class="muted" style="font-size:12px;margin-left:12px">${N(r.n)} long waits in total — the PDF and the CSV have every one</span>` : "";
+    $("#rOrders").innerHTML = rows.length ? `<div class="tbl"><div class="tblin" style="--mw:${all ? 1180 : 1040}px"><div class="th"><span style="flex:0 0 84px">Date</span><span style="flex:0 0 86px">Order</span>${all ? `<span style="flex:1 1 200px">Restaurant</span>` : ""}<span style="flex:0 0 110px">Rider</span><span style="flex:0 0 66px" class="r hm">Accepted</span><span style="flex:0 0 66px" class="r">Arrived</span><span style="flex:0 0 74px" class="r hm">Picked up</span><span style="flex:0 0 150px">Waited</span><span style="flex:0 0 70px" class="r hm">Delivered</span><span style="flex:0 0 66px" class="r hm">Total</span><span style="flex:${all ? "0 1 150px" : "1 1 180px"}" class="hm">Note</span><span style="flex:0 0 62px" class="r">Tour</span></div>
+      ${shown.map(x => `<div class="tr ${x.id ? "click" : ""}" ${x.id ? `data-order="${esc(x.id)}"` : ""}><span class="t2" style="flex:0 0 84px">${esc(x.date)}</span><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${all ? `<span style="flex:1 1 200px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.restaurant)}${S.city ? "" : `<span class="muted" style="font-size:11px"> · ${esc(x.city)}</span>`}</span>` : ""}<span style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.rider)}</span>
         <span class="mono t2 r hm" style="flex:0 0 66px">${esc(x.accepted)}</span><span class="mono t2 r" style="flex:0 0 66px">${esc(x.arrived)}</span><span class="mono t2 r hm" style="flex:0 0 74px">${esc(x.picked)}</span>
         <span style="flex:0 0 150px;display:flex;align-items:center;gap:10px"><span class="track t6"><span class="f" style="width:${Math.min(100, (x.wait || 0) / 60 * 100).toFixed(1)}%;background:${x.wait >= 45 ? C.bad : x.wait >= 30 ? C.amber : C.accent}"></span></span><b style="flex:0 0 36px;text-align:right">${M(x.wait)}</b></span>
-        <span class="mono t2 r hm" style="flex:0 0 70px">${esc(x.delivered)}</span><span class="t2 r hm" style="flex:0 0 66px">${esc(x.ptod)}</span><span class="warnt" style="flex:1 1 180px">${esc(x.note)}</span>
+        <span class="mono t2 r hm" style="flex:0 0 70px">${esc(x.delivered)}</span><span class="t2 r hm" style="flex:0 0 66px">${esc(x.ptod)}</span><span class="warnt hm" style="flex:${all ? "0 1 150px" : "1 1 180px"}">${esc(x.note)}</span>
         <span class="r" style="flex:0 0 62px">${x.mt_url ? `<a href="${esc(x.mt_url)}" target="_blank" rel="noopener" data-stop>Open ↗</a>` : ""}</span></div>`).join("")}</div></div>
-      ${rows.length > 20 ? `<button type="button" class="more" data-act="rrows">${RSTATE.rowsAll ? "Show the latest 20 →" : `Show all ${N(rows.length)} orders →`}</button>` : ""}` : `<div class="empty">No orders.</div>`;
+      ${more}${capped}` : `<div class="empty">No order waited ${r.min_wait}+ min${all ? "" : " at this restaurant"} in this period.</div>`;
   },
   csv() {
-    const r = RSTATE.detail; if (!r || !r.rows.length) return;
+    const r = RSTATE.detail; if (!r) return;
+    if (r.all) {                                       // every long-wait order: built on the server (no 300-row limit)
+      const p = new URLSearchParams(S.from && S.to ? {from: S.from, to: S.to} : {period: S.period});
+      if (S.city) p.set("city", S.city); p.set("minutes", S.min || 10);
+      return download("/export/waits.csv?" + p, "The CSV");
+    }
+    if (!r.rows.length) return;
     const head = ["Date", "Order", "Rider", "Dispatched", "Accepted", "Arrived", "Picked up", "Waited (min)", "Delivered", "Delivery time", "Note"];
     const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const body = [head, ...r.rows.map(x => [x.date, x.ref, x.rider, x.dispatched, x.accepted, x.arrived, x.picked, x.wait, x.delivered, x.ptod, x.note])].map(a => a.map(q).join(";")).join("\r\n");
@@ -999,8 +1031,8 @@ const REST = {
     a.download = `long-waits-${(r.name + "-" + r.city).toLowerCase().replace(/[^a-z0-9]+/g, "-")}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   },
   move(dir) {
-    const rows = this.shown(), i = rows.findIndex(g => g.restaurant + "|" + g.city === S.sel), n = rows[Math.max(0, Math.min(rows.length - 1, i + dir))];
-    if (!n) return; S.sel = n.restaurant + "|" + n.city; RSTATE.rowsAll = false; history.replaceState(null, "", hashFor("restaurants")); this.rank(false); this.detail(false);
+    const keys = ["", ...this.shown().map(g => g.restaurant + "|" + g.city)], i = keys.indexOf(S.sel), n = keys[Math.max(0, Math.min(keys.length - 1, (i < 0 ? 0 : i) + dir))];
+    if (n === undefined || n === S.sel) return; S.sel = n; RSTATE.rowsAll = false; history.replaceState(null, "", hashFor("restaurants")); this.rank(false); this.detail(false);
     const b = $(`.rank[aria-pressed=true]`); if (b) b.scrollIntoView({block: "nearest", behavior: RM ? "auto" : "smooth"});
   }
 };
@@ -1141,11 +1173,169 @@ const RID = {
   }
 };
 
-const PAGES = {performance: PERF, restaurants: REST, riders: RID};
+/* ======================================================================== page: STAFFING (9.5) */
+const WXI = {"clear-day": "☀️", "clear-night": "🌙", "partly-cloudy-day": "⛅", "partly-cloudy-night": "☁️", cloudy: "☁️", fog: "🌫️", wind: "💨",
+             rain: "🌧️", sleet: "🌨️", snow: "❄️", hail: "🌨️", thunderstorm: "⛈️"};
+const berlinToday = () => (META && META.today) || new Date().toLocaleDateString("sv-SE", {timeZone: "Europe/Berlin"});
+const STAFF = {
+  fresh: 60000,
+  url: () => "/api/v2/staffing?" + new URLSearchParams({day: S.sday || addDays(berlinToday(), 1), city: S.city}),
+  filters: () => citySel(),
+  shell() {
+    return `<div class="head"><div><div class="over">Staffing · forecast</div><h1 id="sTitle"><span class="sk" style="display:inline-block;width:300px;height:32px"></span></h1><div class="sub" id="sSub">&nbsp;</div></div><div class="filters" id="filters">${this.filters()}</div></div>
+      <section class="row data" id="sWeek" aria-label="Next 7 days"></section>
+      <section class="row data" id="sKpi" aria-label="Key numbers">${[1, 2, 3, 4].map(() => `<div class="tile plain"><div class="sk" style="height:14px;width:60%"></div><div class="sk" style="height:44px;width:50%;margin-top:12px"></div></div>`).join("")}</section>
+      <section class="card data"><div class="ch"><div><h2>Orders and riders, hour by hour</h2><p class="d" id="sChartSub">Forecast</p></div><div class="legend" id="sLegend"></div></div><div id="sChart" style="margin-top:16px"><div class="sk" style="height:300px"></div></div></section>
+      <section class="card data" id="sGridCard"><div class="ch"><div><h2>Riders needed per city, hour by hour</h2><p class="d">from each city's own orders per hour and delivery time · darker = that city's busiest hours · click a city to plan only it</p></div></div><div id="sGrid" style="margin-top:14px"><div class="sk" style="height:300px"></div></div></section>
+      <section class="card data"><div class="ch"><h2>Cities</h2><span class="muted" style="font-size:12px">click a city to see only it · the most orders first</span></div><div id="sCities"><div class="sk" style="height:300px;margin-top:14px"></div></div></section>
+      <p class="d" id="sNote" style="font-size:12px;color:var(--muted);margin:0"></p>
+      <div class="shortcuts"><span><kbd>←</kbd> <kbd>→</kbd> previous / next day</span><span><kbd>⌘K</kbd> search</span><span>Only shown here — no rider is messaged</span></div>`;
+  },
+  fail(e) { $("#sKpi").innerHTML = `<div class="errbox" style="flex:1">Could not load the forecast: ${esc(e.message)} <button class="btn ghost sm" data-act="retry">Try again</button></div>`; },
+  render(d, o = {}) {
+    const anim = o.anim, T = d.totals, isToday = d.day === d.today;
+    LASTP = {has_today: true, label: "Forecast · " + d.label, a: d.day, b: d.day, days: 1, single: true, today: d.today};
+    $("#sTitle").textContent = (isToday ? "Today · " : d.day === addDays(d.today, 1) ? "Tomorrow · " : "") + longDay(d.day);
+    $("#sSub").textContent = `${S.city || "All cities"} · from the last ${d.basis.length} ${d.weekday}s${d.basis.length ? " (" + d.basis.map(dm).join(", ") + ")" : ""} · recent trend · weather`;
+    $("#sWeek").innerHTML = d.week.map(w => `<button type="button" class="wday ${w.day === d.day ? "on" : ""}" data-sday="${w.day}"><span class="muted" style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase">${w.day === d.today ? "Today" : w.day === addDays(d.today, 1) ? "Tomorrow" : esc(w.weekday.slice(0, 3))} · ${dm(w.day)}</span><b>${N(w.orders)}</b><span class="t2" style="font-size:12px">${w.peak_needed ?? "–"} riders at peak${w.rain_cities ? ` · 🌧️ ${w.rain_cities}` : ""}</span>${w.gap_hours != null ? `<span class="${w.gap_hours < 0 ? "badt" : "good"}" style="font-size:11px">${w.gap_hours < 0 ? "short " + -w.gap_hours : "+" + w.gap_hours} rider-h</span>` : ""}</button>`).join("");
+    const gap = T.gap_hours;
+    $("#sKpi").innerHTML = `
+      <div class="tile plain"><div class="l"><span>Orders expected</span></div><div class="big">${cnt("s.o", T.orders)}</div><div class="s">same ${esc(d.weekday)}s averaged ${N(T.same_day_avg)}</div></div>
+      <div class="tile plain"><div class="l"><span>Busiest hour</span></div><div class="big">${T.peak_hour == null ? "–" : String(T.peak_hour).padStart(2, "0") + ":00"}</div><div class="s">${N(T.peak_orders)} orders expected</div></div>
+      <div class="tile plain"><div class="l"><span>Riders needed at the peak</span></div><div class="big warn">${cnt("s.p", T.peak_needed)}</div><div class="s">${d.min ? `a delivery takes a rider ${F1(d.min)} min${S.city ? " here" : " (avg)"}` : `at ${F1(d.capacity_per_hour)} deliveries per rider-hour (Settings)`}</div></div>
+      <div class="tile plain"><div class="l"><span>Rider-hours needed</span></div><div class="big">${cnt("s.h", T.rider_hours)}</div><div class="s">${gap == null ? "no shift sheet for this day" : `planned ${N(T.planned_hours)} h · <b class="${gap < 0 ? "badt" : "good"}">${gap < 0 ? "short " + N(-gap) : "+" + N(gap)} h</b>`}</div></div>`;
+    this.chart(d, anim); this.grid(d); this.cities(d);
+    const wxN = d.weather.cities, wxAll = d.cities.length;
+    $("#sNote").innerHTML = `How it works: each hour = the last ${d.basis.length || 4} same weekdays (the most recent counts most: 40 · 30 · 20 · 10 %) × the city's trend of the last 7 days (at most ±15 %) × the weather in that hour (${esc(d.weather.rule)})${isToday ? " · hours already over show what really happened, and the rest of today follows how the day is going so far" : ""}. Riders needed = orders in the hour × the minutes a delivery takes a rider in that city at that hour (accept → restaurant → waiting → ride → hand-over, from the same weekdays; orders carried together count once) ÷ ${Math.round(60 * d.busy_share)} (a rider is busy about ${Math.round(100 * d.busy_share)} % of an hour, the rest is waiting for the next order). Each city is planned on its own and the cities are added up${d.no_timing && d.no_timing.length ? ` · no timings yet for ${d.no_timing.map(esc).join(", ")}: ${F1(d.capacity_per_hour)} deliveries per rider-hour (Settings)` : ""}. Weather: ${wxN ? `${wxN} of ${wxAll} cities · ${esc(d.weather.source)}` : "not loaded yet (it refreshes every hour)"}.`;
+    countUp($("#view"), anim);
+  },
+  chart(d, anim) {
+    const H = d.hours.filter(h => h.hour >= 9 && h.hour <= 23), el = $("#sChart");
+    $("#sChartSub").textContent = (S.city ? S.city : "All cities") + " · bar = expected orders · shaded = the lowest–highest of the same weekdays" + (d.day === d.today ? " · solid = what already happened" : "");
+    $("#sLegend").innerHTML = `<span><i style="background:${C.accent}"></i>Expected orders</span><span><i style="background:#3A2D5C"></i>Same-weekday range</span>${d.day === d.today ? `<span><i style="background:${C.good}"></i>Real orders</span>` : ""}`;
+    if (!H.length) { el.innerHTML = `<div class="empty">Not enough history for this day yet.</div>`; return; }
+    const max = niceMax(Math.max(...H.map(h => Math.max(h.hi || 0, h.orders, h.actual || 0))) * 1.05), h = 200;
+    const sheet = d.has_sheet;
+    const rows = [["Riders needed", x => `<b>${x.needed || "·"}</b>`], ["Min per delivery", x => `<span class="t2">${x.min ? Math.round(x.min) : "·"}</span>`], ["Had (same weekdays)", x => `<span class="t2">${x.had ? Math.round(x.had) : "·"}</span>`]];
+    if (sheet) { rows.push(["Planned (sheet)", x => `<span>${x.planned || "·"}</span>`]); rows.push(["Gap", x => { const g = (x.planned || 0) - (x.needed || 0); return x.past ? "" : `<b class="${g < 0 ? "badt" : g > 0 ? "good" : "t2"}">${g > 0 ? "+" + g : g || "0"}</b>`; }]); }
+    if (S.city) rows.push(["Weather", x => x.icon || x.temp != null ? `<span title="${esc((x.cond || "") + (x.mm ? " · " + x.mm + " mm" : ""))}">${WXI[x.icon] || ""}${x.temp != null ? `<span class="t2" style="font-size:10px;display:block">${Math.round(x.temp)}°</span>` : ""}</span>` : `<span class="muted">·</span>`]);
+    else rows.push(["Cities with rain", x => x.rain_cities ? `<span>🌧️ ${x.rain_cities}</span>` : `<span class="muted">·</span>`]);
+    const LW = 118, ticks = [0, max / 4, max / 2, max * 3 / 4, max].map(Math.round);
+    el.innerHTML = `<div class="tbl" style="margin-top:0;padding-top:12px"><div class="tblin keep" style="--mw:${LW + H.length * 40}px"><div class="chart" style="height:${h + 22}px;position:relative">${ticks.map(v => `<div class="ylab" style="bottom:${22 + v / max * h - 6}px"><span style="flex:0 0 ${LW - 8}px">${N(v)}</span><i></i></div>`).join("")}
+      <div class="cols" style="left:${LW}px;right:0;top:0;height:${h}px">${H.map((x, i) => {
+        const tip = [{t: `${String(x.hour).padStart(2, "0")}:00 – ${String(x.hour + 1).padStart(2, "0")}:00`}, {v: F1(x.orders), l: x.past ? "orders (real)" : "orders expected", k: C.accent},
+                     {v: `${F1(x.lo)}–${F1(x.hi)}`, l: "range on the same weekdays"}, {v: N(x.needed), l: "riders needed"}, ...(x.min ? [{v: F1(x.min) + " min", l: "a delivery takes a rider"}] : []), {v: F1(x.had), l: "riders it had"},
+                     ...(sheet ? [{v: N(x.planned), l: "planned in the sheet"}] : []), ...(x.actual != null ? [{v: N(x.actual), l: "real orders so far", k: C.good}] : []),
+                     ...(x.wx && x.wx !== 1 ? [{v: (x.wx > 1 ? "+" : "") + Math.round((x.wx - 1) * 100) + " %", l: "weather " + (x.cond || ""), c: "em"}] : [])];
+        return `<div class="col" tabindex="0" ${tipAttr(tip)} style="position:relative"><i style="position:absolute;bottom:0;width:86%;height:${((x.hi || 0) / max * 100).toFixed(2)}%;background:#2A2140;border-radius:7px 7px 3px 3px"></i><i class="${anim ? "grow" : ""}" style="--i:${i};position:relative;height:${(x.orders / max * 100).toFixed(2)}%;background:${x.past ? `linear-gradient(180deg,#5BE0A6,${C.good})` : `linear-gradient(180deg,#A47BFF,${C.accent})`}${x.wx > 1 ? ";box-shadow:inset 0 3px 0 #7CC4FF" : ""}"></i></div>`;
+      }).join("")}</div>
+      <div class="xl" style="left:${LW}px;right:0;bottom:0">${H.map(x => `<span>${x.hour}</span>`).join("")}</div></div>
+      <div style="margin-top:8px">${rows.map(([l, f], ri) => `<div style="display:flex;align-items:center;padding:7px 0;${ri ? "border-top:1px solid var(--hair)" : ""}"><span class="stick" style="flex:0 0 ${LW}px;font-size:12px;color:var(--muted);padding-right:8px">${l}</span>${H.map(x => `<span style="flex:1 1 0;text-align:center;font-size:12px">${f(x)}</span>`).join("")}</div>`).join("")}</div></div></div>`;
+  },
+  grid(d) {
+    const card = $("#sGridCard"), el = $("#sGrid");
+    card.hidden = !!S.city;
+    if (S.city) return;
+    const hrs = [...new Set(d.hours.filter(h => h.hour >= 9 && h.hour <= 23 && h.orders >= 0.5).map(h => h.hour))].sort((a, b) => a - b);
+    if (!hrs.length || !d.cities.length) { el.innerHTML = `<div class="empty">No history for this day yet.</div>`; return; }
+    const tot = Object.fromEntries(d.hours.map(h => [h.hour, h]));
+    const cell = (x, mx, c) => {
+      if (!x || !x.needed) return `<span class="gc" style="color:var(--muted)">·</span>`;
+      const a = 0.1 + 0.62 * x.needed / mx;
+      const tip = [{t: `${c} · ${String(x.hour).padStart(2, "0")}:00`}, {v: F1(x.orders), l: x.past ? "orders (real)" : "orders expected", k: C.accent}, {v: N(x.needed), l: "riders needed"},
+                   ...(x.min ? [{v: F1(x.min) + " min", l: "a delivery takes a rider"}] : []), {v: F1(x.had), l: "riders it had (same weekdays)"},
+                   ...(d.has_sheet ? [{v: N(x.planned), l: "planned in the sheet"}] : []), ...(x.wx > 1 ? [{v: "+" + Math.round((x.wx - 1) * 100) + " %", l: "rain", c: "em"}] : [])];
+      return `<span class="gc" tabindex="0" ${tipAttr(tip)} style="background:rgba(143,91,255,${a.toFixed(2)});${x.needed === mx ? "font-weight:800;color:#fff;" : ""}${x.past ? "opacity:.45;" : ""}${x.wx > 1 ? "box-shadow:inset 0 2px 0 #7CC4FF;" : ""}${d.has_sheet && !x.past && x.planned < x.needed ? "outline:1.5px solid var(--bad);outline-offset:-2px;" : ""}">${x.needed}</span>`;
+    };
+    el.innerHTML = `<div class="tbl"><div class="tblin keep" style="--mw:${200 + hrs.length * 40}px">
+      <div class="th"><span class="stick" style="flex:0 0 150px">City</span>${hrs.map(h => `<span class="r" style="flex:1 1 0;text-align:center;min-width:34px">${h}</span>`).join("")}<span class="r" style="flex:0 0 64px">Rider-h</span></div>
+      ${d.cities.map(c => {
+        const by = Object.fromEntries(c.hours.map(x => [x.hour, x])), mx = Math.max(1, ...c.hours.map(x => x.needed || 0));
+        return `<div class="tr click" data-city="${esc(c.city)}" style="padding:3px 0"><b class="stick" style="flex:0 0 150px;min-width:0;overflow:hidden;font-size:13px;padding-right:6px" title="${esc(c.city)}"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.city)}</span></b>${hrs.map(h => `<span style="flex:1 1 0;min-width:34px;padding:0 2px">${cell(by[h], mx, c.city)}</span>`).join("")}<b class="r" style="flex:0 0 64px">${N(c.rider_hours)}</b></div>`;
+      }).join("")}
+      <div class="tr" style="padding:6px 0;border-top:1px solid var(--hair2,var(--hair))"><b class="stick" style="flex:0 0 150px;font-size:13px">All cities</b>${hrs.map(h => `<b style="flex:1 1 0;min-width:34px;text-align:center;font-size:12.5px">${tot[h] ? N(tot[h].needed) : "·"}</b>`).join("")}<b class="r" style="flex:0 0 64px">${N(d.totals.rider_hours)}</b></div>
+    </div></div>
+    <div class="legend" style="margin-top:10px;font-size:12px"><span><i style="background:rgba(143,91,255,.72)"></i>the city's busiest hour</span><span><i style="background:rgba(143,91,255,.25)"></i>quieter</span><span><i style="background:transparent;box-shadow:inset 0 2px 0 #7CC4FF"></i>rain expected</span>${d.has_sheet ? `<span><i style="background:transparent;outline:1.5px solid var(--bad)"></i>fewer planned than needed</span>` : ""}${d.day === d.today ? `<span><i style="background:rgba(143,91,255,.2);opacity:.5"></i>hour already over</span>` : ""}</div>`;
+  },
+  cities(d) {
+    const cs = d.cities, sheet = d.has_sheet;
+    $("#sCities").innerHTML = cs.length ? `<div class="tbl"><div class="tblin" style="--mw:1000px"><div class="th"><span style="flex:1 1 160px">City</span><span style="flex:0 0 80px" class="r">Orders</span><span style="flex:0 0 70px" class="r hm">Trend</span><span style="flex:0 0 96px" class="r">Busiest hour</span><span style="flex:0 0 104px" class="r hm">Min / delivery</span><span style="flex:0 0 90px" class="r">Riders at peak</span><span style="flex:0 0 90px" class="r hm">Rider-hours</span>${sheet ? `<span style="flex:0 0 80px" class="r hm">Planned</span><span style="flex:0 0 80px" class="r">Gap</span>` : ""}<span style="flex:1 1 170px" class="hm">Weather (11–23 h)</span></div>
+      ${cs.map(c => `<div class="tr click" data-city="${esc(c.city)}"><b style="flex:1 1 160px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(c.city)}</b><b class="r" style="flex:0 0 80px">${N(c.orders)}</b>
+        <span class="r hm ${c.trend > 1.03 ? "good" : c.trend < 0.97 ? "badt" : "t2"}" style="flex:0 0 70px">${c.trend === 1 ? "±0 %" : (c.trend > 1 ? "+" : "") + Math.round((c.trend - 1) * 100) + " %"}</span>
+        <span class="r t2" style="flex:0 0 96px">${String(c.peak_hour).padStart(2, "0")}:00 · ${Math.round(c.peak_orders)}</span><span class="r hm" style="flex:0 0 104px" title="${c.merged_saves >= 0.05 ? `orders carried together save ${Math.round(c.merged_saves * 100)} % of rider time` : ""}">${c.min ? F1(c.min) : "–"}${c.merged_saves >= 0.05 ? `<span class="t2" style="font-size:11px;display:block">merged −${Math.round(c.merged_saves * 100)} %</span>` : ""}</span><b class="r warn" style="flex:0 0 90px">${c.peak_needed}</b><span class="r hm" style="flex:0 0 90px">${N(c.rider_hours)}</span>
+        ${sheet ? `<span class="r hm" style="flex:0 0 80px">${c.planned_hours == null ? "–" : N(c.planned_hours)}</span><b class="r ${c.gap_hours < 0 ? "badt" : "good"}" style="flex:0 0 80px">${c.gap_hours == null ? "–" : c.gap_hours < 0 ? "short " + -c.gap_hours : "+" + c.gap_hours}</b>` : ""}
+        <span class="hm t2" style="flex:1 1 170px">${c.weather ? `${c.rain_hours ? `🌧️ ${c.rain_hours} h rain · ${c.rain_mm} mm` : "☁️ dry"}${c.temp_min != null ? ` · ${Math.round(c.temp_min)}–${Math.round(c.temp_max)}°` : ""}` : `<span class="muted">not loaded yet</span>`}</span></div>`).join("")}</div></div>` : `<div class="empty">No history for this day yet.</div>`;
+  },
+  shift(dir) {
+    const today = berlinToday(), cur = S.sday || addDays(today, 1), n = addDays(cur, dir);
+    if (n < today || n > addDays(today, 6)) return;
+    S.sday = n; history.replaceState(null, "", hashFor("staffing")); refresh({dim: true, anim: true});
+  }
+};
+
+/* ======================================================================== page: EVIDENCE PACK (9.5) */
+const mondayOf = s => { const d = dD(s), wd = (d.getUTCDay() + 6) % 7; return addDays(s, -wd); };
+const EVID = {
+  fresh: 120000,
+  wk() { return S.wk || addDays(mondayOf(berlinToday()), -7); },
+  url() { const a = this.wk(); return "/api/v2/evidence?" + new URLSearchParams({from: a, to: addDays(a, 6), ...(S.city ? {city: S.city} : {})}); },
+  filters() {
+    const thisMon = mondayOf(berlinToday()), wk = this.wk();
+    return `${citySel()}<div class="seg" role="group" aria-label="Week"><button type="button" data-ewk="${addDays(thisMon, -7)}" aria-pressed="${wk === addDays(thisMon, -7)}">Last week</button><button type="button" data-ewk="${thisMon}" aria-pressed="${wk === thisMon}">This week</button><button type="button" data-ewkd="-7" aria-label="Previous week">‹</button><button type="button" aria-pressed="${wk !== thisMon && wk !== addDays(thisMon, -7)}">${dm(wk)} – ${dm(addDays(wk, 6))}</button><button type="button" data-ewkd="7" aria-label="Next week" ${wk >= thisMon ? "disabled" : ""}>›</button></div>`;
+  },
+  shell() {
+    return `<div class="head"><div><div class="over">Evidence pack · Lieferando</div><h1>Late because of the restaurant</h1><div class="sub" id="eSub">&nbsp;</div></div><div class="filters" id="filters">${this.filters()}</div></div>
+      <section class="row data" id="eKpi" aria-label="Key numbers">${[1, 2, 3, 4].map(() => `<div class="tile plain"><div class="sk" style="height:14px;width:60%"></div><div class="sk" style="height:44px;width:50%;margin-top:12px"></div></div>`).join("")}</section>
+      <div class="row" style="gap:10px"><button type="button" class="btn violet" data-act="epdf">${svgI("M12 3v12M7 10l5 5 5-5M5 21h14", 16)}PDF for Lieferando</button><button type="button" class="btn ghost" data-act="ecsv">CSV</button><span class="muted" style="font-size:12px;align-self:center">Order numbers, restaurants and times only — no customer data, no rider names</span></div>
+      <section class="row data" style="align-items:flex-start">
+        <div class="card" style="flex:3 1 560px"><div class="ch"><h2>Restaurants</h2><span class="muted" style="font-size:12px">late orders they caused · minutes of delay beyond a normal hand-over</span></div><div id="eRest" style="margin-top:14px"><div class="sk" style="height:280px"></div></div></div>
+        <div class="card" style="flex:2 1 340px"><h2>Which orders count</h2><div id="eRule" class="t2" style="font-size:13px;margin-top:10px;display:flex;flex-direction:column;gap:10px"></div></div>
+      </section>
+      <section class="card data"><div class="ch"><h2 id="eOTitle">Orders</h2><span class="muted" style="font-size:12px">click a row for the full story</span></div><div id="eOrders"><div class="sk" style="height:240px;margin-top:14px"></div></div></section>
+      <div class="shortcuts"><span><kbd>←</kbd> <kbd>→</kbd> previous / next week</span><span><kbd>E</kbd> export</span></div>`;
+  },
+  fail(e) { $("#eKpi").innerHTML = `<div class="errbox" style="flex:1">Could not load: ${esc(e.message)} <button class="btn ghost sm" data-act="retry">Try again</button></div>`; },
+  render(d, o = {}) {
+    LASTP = d.period; EVID.data = d; const anim = o.anim, t = d.target;
+    $("#eSub").textContent = `${S.city || "All cities"} · ${dm(d.from)} – ${dm(d.to)} ${d.to.slice(0, 4)} · delivered more than ${t}′ after dispatch, only because the kitchen made the rider wait`;
+    $("#eKpi").innerHTML = `
+      <div class="tile plain"><div class="l"><span>Late deliveries (over ${t}′)</span></div><div class="big">${cnt("e.l", d.late)}</div><div class="s">of ${N(d.delivered)} delivered</div></div>
+      <div class="tile plain"><div class="l"><span>Late because of the restaurant</span></div><div class="big warn">${cnt("e.n", d.n)}</div><div class="s">${d.late_share == null ? "–" : d.late_share + " % of the late ones"}</div></div>
+      <div class="tile plain"><div class="l"><span>Restaurant delay</span></div><div class="big">${cnt("e.h", Math.round(d.delay_min / 60))}<span style="font-size:20px"> h</span></div><div class="s">waiting beyond a normal ${d.normal}′ hand-over</div></div>
+      <div class="tile plain"><div class="l"><span>Within ${t}′ if excused</span></div><div style="display:flex;align-items:baseline;gap:10px;margin-top:6px"><span class="big good" style="margin:0">${d.within_if_excused == null ? "–" : d.within_if_excused + " %"}</span><span class="t2" style="font-size:14px">now ${d.within_pct == null ? "–" : d.within_pct + " %"}</span></div><div class="s">${d.within_pct != null ? `+${d.within_if_excused - d.within_pct} pts for your scorecard` : ""}</div></div>`;
+    const rs = d.restaurants.slice(0, EVID.allRest ? 400 : 12), mx = Math.max(1, ...d.restaurants.map(g => g.n));
+    $("#eRest").innerHTML = rs.length ? `${rs.map((g, i) => `<div class="hbar" style="margin:8px 0" ${tipAttr([{t: g.restaurant + " · " + g.city}, {v: N(g.n), l: "late orders caused", k: C.amber}, {v: g.avg_wait + "′", l: "average wait"}, {v: N(g.delay) + "′", l: "restaurant delay in total"}])}><span class="lb" style="flex-basis:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><b style="color:var(--text)">${esc(g.restaurant)}</b><span class="muted" style="font-size:11px"> · ${esc(g.city)}</span></span><span class="track t8"><span class="f ${anim ? "growx" : ""}" style="--i:${i};width:${(g.n / mx * 100).toFixed(1)}%;background:${C.amber}"></span></span><b>${N(g.n)}</b><span class="muted" style="flex:0 0 64px;text-align:right;font-size:12px">${N(g.delay)}′</span></div>`).join("")}
+      ${d.restaurants.length > 12 ? `<button type="button" class="more" data-act="eall">${EVID.allRest ? "Show the top 12 →" : `Show all ${N(d.restaurants.length)} restaurants →`}</button>` : ""}` : `<div class="empty">No late delivery in this week was caused by restaurant waiting.</div>`;
+    $("#eRule").innerHTML = `<div>① Delivered more than <b>${t}′</b> after dispatch (late for PTOD).</div><div>② The rider was at the restaurant within <b>${d.arrive_max}′</b> of dispatch.</div><div>③ The rider waited <b>${d.min_wait}′ or more</b> for the food (first rider's arrival → pickup; a rider who gave up and handed the order back still counts).</div><div>④ Without the waiting beyond a normal <b>${d.normal}′</b> hand-over, the order would have been on target.</div><div class="muted" style="font-size:12px">The PDF explains this on its first page, then lists every order with its full timeline.</div>`;
+    this.orders();
+    countUp($("#view"), anim);
+  },
+  orders() {
+    const d = EVID.data; if (!d) return;
+    const rows = d.rows, shown = EVID.allRows ? rows : rows.slice(0, 30), multi = !S.city;
+    $("#eOTitle").textContent = `${N(rows.length)} orders`;
+    $("#eOrders").innerHTML = rows.length ? `<div class="tbl"><div class="tblin" style="--mw:${multi ? 1180 : 1060}px"><div class="th"><span style="flex:0 0 84px">Date</span><span style="flex:0 0 86px">Order</span>${multi ? `<span style="flex:0 0 110px" class="hm">City</span>` : ""}<span style="flex:1 1 180px">Restaurant</span><span style="flex:0 0 66px" class="r hm">Dispatched</span><span style="flex:0 0 96px" class="r">At restaurant</span><span style="flex:0 0 70px" class="r hm">Picked up</span><span style="flex:0 0 64px" class="r">Waited</span><span style="flex:0 0 58px" class="r hm">Delay</span><span style="flex:0 0 70px" class="r hm">Delivered</span><span style="flex:0 0 64px" class="r">Total</span><span style="flex:0 0 92px" class="r">Without delay</span></div>
+      ${shown.map(x => `<div class="tr click" data-order="${esc(x.id)}"><span class="t2" style="flex:0 0 84px">${esc(x.day)}</span><b class="mono" style="flex:0 0 86px">${esc(x.ref)}</b>${multi ? `<span class="t2 hm" style="flex:0 0 110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.city)}</span>` : ""}<span style="flex:1 1 180px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.restaurant)}${x.note ? `<span class="warnt" style="font-size:11px"> · ${esc(x.note)}</span>` : ""}</span>
+        <span class="mono t2 r hm" style="flex:0 0 66px">${esc(x.dispatched)}</span><span class="mono r" style="flex:0 0 96px">${esc(x.arrived)} <span class="muted">+${x.to_rest}′</span></span><span class="mono t2 r hm" style="flex:0 0 70px">${esc(x.picked)}</span>
+        <b class="r warn" style="flex:0 0 64px">${x.wait}′</b><span class="r hm t2" style="flex:0 0 58px">${x.delay}′</span><span class="mono t2 r hm" style="flex:0 0 70px">${esc(x.delivered)}</span><b class="r badt" style="flex:0 0 64px">${x.ptod}′</b><b class="r good" style="flex:0 0 92px">${x.without}′</b></div>`).join("")}</div></div>
+      ${rows.length > 30 ? `<button type="button" class="more" data-act="erows">${EVID.allRows ? "Show the first 30 →" : `Show all ${N(rows.length)} orders →`}</button>` : ""}` : `<div class="empty">No orders.</div>`;
+  },
+  dl(kind) {
+    const a = this.wk(), p = new URLSearchParams({from: a, to: addDays(a, 6), ...(S.city ? {city: S.city} : {})});
+    download(`/export/evidence.${kind}?` + p, kind === "pdf" ? "The evidence PDF" : "The CSV");
+  },
+  shift(dir) {
+    const n = addDays(this.wk(), dir * 7);
+    if (n > mondayOf(berlinToday())) return;
+    S.wk = n; history.replaceState(null, "", hashFor("evidence")); renderFilters(); refresh({dim: true, anim: true});
+  }
+};
+
+const PAGES = {performance: PERF, restaurants: REST, riders: RID, staffing: STAFF, evidence: EVID};
 
 /* ======================================================================== events */
 document.addEventListener("click", e => {
-  const a = e.target.closest("[data-act],[data-period],[data-city],[data-metric],[data-sel],[data-sort],[data-msg],[data-order],[data-rider],[data-ex],[data-pi],[data-nav]");
+  const a = e.target.closest("[data-act],[data-period],[data-city],[data-metric],[data-sel],[data-sort],[data-msg],[data-order],[data-rider],[data-ex],[data-pi],[data-nav],[data-sday],[data-ewk],[data-ewkd]");
   if (!a) { if (!e.target.closest(".menu,#btnExport,#customPop,[data-act=custom]")) closeMenus(); return; }
   if (a.hasAttribute("data-stop") || e.target.closest("[data-stop]")) return;
   const ds = a.dataset;
@@ -1153,8 +1343,11 @@ document.addEventListener("click", e => {
   if (ds.period) return setFilters({period: ds.period, from: "", to: ""});
   if (a.hasAttribute("data-city")) { e.preventDefault(); return setFilters({city: S.city === ds.city ? "" : ds.city}); }
   if (ds.metric) { S.metric = ds.metric; saveLocal(); const h = CACHE.get(PERF.url()); if (h) PERF.trend(h.d, true); return; }
-  if (ds.sel) { S.sel = ds.sel; RSTATE.rowsAll = false; history.replaceState(null, "", hashFor("restaurants")); REST.rank(false); REST.detail(false); if (innerWidth < 960) $("#rSel").scrollIntoView({behavior: RM ? "auto" : "smooth"}); return; }
+  if (ds.sel) { S.sel = ds.sel === "*" ? "" : ds.sel; RSTATE.rowsAll = false; history.replaceState(null, "", hashFor("restaurants")); REST.rank(false); REST.detail(false); if (innerWidth < 960) $("#rSel").scrollIntoView({behavior: RM ? "auto" : "smooth"}); return; }
   if (ds.sort) { S.sort = ds.sort; saveLocal(); RID.table(); return; }
+  if (ds.sday) { S.sday = ds.sday; history.replaceState(null, "", hashFor("staffing")); return refresh({dim: true, anim: true}); }
+  if (ds.ewk) { S.wk = ds.ewk; history.replaceState(null, "", hashFor("evidence")); renderFilters(); return refresh({dim: true, anim: true}); }
+  if (ds.ewkd) return EVID.shift(+ds.ewkd / 7);
   if (ds.msg) { e.stopPropagation(); return openMessage(ds.msg, ds.name, ds.phone, ds.ref); }
   if (ds.order) return openOrder(ds.order);
   if (ds.rider) return RID.riderDrawer(ds.rider);
@@ -1171,8 +1364,12 @@ document.addEventListener("click", e => {
     case "rrows": RSTATE.rowsAll = !RSTATE.rowsAll; return REST.orders();
     case "dall": RFILTER.all = !RFILTER.all; return RID.table();
     case "call": RFILTER.allChecks = !RFILTER.allChecks; return RFILTER.data && RID.checks(RFILTER.data);
-    case "rpdf": { const [n, c] = S.sel.split("|"); return exportPdf({restaurant: n, city: c}); }
+    case "rpdf": { if (!S.sel) return exportPdf(); const [n, c] = S.sel.split("|"); return exportPdf({restaurant: n, city: c}); }
     case "rcsv": return REST.csv();
+    case "epdf": return EVID.dl("pdf");
+    case "ecsv": return EVID.dl("csv");
+    case "eall": EVID.allRest = !EVID.allRest; return EVID.data && EVID.render(EVID.data, {});
+    case "erows": EVID.allRows = !EVID.allRows; return EVID.orders();
   }
 });
 $("#openSearch").onclick = openPal;
@@ -1197,12 +1394,13 @@ document.addEventListener("keydown", e => {
   if (e.target.closest("input,textarea,select,[contenteditable]") || e.metaKey || e.ctrlKey || e.altKey) return;
   if (k === "/") { e.preventDefault(); return openPal(); }
   const n = "123456789".indexOf(k); if (n >= 0) return goPage(NAV[n].id);
-  if (k === "ArrowLeft" || k === "ArrowRight") { if (S.page === "restaurants" && e.shiftKey) return; e.preventDefault(); return shiftRange(k === "ArrowLeft" ? -1 : 1); }
+  if (k === "ArrowLeft" || k === "ArrowRight") { if (S.page === "restaurants" && e.shiftKey) return; e.preventDefault(); const dir = k === "ArrowLeft" ? -1 : 1;
+    if (S.page === "staffing") return STAFF.shift(dir); if (S.page === "evidence") return EVID.shift(dir); return shiftRange(dir); }
   const l = k.toLowerCase();
   if (l === "e") return openExport();
   if (l === "c" && S.page === "performance") { S.cmp = !S.cmp; saveLocal(); const c = $("#fCmp"); if (c) c.checked = S.cmp; return refresh({}); }
   if (S.page === "restaurants" && (k === "ArrowDown" || k === "ArrowUp")) { e.preventDefault(); return REST.move(k === "ArrowDown" ? 1 : -1); }
-  if (S.page === "restaurants" && l === "p" && S.sel) { const [nm, c] = S.sel.split("|"); return exportPdf({restaurant: nm, city: c}); }
+  if (S.page === "restaurants" && l === "p") { if (!S.sel) return exportPdf(); const [nm, c] = S.sel.split("|"); return exportPdf({restaurant: nm, city: c}); }
   if (S.page === "riders" && l === "s") { const i = SORTS.findIndex(s => s[0] === S.sort); S.sort = SORTS[(i + 1) % SORTS.length][0]; saveLocal(); return RID.table(); }
 });
 

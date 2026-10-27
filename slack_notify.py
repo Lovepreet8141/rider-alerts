@@ -47,6 +47,11 @@ class SlackNotifier:
             store.set_settings({"slack_events": s["slack_events"] + ",rest", "mig_slack_rest": "1"})
         elif s.get("mig_slack_rest") != "1":
             store.set_settings({"mig_slack_rest": "1"})
+        s = store.get_settings()                  # 9.5, once: the Monday waiting-time report starts switched on
+        if s.get("slack_events") and s.get("mig_slack_weekly") != "1" and "weekly" not in s["slack_events"].split(","):
+            store.set_settings({"slack_events": s["slack_events"] + ",weekly", "mig_slack_weekly": "1"})
+        elif s.get("mig_slack_weekly") != "1":
+            store.set_settings({"mig_slack_weekly": "1"})
 
     # ---- settings
     def cfg(self) -> dict:
@@ -60,7 +65,7 @@ class SlackNotifier:
             rest = max(1, int(s.get("slack_rest_min") or 10))
         except ValueError:
             rest = 10
-        events = set((s.get("slack_events") or "new,norider,rest,cancel").split(","))
+        events = set((s.get("slack_events") or "new,norider,rest,cancel,weekly").split(","))
         return {"names": names, "no_rider_min": norider, "rest_min": rest, "events": events, "on": bool(WEBHOOK) and bool(names)}
 
     def match(self, restaurant: str, names: list) -> str:
