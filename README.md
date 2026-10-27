@@ -23,24 +23,21 @@ volume, so nothing depends on anyone watching: while you sleep it keeps recordin
 - **Deployment change**: remove the `MUNICH_SERVICE_AREA_ID` variable in Railway (or leave it empty) — with it set, events
   of other cities are ignored. Make sure the MotionTools webhook is not limited to one service area.
 
-## 9.7.0 — Morning report: long restaurant waits in a Google Sheet + Slack with @here (new file: gsheet.py · requirements: google-auth)
+## 9.7.1 — Morning report: long restaurant waits in Slack with @here + the sheet to download (new file: gsheet.py · requirements: openpyxl)
 
-* **Every day at 10:00 (Berlin)** — time can be changed in Settings — yesterday's orders where the rider waited 10+ min
-  are written into your Google Sheet, then a short message starting with **@here** goes to your team's channel
-  (orders that waited, % of delivered, rider-hours lost, the 3 cities with the most, the worst restaurant, link to the
-  sheet). Mondays it also covers last week (Monday–Sunday), and the Monday waiting report moves to the same time.
-  A restart after the time still sends what is due (up to 8 hours late — a deploy at night waits for the next morning).
-* **The sheet** (tabs are rewritten by the system, your own tabs are never touched): *Yesterday* (key numbers, by city,
-  top 10 restaurants) · *Last week* (by city + call list per city) · *Yesterday orders* · *Last week orders* (every
-  order with its timeline, wait, PTOD, hand-back note and a MotionTools link) · *How it works*. Sorted by city A–Z;
-  waits coloured 10–14 yellow, 15–19 orange, 20+ red. No customer data.
-* **Setup (once):** (1) in Google Cloud create a service account and a JSON key; (2) in Railway → web → Variables add
-  `GOOGLE_SERVICE_ACCOUNT_JSON` = the whole JSON; (3) create a Google Sheet and share it with the service account's
-  e-mail (Settings shows it) as Editor; (4) paste the sheet link in Settings → Morning report and Save.
-  For the Quickzii ops channel add an incoming webhook for it as `SLACK_REPORT_WEBHOOK_URL` (otherwise the message
-  goes to the `SLACK_WEBHOOK_URL` channel). Keys and webhooks only in Railway — never in chat or on GitHub.
-* Settings → Morning report: on/off, time, sheet link, status (Google key, sheet, Slack channel, last run), preview and
-  "Write sheet + send now".
+* **Every day at 10:00 (Berlin)** — the time can be changed in Settings — a message starting with **@here** goes to
+  your team's channel: orders where the rider waited 10+ min yesterday, % of delivered, rider-hours lost, the 3 cities
+  with the most, the worst restaurant, and a **download link to the sheet** (Excel — opens in Google Sheets:
+  Drive → New → File upload). Mondays the file also has last week, and the Monday waiting report follows.
+  A restart up to 8 hours after the time still sends what is due; a deploy at night waits for the next morning.
+* **The sheet**: *Yesterday* (key numbers, by city, top 10 restaurants) · *Last week* (by city + call list per city,
+  Mondays) · *Yesterday orders* · *Last week orders* (every order with its timeline, wait, PTOD, hand-back note and a
+  MotionTools link) · *How it works*. Sorted by city A–Z; waits coloured 10–14 yellow, 15–19 orange, 20+ red.
+  No customer data. Download any day or week: /export/long-waits.xlsx?day=YYYY-MM-DD or ?week=YYYY-MM-DD.
+* **No Google account needed.** For the Quickzii ops channel add an incoming webhook for it in Railway as
+  `SLACK_REPORT_WEBHOOK_URL` (without it the message goes to the `SLACK_WEBHOOK_URL` channel).
+* Settings → Morning report: on/off, time, preview, send now, download yesterday's / last week's sheet.
+* (9.7.0 wrote into a Google Sheet with a Google service account — replaced by the file, nothing to set up.)
 
 ## 9.6.0 — PTOD under 30 (new page, key 4)
 

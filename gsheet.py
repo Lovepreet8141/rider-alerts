@@ -1,128 +1,20 @@
-"""The daily "Long restaurant waits" Google Sheet (9.7).
+"""The daily "Long restaurant waits" sheet (9.7) — an Excel file that opens 1:1 in Google Sheets.
 
-Access: a Google *service account* (a robot user). Its key — the JSON file Google gives you — lives ONLY in Railway as
-GOOGLE_SERVICE_ACCOUNT_JSON: never in the dashboard, never on GitHub. Share the sheet with the robot's e-mail address
-(…@….iam.gserviceaccount.com) as Editor; the system can then write that one sheet and nothing else of yours.
-The sheet's link is pasted in Settings → Slack.
+No Google account and no key: the system builds the file, the morning Slack message carries a download link
+(/export/long-waits.xlsx, behind the dashboard password). Open it in Google Sheets: Drive → New → File upload, then
+open it — or File → Import in any sheet.
 
-Only these tabs are written (other tabs are left alone): Yesterday · Last week · Yesterday orders · Last week orders ·
-How it works. Everything is sorted by city A–Z. No customer data: order numbers, restaurants, riders and times only.
+Tabs: Yesterday · Last week (Mondays) · Yesterday orders · Last week orders (Mondays) · How it works.
+Everything sorted by city A–Z. No customer data: order numbers, restaurants, riders and times only.
 """
 from __future__ import annotations
 
-import base64
-import json
-import logging
-import os
-import re
-import time
+import io
 from collections import Counter, defaultdict
 from datetime import date, datetime, time as dtime
 
-import httpx
-
-log = logging.getLogger("gsheet")
-SCOPE = "https://www.googleapis.com/auth/spreadsheets"
-API = (os.environ.get("GOOGLE_SHEETS_API") or "https://sheets.googleapis.com").rstrip("/")     # override only for tests
-TOKEN_URL = (os.environ.get("GOOGLE_TOKEN_URL") or "").strip()                                 # override only for tests
-TABS = ["Yesterday", "Last week", "Yesterday orders", "Last week orders", "How it works"]
-CHUNK = 1500                                   # rows per write call (keeps every request far below Google's 10 MB)
-
-
-# ------------------------------------------------------------------ access
-def _info() -> dict | None:
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        return None
-    if not raw.startswith("{"):                # also accepted: the JSON as base64
-        try:
-            raw = base64.b64decode(raw).decode("utf-8")
-        except Exception:
-            return None
-    try:
-        d = json.loads(raw)
-    except Exception:
-        return None
-    return d if d.get("client_email") and d.get("private_key") else None
-
-
-def robot_email() -> str:
-    i = _info()
-    return i["client_email"] if i else ""
-
-
-def key_problem() -> str:
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        return "GOOGLE_SERVICE_ACCOUNT_JSON is not set in Railway"
-    return "" if _info() else "GOOGLE_SERVICE_ACCOUNT_JSON in Railway is not a valid service-account key (paste the whole JSON file)"
-
-
-def sheet_id_from(text: str) -> str:
-    """The sheet id from a Google Sheets link (or the bare id)."""
-    t = (text or "").strip()
-    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", t)
-    if m:
-        return m.group(1)
-    return t if re.fullmatch(r"[A-Za-z0-9_-]{20,}", t) else ""
-
-
-def sheet_url(sid: str, gid=None) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sid}/edit" + (f"#gid={gid}" if gid is not None else "")
-
-
-class GoogleError(RuntimeError):
-    pass
-
-
-class Client:
-    def __init__(self):
-        self._tok, self._exp = "", 0.0
-        self.http = httpx.Client(timeout=60)
-
-    def token(self) -> str:
-        if self._tok and time.time() < self._exp - 120:
-            return self._tok
-        info = _info()
-        if not info:
-            raise GoogleError(key_problem())
-        from google.auth import crypt, jwt as gjwt
-        signer = crypt.RSASigner.from_service_account_info(info)
-        aud = info.get("token_uri") or "https://oauth2.googleapis.com/token"
-        now = int(time.time())
-        assertion = gjwt.encode(signer, {"iss": info["client_email"], "scope": SCOPE, "aud": aud, "iat": now, "exp": now + 3600})
-        r = self.http.post(TOKEN_URL or aud, data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                                                   "assertion": assertion.decode() if isinstance(assertion, bytes) else assertion})
-        if r.status_code != 200:
-            raise GoogleError(f"Google login failed ({r.status_code}): {r.text[:160]}")
-        d = r.json()
-        self._tok, self._exp = d["access_token"], time.time() + float(d.get("expires_in", 3600))
-        return self._tok
-
-    def call(self, method: str, path: str, **kw):
-        for attempt in range(5):
-            r = self.http.request(method, API + path, headers={"Authorization": "Bearer " + self.token()}, **kw)
-            if r.status_code in (429, 500, 502, 503) and attempt < 4:
-                time.sleep(min(30, 2 ** attempt * 2))
-                continue
-            if r.status_code == 403:
-                raise GoogleError(f"Google says no access to the sheet — share it with {robot_email()} as Editor")
-            if r.status_code == 404:
-                raise GoogleError("Google can't find the sheet — check the link in Settings → Slack")
-            if r.status_code >= 300:
-                raise GoogleError(f"Google Sheets {r.status_code}: {r.text[:200]}")
-            return r.json() if r.content else {}
-        raise GoogleError("Google Sheets is busy — try again later")
-
-    def batch(self, sid: str, requests: list):
-        if requests:
-            return self.call("POST", f"/v4/spreadsheets/{sid}:batchUpdate", json={"requests": requests})
-
 
 # ------------------------------------------------------------------ cells and formats
-EPOCH = date(1899, 12, 30)
-
-
 class Link:
     def __init__(self, text: str, url: str):
         self.text, self.url = text, url
@@ -131,27 +23,6 @@ class Link:
 def _rgb(h: str) -> dict:
     h = h.lstrip("#")
     return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
-
-
-def _cell(v) -> dict:
-    if v is None or v == "":
-        return {}
-    if isinstance(v, Link):
-        c = {"userEnteredValue": {"stringValue": v.text}}
-        if v.url:
-            c["userEnteredFormat"] = {"textFormat": {"link": {"uri": v.url}}}
-        return c
-    if isinstance(v, bool):
-        return {"userEnteredValue": {"stringValue": "yes" if v else ""}}
-    if isinstance(v, (int, float)):
-        return {"userEnteredValue": {"numberValue": round(float(v), 4)}}
-    if isinstance(v, datetime):
-        v = v.date()
-    if isinstance(v, date):
-        return {"userEnteredValue": {"numberValue": (v - EPOCH).days}}
-    if isinstance(v, dtime):
-        return {"userEnteredValue": {"numberValue": round((v.hour * 3600 + v.minute * 60 + v.second) / 86400, 6)}}
-    return {"userEnteredValue": {"stringValue": str(v)}}
 
 
 def fmt(bg=None, bold=None, italic=None, size=None, color=None, align=None, valign=None, wrap=None, num=None, underline=None, font=None):
@@ -394,13 +265,12 @@ def help_tab() -> Tab:
         ("Late?", "PTOD (dispatch → delivered) over 30 minutes."),
         ("Colours", "Waited 10–14 min = yellow · 15–19 min = orange · 20+ min = red."),
         ("Sorting", "Sorted by city A–Z. Inside a city: the restaurant with the most long waits first, then by time."),
-        ("Yesterday", "'Yesterday' and 'Yesterday orders' are replaced every morning with the day before."),
-        ("Last week", "'Last week' and 'Last week orders' are replaced every Monday with Monday–Sunday of the week before."),
-        ("Slack", "After each refresh Quickzi Ops posts a short summary with the link in the team's own Slack channel."),
+        ("Every morning", "Quickzi Ops makes this file for yesterday and posts the download link with a short summary in the team's Slack channel. "
+                          "Mondays the file also has last week (Monday–Sunday)."),
+        ("Google Sheets", "Drive → New → File upload, then open the file — or in any Google Sheet: File → Import → Upload."),
         ("Privacy", "No customer data: no names, addresses, phone numbers or zip codes. Order numbers, restaurants, riders and times only. "
-                    "Keep the sheet shared inside the team."),
+                    "Keep the file inside the team."),
         ("Filters", "Use Data → Create a filter view to see one city or one restaurant without changing the sheet for everybody else."),
-        ("Don't edit", "These tabs are rewritten by the system. Put your own notes in a tab of your own — those are never touched."),
     ]
     for a, b in lines:
         t.add([a, b])
@@ -412,110 +282,127 @@ def help_tab() -> Tab:
     return t
 
 
-def build(yesterday: dict, last_week: dict | None) -> list:
-    """yesterday / last_week: {"rows": [...], "delivered": {city: n}, "label": "...", "a": date, "b": date}."""
-    tabs = [summary_tab("Yesterday", "Long restaurant waits — riders who waited 10+ minutes for the food", yesterday["label"],
-                        "Refreshed every morning · all cities · no customer data", yesterday["rows"], yesterday["delivered"], False, VIOLET)]
-    if last_week is not None:
-        tabs.append(summary_tab("Last week", "Last week — riders who waited 10+ minutes for the food", last_week["label"],
-                                "Refreshed every Monday · all cities · no customer data", last_week["rows"], last_week["delivered"], True, "B9A4F5"))
-    tabs.append(orders_tab("Yesterday orders", yesterday["rows"], "F59E0B"))
-    if last_week is not None:
-        tabs.append(orders_tab("Last week orders", last_week["rows"], "FCD34D"))
+def build(day: dict | None, week: dict | None) -> list:
+    """day / week: {"rows": [...], "delivered": {city: n}, "label": "...", "title": "Yesterday" | "Day" | "Last week" | "Week"}."""
+    tabs = []
+    if day is not None:
+        tabs.append(summary_tab(day["title"], "Long restaurant waits — riders who waited 10+ minutes for the food", day["label"],
+                                "Made by Quickzi Ops · all cities · no customer data", day["rows"], day["delivered"], False, VIOLET))
+    if week is not None:
+        tabs.append(summary_tab(week["title"], f"{week['title']} — riders who waited 10+ minutes for the food", week["label"],
+                                "Made by Quickzi Ops · all cities · no customer data", week["rows"], week["delivered"], True, "B9A4F5"))
+    if day is not None:
+        tabs.append(orders_tab(day["title"] + " orders", day["rows"], "F59E0B"))
+    if week is not None:
+        tabs.append(orders_tab(week["title"] + " orders", week["rows"], "FCD34D"))
     tabs.append(help_tab())
     return tabs
 
 
-# ------------------------------------------------------------------ writing
-def _grid(sheet_id, r0, r1, c0, c1):
-    return {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
+# ------------------------------------------------------------------ the Excel file
+def to_xlsx(tabs: list) -> bytes:
+    """The tabs as an .xlsx (Arial, colours, frozen headers, filters, conditional colours, links)."""
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule, ColorScaleRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter as L
 
+    hx = lambda c: "%02X%02X%02X" % tuple(round(c[k] * 255) for k in ("red", "green", "blue"))
+    cache = {}
 
-def _cond_request(sheet_id, c, idx):
-    (r0, r1, c0, c1), kind, vals, f = c
-    rng = [_grid(sheet_id, r0, max(r1, r0 + 1), c0, c1)]
-    if kind == "GRADIENT":
-        rule = {"ranges": rng, "gradientRule": {"minpoint": {"color": _rgb(f[0]), "type": "NUMBER", "value": vals[0]},
-                                                "maxpoint": {"color": _rgb(f[1]), "type": "MAX"}}}
-    elif kind == "GRADIENT3":
-        rule = {"ranges": rng, "gradientRule": {"minpoint": {"color": _rgb(f[0]), "type": "NUMBER", "value": vals[0]},
-                                                "midpoint": {"color": _rgb(f[1]), "type": "NUMBER", "value": vals[1]},
-                                                "maxpoint": {"color": _rgb(f[2]), "type": "NUMBER", "value": vals[2]}}}
-    else:
-        rule = {"ranges": rng, "booleanRule": {"condition": {"type": kind, "values": [{"userEnteredValue": v} for v in vals]}, "format": f}}
-    return {"addConditionalFormatRule": {"rule": rule, "index": idx}}
-
-
-def missing(sid: str, titles: list, client: Client | None = None) -> list:
-    """Which of these tabs the sheet doesn't have (e.g. somebody deleted 'Last week')."""
-    c = client or Client()
-    have = {s["properties"]["title"] for s in c.call("GET", f"/v4/spreadsheets/{sid}", params={"fields": "sheets(properties(title))"}).get("sheets", [])}
-    return [t for t in titles if t not in have]
-
-
-def write(sid: str, tabs: list, client: Client | None = None) -> dict:
-    """Replace the given tabs in the sheet (create them when missing). Returns {title: gid}."""
-    c = client or Client()
-    meta = c.call("GET", f"/v4/spreadsheets/{sid}", params={"fields": "sheets(properties(sheetId,title,index),conditionalFormats,basicFilter)"})
-    sheets = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
-    add = [{"addSheet": {"properties": {"title": t.title}}} for t in tabs if t.title not in sheets]
-    if add:
-        res = c.batch(sid, add)
-        for rep in (res or {}).get("replies", []):
-            p = rep.get("addSheet", {}).get("properties", {})
-            if p:
-                sheets[p["title"]] = {"properties": p}
-    # the empty first tab Google creates ("Sheet1" / "Tabellenblatt1") goes away once ours are in
-    for name in ("Sheet1", "Tabellenblatt1", "Blatt1", "Tabelle1"):
-        s = sheets.get(name)
-        if s and len(sheets) > 1:
-            try:
-                v = c.call("GET", f"/v4/spreadsheets/{sid}/values/{name}!A1:Z50")
-                if not v.get("values"):
-                    c.batch(sid, [{"deleteSheet": {"sheetId": s["properties"]["sheetId"]}}]); sheets.pop(name)
-            except GoogleError:
-                pass
-    ours = [x for x in TABS if x in sheets]            # our tabs first, in our order (positions that always exist)
-    gids = {}
+    def obj(kind, key, make):
+        k = (kind, key)
+        if k not in cache:
+            cache[k] = make()
+        return cache[k]
+    wb = Workbook()
+    wb.remove(wb.active)
     for t in tabs:
-        s = sheets[t.title]; gid = s["properties"]["sheetId"]; gids[t.title] = gid
-        n = max(len(t.rows), 1)
-        req = [{"deleteConditionalFormatRule": {"sheetId": gid, "index": i}} for i in reversed(range(len(s.get("conditionalFormats") or [])))]
-        if s.get("basicFilter"):
-            req.append({"clearBasicFilter": {"sheetId": gid}})
-        req.append({"updateSheetProperties": {"properties": {"sheetId": gid, "gridProperties": {"rowCount": n + 20, "columnCount": t.ncols + 1}},
-                                              "fields": "gridProperties.rowCount,gridProperties.columnCount"}})
-        req.append({"updateCells": {"range": {"sheetId": gid}, "fields": "*"}})                     # clears values and formats
-        req.append({"updateSheetProperties": {"properties": {"sheetId": gid, "index": ours.index(t.title) if t.title in ours else 0,
-                                                             "tabColorStyle": {"rgbColor": _rgb(t.color)},
-                                                             "gridProperties": {"frozenRowCount": t.freeze[0], "frozenColumnCount": t.freeze[1],
-                                                                                "hideGridlines": not t.grid}},
-                                              "fields": "index,tabColorStyle,gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines"}})
-        for col, px in t.widths.items():
-            req.append({"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
-                                                      "properties": {"pixelSize": px}, "fields": "pixelSize"}})
-        req.append({"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "ROWS", "startIndex": 0, "endIndex": n},
-                                                  "properties": {"pixelSize": 22}, "fields": "pixelSize"}})
-        for row, px in t.heights.items():
-            req.append({"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "ROWS", "startIndex": row, "endIndex": row + 1},
-                                                      "properties": {"pixelSize": px}, "fields": "pixelSize"}})
-        c.batch(sid, req)
-        for a in range(0, len(t.rows), CHUNK):                                                         # values
-            part = t.rows[a:a + CHUNK]
-            c.batch(sid, [{"updateCells": {"start": {"sheetId": gid, "rowIndex": a, "columnIndex": 0},
-                                           "rows": [{"values": [_cell(v) for v in row]} for row in part],
-                                           "fields": "userEnteredValue,userEnteredFormat.textFormat.link"}}])
-        req = []
-        for (r0, r1, c0, c1, f, fields) in t.styles:                                                  # formats (in order: later ones win)
-            if r1 > r0 and fields:
-                req.append({"repeatCell": {"range": _grid(gid, r0, r1, c0, c1), "cell": {"userEnteredFormat": f}, "fields": fields}})
-        for (r0, r1, c0, c1, side) in t.borders:
-            req.append({"updateBorders": {"range": _grid(gid, r0, r1, c0, c1), side: {"style": "SOLID_MEDIUM", "color": _rgb(VIOLET)}}})
-        for i, cf in enumerate(t.cond):
-            if cf[0][1] > cf[0][0]:
-                req.append(_cond_request(gid, cf, i))
+        ws = wb.create_sheet(t.title)
+        nr, nc = len(t.rows), t.ncols
+        # every cell's format: the style ranges applied in order, later ones win (as in Google Sheets)
+        st = [[{} for _ in range(nc)] for _ in range(nr)]
+        for (r0, r1, c0, c1, f, _fields) in t.styles:
+            flat = {}
+            if "backgroundColor" in f:
+                flat["bg"] = hx(f["backgroundColor"])
+            tf = f.get("textFormat", {})
+            for k in ("bold", "italic", "fontSize", "underline", "fontFamily"):
+                if k in tf:
+                    flat[k] = tf[k]
+            if "foregroundColor" in tf:
+                flat["color"] = hx(tf["foregroundColor"])
+            for k in ("horizontalAlignment", "verticalAlignment", "wrapStrategy"):
+                if k in f:
+                    flat[k] = f[k]
+            if "numberFormat" in f:
+                flat["num"] = f["numberFormat"]["pattern"]
+            for r in range(r0, min(r1, nr)):
+                row = st[r]
+                for c in range(c0, min(c1, nc)):
+                    row[c].update(flat)
+        for r, vals in enumerate(t.rows):
+            for c, v in enumerate(vals):
+                s_ = st[r][c]
+                if v is None and not s_:
+                    continue
+                link = None
+                if isinstance(v, Link):
+                    v, link = v.text, v.url
+                cell = ws.cell(row=r + 1, column=c + 1, value=v if v != "" else None)
+                if link:
+                    cell.hyperlink = link
+                if not s_:
+                    continue
+                fk = (s_.get("fontFamily", "Arial"), s_.get("fontSize", 10), bool(s_.get("bold")), bool(s_.get("italic")),
+                      bool(s_.get("underline")), s_.get("color"))
+                cell.font = obj("font", fk, lambda: Font(name=fk[0], size=fk[1], bold=fk[2], italic=fk[3],
+                                                         underline="single" if fk[4] else None, color=fk[5]))
+                if s_.get("bg"):
+                    cell.fill = obj("fill", s_["bg"], lambda: PatternFill("solid", fgColor=s_["bg"]))
+                ak = (s_.get("horizontalAlignment"), s_.get("verticalAlignment"), s_.get("wrapStrategy") == "WRAP")
+                if any(ak):
+                    cell.alignment = obj("al", ak, lambda: Alignment(horizontal=(ak[0] or "general").lower(),
+                                                                     vertical={"MIDDLE": "center"}.get(ak[1], (ak[1] or "bottom").lower()),
+                                                                     wrap_text=ak[2]))
+                if s_.get("num"):
+                    cell.number_format = s_["num"]
+        side = Side(style="medium", color=VIOLET)
+        for (r0, _r1, c0, c1, _side) in t.borders:
+            for c in range(c0, c1):
+                ws.cell(row=r0 + 1, column=c + 1).border = Border(top=side)
+        for (r0, r1, c0, c1), kind, vals, f in t.cond:
+            if r1 <= r0:
+                continue
+            ref = f"{L(c0 + 1)}{r0 + 1}:{L(c1)}{r1}"
+            if kind == "GRADIENT":
+                ws.conditional_formatting.add(ref, ColorScaleRule(start_type="num", start_value=float(vals[0]), start_color=f[0],
+                                                                  end_type="max", end_color=f[1]))
+            elif kind == "GRADIENT3":
+                ws.conditional_formatting.add(ref, ColorScaleRule(start_type="num", start_value=float(vals[0]), start_color=f[0],
+                                                                  mid_type="num", mid_value=float(vals[1]), mid_color=f[1],
+                                                                  end_type="num", end_value=float(vals[2]), end_color=f[2]))
+            else:
+                kw = {}
+                if "backgroundColor" in f:
+                    kw["fill"] = PatternFill("solid", fgColor=hx(f["backgroundColor"]))
+                if "textFormat" in f:
+                    tf = f["textFormat"]
+                    kw["font"] = Font(name="Arial", bold=tf.get("bold"), color=hx(tf["foregroundColor"]) if "foregroundColor" in tf else None)
+                op = {"NUMBER_GREATER_THAN_EQ": "greaterThanOrEqual", "NUMBER_BETWEEN": "between", "NUMBER_GREATER": "greaterThan", "TEXT_EQ": "equal"}[kind]
+                ws.conditional_formatting.add(ref, CellIsRule(operator=op, formula=[f'"{vals[0]}"'] if kind == "TEXT_EQ" else list(vals), **kw))
+        for c, px in t.widths.items():
+            ws.column_dimensions[L(c + 1)].width = round(px / 7, 1)
+        for r, px in t.heights.items():
+            ws.row_dimensions[r + 1].height = round(px * 0.75, 1)
+        fr, fc = t.freeze
+        if fr or fc:
+            ws.freeze_panes = f"{L(fc + 1)}{fr + 1}"
         if t.filter and t.filter[1] > t.filter[0] + 1:
-            req.append({"setBasicFilter": {"filter": {"range": _grid(gid, *t.filter)}}})
-        for a in range(0, len(req), 400):
-            c.batch(sid, req[a:a + 400])
-    return gids
+            r0, r1, c0, c1 = t.filter
+            ws.auto_filter.ref = f"{L(c0 + 1)}{r0 + 1}:{L(c1)}{r1}"
+        ws.sheet_view.showGridLines = t.grid
+        ws.sheet_properties.tabColor = t.color
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
